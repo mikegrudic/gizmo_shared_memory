@@ -35,12 +35,33 @@ static bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dim
     return (a*b <= 0) ? 0.0 : (std::abs(a) < std::abs(b) ? a : b);
 }
 
-// The five primitive fields, in the one order used by gradients, reconstruction and the Riemann
-// state vectors. Named rather than bare 0..4: the flux loop indexes these arrays a dozen times and
-// a transposed velocity component is otherwise invisible.
-enum PrimitiveField : int { FIELD_DENSITY = 0, FIELD_VX, FIELD_VY, FIELD_VZ, FIELD_PRESSURE,
-                            NUM_FIELDS };
-using PrimitiveState = std::array<double, NUM_FIELDS>;
+// Per-particle slope limiter, Hopkins (2015) appendix B.
+//
+// Scale the gradient so that extrapolating it a distance SLOPE_REACH*h -- a fraction of the kernel
+// radius, i.e. roughly to where the faces are -- overshoots neither the largest rise nor the
+// largest drop actually present in the neighbour set.
+//
+// The point is that this is decided ONCE per particle against the whole neighbourhood, rather than
+// per face against that one pair's jump. A per-face minmod against half the pair jump is far more
+// restrictive: in smooth flow, neighbouring pairs with a small jump clamp the slope even where the
+// field is perfectly linear, so it clips smooth extrema. That is invisible in a shock tube, where
+// clipping is what you want anyway, and fatal in a rotating flow, where the clipped slope bleeds
+// angular momentum every step and the vortex spins down.
+//
+// SHOOT_TOLERANCE lets the reconstruction exceed the neighbour range by a fraction of the WIDER of
+// the two excursions, which keeps a genuine smooth extremum (where rise and drop are both real and
+// the true profile is curved) from being flattened to first order.
+static constexpr double SLOPE_REACH     = 0.5;
+static constexpr double SHOOT_TOLERANCE = 0.25;
+static inline void limit_slope(Vec3d& gradient, double largest_rise, double largest_drop,
+                               double h) {
+    const double slope = gradient.norm();
+    if (slope <= 0) return;
+    const double rise = std::abs(largest_rise), drop = std::abs(largest_drop);
+    const double allowed = std::min(rise, drop) + SHOOT_TOLERANCE * std::max(rise, drop);
+    const double factor = allowed / (SLOPE_REACH * h * slope);
+    if (factor < 1.0) gradient *= factor;
+}
 
 // Contact-wave speed and pressure from the Riemann fan -- the only two quantities the Lagrangian
 // MFM flux needs, since the mass flux vanishes by construction.
@@ -68,14 +89,6 @@ struct ContactState { double speed, pressure; };
     if (contact_pressure < 0) contact_pressure = 0.5*(pressure_left + pressure_right);
     return {contact_speed, contact_pressure};
 }
-
-// per-step scratch shared by the phases
-struct Work {
-    std::vector<Mat3d> moments_inv;                            // E^-1, one per particle
-    std::array<std::vector<Vec3d>, NUM_FIELDS> gradient;       // gradient of each primitive field
-    std::array<std::vector<double>, NUM_FIELDS> predicted;     // half-step predicted primitives
-    std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
-};
 
 static void solve_h_and_volumes(Sim& sim, const Tree& tree) {
     const size_t n_part = sim.size();
@@ -150,16 +163,25 @@ static void gradients(Sim& sim, const Tree& tree, Work& work) {
 
             const PrimitiveState field_i{sim.rho[i], sim.vx[i], sim.vy[i], sim.vz[i], sim.press[i]};
             std::array<Vec3d, NUM_FIELDS> weighted_diff_sum{};
+            // widest rise and fall seen across the neighbour set, for the slope limiter below
+            PrimitiveState largest_rise{}, largest_drop{};
             for (uint32_t j : neighbours) {
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double weight = kernel_w(offset.norm(), sim.h[i], sim.dim);
                 const PrimitiveState field_j{sim.rho[j], sim.vx[j], sim.vy[j], sim.vz[j],
                                              sim.press[j]};
-                for (int f = 0; f < NUM_FIELDS; ++f)
-                    weighted_diff_sum[f] += offset * ((field_j[f] - field_i[f]) * weight);
+                for (int f = 0; f < NUM_FIELDS; ++f) {
+                    const double diff = field_j[f] - field_i[f];
+                    weighted_diff_sum[f] += offset * (diff * weight);
+                    largest_rise[f] = std::max(largest_rise[f], diff);
+                    largest_drop[f] = std::min(largest_drop[f], diff);
+                }
             }
-            for (int f = 0; f < NUM_FIELDS; ++f)
-                work.gradient[f][i] = moments_inv.matvec(weighted_diff_sum[f]);
+            for (int f = 0; f < NUM_FIELDS; ++f) {
+                Vec3d gradient = moments_inv.matvec(weighted_diff_sum[f]);
+                limit_slope(gradient, largest_rise[f], largest_drop[f], sim.h[i]);
+                work.gradient[f][i] = gradient;
+            }
         }
     }
 }
@@ -253,12 +275,19 @@ static void fluxes(Sim& sim, const Tree& tree, Work& work, double dt,
                 auto extrapolate = [&](int field, size_t side, double sign)->double {
                     return sign * dot(work.gradient[field][side], to_midpoint);
                 };
+                // Pairwise safety net only. The gradient was already limited per particle against
+                // its whole neighbourhood (see limit_slope), so all this has to do is stop a face
+                // value from leaving the range spanned by the two endpoints -- which is what keeps
+                // the Riemann problem well posed. Clamping to that range is markedly less
+                // diffusive than the older minmod against half the jump, which limited the SLOPE
+                // itself on every face and so kept re-clipping smooth flow.
                 PrimitiveState left{}, right{};
                 for (int f = 0; f < NUM_FIELDS; ++f) {
                     const auto& predicted = work.predicted[f];
-                    const double jump = predicted[j] - predicted[i];
-                    left[f]  = predicted[i] + minmod(extrapolate(f, i, +1.0),  0.5*jump);
-                    right[f] = predicted[j] + minmod(extrapolate(f, j, -1.0), -0.5*jump);
+                    const double lo = std::min(predicted[i], predicted[j]);
+                    const double hi = std::max(predicted[i], predicted[j]);
+                    left[f]  = std::min(hi, std::max(lo, predicted[i] + extrapolate(f, i, +1.0)));
+                    right[f] = std::min(hi, std::max(lo, predicted[j] + extrapolate(f, j, -1.0)));
                 }
                 if (left[FIELD_DENSITY]  <= 0 || right[FIELD_DENSITY]  <= 0 ||
                     left[FIELD_PRESSURE] <= 0 || right[FIELD_PRESSURE] <= 0) {  // limiter emergency

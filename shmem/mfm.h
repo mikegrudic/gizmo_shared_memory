@@ -20,9 +20,35 @@
 // tests (soundwave, shocktube, square) validate exactly this much.
 
 #pragma once
+#include <array>
 #include "hydro.h"
 
 namespace shmem {
+
+// The five primitive fields, in the one order used by gradients, reconstruction and the Riemann
+// state vectors. Named rather than bare 0..4: the flux loop indexes these arrays a dozen times and
+// a transposed velocity component is otherwise invisible.
+enum PrimitiveField : int { FIELD_DENSITY = 0, FIELD_VX, FIELD_VY, FIELD_VZ, FIELD_PRESSURE,
+                            NUM_FIELDS };
+using PrimitiveState = std::array<double, NUM_FIELDS>;
+
+// Per-particle scratch for the step. PERSISTENT across steps, not a local: under individual
+// timesteps an inactive particle is still a neighbour of active ones, and the flux needs its
+// B matrix, gradients and predicted state. Those keep the values from the particle's own last
+// update, which is exactly the standard approximation.
+struct Work {
+    std::vector<Mat3d> moments_inv;                            // E^-1, one per particle
+    std::array<std::vector<Vec3d>, NUM_FIELDS> gradient;       // gradient of each primitive field
+    std::array<std::vector<double>, NUM_FIELDS> predicted;     // half-step predicted primitives
+    std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
+
+    void resize(size_t n) {
+        moments_inv.resize(n);
+        for (auto& g : gradient)  g.resize(n);
+        for (auto& p : predicted) p.resize(n);
+        signal_speed.resize(n);
+    }
+};
 
 struct Sim {
     Particles P;                       // positions + masses + gravitational softening
@@ -44,8 +70,21 @@ struct Sim {
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
     double pending_half_kick = 0.0;    // dt/2 owed from the previous step's closing kick
 
-    // derived per step
+    // ---- individual (hierarchical) timesteps ----
+    // Every particle's step is dt_max / 2^bin, so all steps are commensurate and every particle's
+    // sync points are a subset of the shortest bin's. Off by default: with one bin this reduces
+    // exactly to the global-timestep scheme.
+    bool  individual_timesteps = false;
+    int   max_bins  = 20;              // deepest allowed level below dt_max
+    int   bin_limit = 4;               // Saitoh-Makino: a particle may not sit this many bins
+                                       // above an active neighbour (see wake_neighbours)
+    std::vector<int> bin;              // current timebin per particle
+    std::vector<uint32_t> active;      // indices due at this sync point
+
+    // derived per step; under individual timesteps only the ACTIVE entries are refreshed and the
+    // rest keep their values from each particle's own last update
     std::vector<double> h, ninv, rho, press;
+    Work work;
 
     size_t size() const { return P.size(); }
 };
