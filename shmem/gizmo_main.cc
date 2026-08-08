@@ -13,9 +13,15 @@
 // BOX_SPATIAL_DIMENSION and EOS_GAMMA -- compile-time constants in real GIZMO, runtime here).
 // Writes: output/snapshot_NNN.hdf5 with the Header attrs and PartType0 fields the suite reads.
 
+#include <sched.h>          // sched_setaffinity: undo mpirun's per-rank pinning (see main)
+#include <unistd.h>
+
 #include "mfm.h"
 #include <hdf5.h>
 #include <mpi.h>
+#include <omp.h>
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -25,211 +31,262 @@
 using namespace shmem;
 
 static std::map<std::string, std::string> parse_kv(const char* path) {
-    std::map<std::string, std::string> kv;
-    FILE* f = fopen(path, "r");
-    if (!f) return kv;
+    std::map<std::string, std::string> settings;
+    FILE* file = fopen(path, "r");
+    if (!file) return settings;
     char line[512];
-    while (fgets(line, sizeof line, f)) {
-        char k[128], v[256];
+    while (fgets(line, sizeof line, file)) {
+        char key[128], value[256];
         if (line[0] == '%' || line[0] == '#') continue;
-        if (sscanf(line, "%127s %255s", k, v) == 2) kv[k] = v;
+        if (sscanf(line, "%127s %255s", key, value) == 2) settings[key] = value;
     }
-    fclose(f);
-    return kv;
+    fclose(file);
+    return settings;
 }
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
-static void parse_config(int& dim, double& gamma) {
-    for (const char* p : {"Config.sh", "../../Config.sh"}) {
-        FILE* f = fopen(p, "r");
-        if (!f) continue;
+static void parse_config(int& n_dims, double& gamma) {
+    for (const char* path : {"Config.sh", "../../Config.sh"}) {
+        FILE* file = fopen(path, "r");
+        if (!file) continue;
         char line[512];
-        while (fgets(line, sizeof line, f)) {
+        while (fgets(line, sizeof line, file)) {
             if (line[0] == '#') continue;
-            int d;
-            if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &d) == 1) dim = d;
-            double a, b;
-            if (sscanf(line, "EOS_GAMMA=(%lf/%lf)", &a, &b) == 2) gamma = a / b;
-            else if (sscanf(line, "EOS_GAMMA=(%lf)", &a) == 1) gamma = a;
-            else if (sscanf(line, "EOS_GAMMA=%lf", &a) == 1) gamma = a;
+            int dims_from_config;
+            if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
+                n_dims = dims_from_config;
+            double numerator, denominator;
+            if (sscanf(line, "EOS_GAMMA=(%lf/%lf)", &numerator, &denominator) == 2)
+                gamma = numerator / denominator;
+            else if (sscanf(line, "EOS_GAMMA=(%lf)", &numerator) == 1) gamma = numerator;
+            else if (sscanf(line, "EOS_GAMMA=%lf", &numerator) == 1) gamma = numerator;
         }
-        fclose(f);
+        fclose(file);
         break;                                   // first Config.sh found wins (cwd over root)
     }
 }
 
-static std::vector<double> h5_read(hid_t g, const char* name, int col) {
-    hid_t d = H5Dopen2(g, name, H5P_DEFAULT);
-    hid_t sp = H5Dget_space(d);
+// Read one dataset as doubles. `column` selects a component of an Nx3 dataset; pass -1 for a
+// plain 1D dataset.
+static std::vector<double> h5_read(hid_t group, const char* name, int column) {
+    hid_t dataset = H5Dopen2(group, name, H5P_DEFAULT);
+    hid_t space = H5Dget_space(dataset);
     hsize_t dims[2] = {0, 0};
-    int nd = H5Sget_simple_extent_ndims(sp);
-    H5Sget_simple_extent_dims(sp, dims, nullptr);
-    size_t n = dims[0];
-    std::vector<double> out(n);
-    if (nd == 1) H5Dread(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data());
-    else {
-        std::vector<double> buf(n * dims[1]);
-        H5Dread(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf.data());
-        for (size_t i = 0; i < n; ++i) out[i] = buf[i*dims[1] + (col < 0 ? 0 : col)];
+    const int rank = H5Sget_simple_extent_ndims(space);
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    const size_t n_rows = dims[0];
+    std::vector<double> values(n_rows);
+    if (rank == 1) {
+        H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+    } else {
+        std::vector<double> all_columns(n_rows * dims[1]);
+        H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, all_columns.data());
+        for (size_t i = 0; i < n_rows; ++i)
+            values[i] = all_columns[i*dims[1] + (column < 0 ? 0 : column)];
     }
-    H5Sclose(sp); H5Dclose(d);
-    return out;
+    H5Sclose(space); H5Dclose(dataset);
+    return values;
 }
 
-static void attr_d(hid_t h, const char* n, double v) {
-    hid_t s = H5Screate(H5S_SCALAR), a = H5Acreate2(h, n, H5T_NATIVE_DOUBLE, s, H5P_DEFAULT, H5P_DEFAULT);
-    H5Awrite(a, H5T_NATIVE_DOUBLE, &v); H5Aclose(a); H5Sclose(s);
+static void write_attr(hid_t where, const char* name, double value) {
+    hid_t space = H5Screate(H5S_SCALAR);
+    hid_t attr = H5Acreate2(where, name, H5T_NATIVE_DOUBLE, space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr, H5T_NATIVE_DOUBLE, &value); H5Aclose(attr); H5Sclose(space);
 }
-static void attr_i(hid_t h, const char* n, int v) {
-    hid_t s = H5Screate(H5S_SCALAR), a = H5Acreate2(h, n, H5T_NATIVE_INT, s, H5P_DEFAULT, H5P_DEFAULT);
-    H5Awrite(a, H5T_NATIVE_INT, &v); H5Aclose(a); H5Sclose(s);
+static void write_attr(hid_t where, const char* name, int value) {
+    hid_t space = H5Screate(H5S_SCALAR);
+    hid_t attr = H5Acreate2(where, name, H5T_NATIVE_INT, space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr, H5T_NATIVE_INT, &value); H5Aclose(attr); H5Sclose(space);
 }
+// the per-particle-type header arrays GIZMO writes, one entry per type
 template <typename T>
-static void attr_v6(hid_t h, const char* n, hid_t type, const T* v) {
-    hsize_t six = 6;
-    hid_t s = H5Screate_simple(1, &six, nullptr);
-    hid_t a = H5Acreate2(h, n, type, s, H5P_DEFAULT, H5P_DEFAULT);
-    H5Awrite(a, type, v); H5Aclose(a); H5Sclose(s);
+static void write_attr_per_type(hid_t where, const char* name, hid_t type, const T* values) {
+    hsize_t n_types = 6;
+    hid_t space = H5Screate_simple(1, &n_types, nullptr);
+    hid_t attr = H5Acreate2(where, name, type, space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr, type, values); H5Aclose(attr); H5Sclose(space);
 }
 
-static void write_snapshot(const Sim& S, const std::vector<long long>& ids,
-                           const std::string& outdir, int num, double time) {
-    char fn[512];
-    snprintf(fn, sizeof fn, "%s/snapshot_%03d.hdf5", outdir.c_str(), num);
-    hid_t f = H5Fcreate(fn, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-    const size_t n = S.size();
+static void write_snapshot(const Sim& sim, const std::vector<long long>& particle_ids,
+                           const std::string& outdir, int snapshot_num, double time) {
+    char filename[512];
+    snprintf(filename, sizeof filename, "%s/snapshot_%03d.hdf5", outdir.c_str(), snapshot_num);
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    const size_t n_part = sim.size();
 
-    hid_t hdr = H5Gcreate2(f, "Header", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    unsigned int np[6] = {(unsigned)n,0,0,0,0,0}, zero6u[6] = {0,0,0,0,0,0};
-    int np_i[6] = {(int)n,0,0,0,0,0};
-    double mt[6] = {0,0,0,0,0,0};
-    attr_v6(hdr, "NumPart_ThisFile", H5T_NATIVE_INT, np_i);
-    attr_v6(hdr, "NumPart_Total", H5T_NATIVE_UINT, np);
-    attr_v6(hdr, "NumPart_Total_HighWord", H5T_NATIVE_UINT, zero6u);
-    attr_v6(hdr, "MassTable", H5T_NATIVE_DOUBLE, mt);
-    attr_d(hdr, "Time", time);
-    attr_d(hdr, "Redshift", 0.0);
-    attr_d(hdr, "BoxSize", S.box);
-    attr_i(hdr, "NumFilesPerSnapshot", 1);
-    attr_i(hdr, "Flag_Sfr", 0); attr_i(hdr, "Flag_Cooling", 0);
-    attr_i(hdr, "Flag_Feedback", 0); attr_i(hdr, "Flag_StellarAge", 0);
-    attr_i(hdr, "Flag_Metals", 0); attr_i(hdr, "Flag_DoublePrecision", 1);
-    attr_d(hdr, "HubbleParam", 1.0); attr_d(hdr, "Omega0", 0.0); attr_d(hdr, "OmegaLambda", 0.0);
-    H5Gclose(hdr);
+    hid_t header = H5Gcreate2(file, "Header", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    unsigned int count_per_type[6] = {(unsigned)n_part,0,0,0,0,0}, zeros[6] = {0,0,0,0,0,0};
+    int count_per_type_int[6] = {(int)n_part,0,0,0,0,0};
+    double mass_table[6] = {0,0,0,0,0,0};       // 0 => per-particle masses live in the dataset
+    write_attr_per_type(header, "NumPart_ThisFile", H5T_NATIVE_INT, count_per_type_int);
+    write_attr_per_type(header, "NumPart_Total", H5T_NATIVE_UINT, count_per_type);
+    write_attr_per_type(header, "NumPart_Total_HighWord", H5T_NATIVE_UINT, zeros);
+    write_attr_per_type(header, "MassTable", H5T_NATIVE_DOUBLE, mass_table);
+    write_attr(header, "Time", time);
+    write_attr(header, "Redshift", 0.0);
+    write_attr(header, "BoxSize", sim.box);
+    write_attr(header, "NumFilesPerSnapshot", 1);
+    write_attr(header, "Flag_Sfr", 0);      write_attr(header, "Flag_Cooling", 0);
+    write_attr(header, "Flag_Feedback", 0); write_attr(header, "Flag_StellarAge", 0);
+    write_attr(header, "Flag_Metals", 0);   write_attr(header, "Flag_DoublePrecision", 1);
+    write_attr(header, "HubbleParam", 1.0);
+    write_attr(header, "Omega0", 0.0);      write_attr(header, "OmegaLambda", 0.0);
+    H5Gclose(header);
 
-    hid_t g = H5Gcreate2(f, "PartType0", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    auto write3 = [&](const char* name, const std::vector<double>& a,
-                      const std::vector<double>& b, const std::vector<double>& c) {
-        hsize_t dims[2] = {n, 3};
-        hid_t s = H5Screate_simple(2, dims, nullptr);
-        hid_t d = H5Dcreate2(g, name, H5T_NATIVE_DOUBLE, s, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> buf(3*n);
-        for (size_t i = 0; i < n; ++i) { buf[3*i]=a[i]; buf[3*i+1]=b[i]; buf[3*i+2]=c[i]; }
-        H5Dwrite(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf.data());
-        H5Dclose(d); H5Sclose(s);
+    hid_t gas_group = H5Gcreate2(file, "PartType0", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    auto write_vector_field = [&](const char* name, const std::vector<double>& comp_x,
+                                  const std::vector<double>& comp_y,
+                                  const std::vector<double>& comp_z) {
+        hsize_t dims[2] = {n_part, 3};
+        hid_t space = H5Screate_simple(2, dims, nullptr);
+        hid_t dataset = H5Dcreate2(gas_group, name, H5T_NATIVE_DOUBLE, space,
+                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> interleaved(3*n_part);
+        for (size_t i = 0; i < n_part; ++i) {
+            interleaved[3*i] = comp_x[i];
+            interleaved[3*i+1] = comp_y[i];
+            interleaved[3*i+2] = comp_z[i];
+        }
+        H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, interleaved.data());
+        H5Dclose(dataset); H5Sclose(space);
     };
-    auto write1 = [&](const char* name, const std::vector<double>& a) {
-        hsize_t dims = n;
-        hid_t s = H5Screate_simple(1, &dims, nullptr);
-        hid_t d = H5Dcreate2(g, name, H5T_NATIVE_DOUBLE, s, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, a.data());
-        H5Dclose(d); H5Sclose(s);
+    auto write_scalar_field = [&](const char* name, const std::vector<double>& values) {
+        hsize_t dims = n_part;
+        hid_t space = H5Screate_simple(1, &dims, nullptr);
+        hid_t dataset = H5Dcreate2(gas_group, name, H5T_NATIVE_DOUBLE, space,
+                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+        H5Dclose(dataset); H5Sclose(space);
     };
-    write3("Coordinates", S.P.x, S.P.y, S.P.z);
-    write3("Velocities", S.vx, S.vy, S.vz);
-    write1("Masses", S.P.m);
-    write1("InternalEnergy", S.u);
-    write1("Density", S.rho);
-    write1("SmoothingLength", S.h);
+    write_vector_field("Coordinates", sim.P.x, sim.P.y, sim.P.z);
+    write_vector_field("Velocities", sim.vx, sim.vy, sim.vz);
+    write_scalar_field("Masses", sim.P.m);
+    write_scalar_field("InternalEnergy", sim.u);
+    write_scalar_field("Density", sim.rho);
+    write_scalar_field("SmoothingLength", sim.h);
     {
-        hsize_t dims = n;
-        hid_t s = H5Screate_simple(1, &dims, nullptr);
-        hid_t d = H5Dcreate2(g, "ParticleIDs", H5T_NATIVE_LLONG, s, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(d, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, ids.data());
-        H5Dclose(d); H5Sclose(s);
+        hsize_t dims = n_part;
+        hid_t space = H5Screate_simple(1, &dims, nullptr);
+        hid_t dataset = H5Dcreate2(gas_group, "ParticleIDs", H5T_NATIVE_LLONG, space,
+                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(dataset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, particle_ids.data());
+        H5Dclose(dataset); H5Sclose(space);
     }
-    H5Gclose(g); H5Fclose(f);
-    printf("wrote %s (t=%.6g)\n", fn, time); fflush(stdout);
+    H5Gclose(gas_group); H5Fclose(file);
+    printf("wrote %s (t=%.6g)\n", filename, time); fflush(stdout);
 }
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    // Idle ranks EXIT, they do not wait: OpenMPI barriers busy-wait, so parking N-1 ranks at a
-    // barrier spins N-1 cores at 100% for the whole run -- the exact __sched_yield pathology this
-    // engine exists to remove. mpirun is fine with ranks finalizing at different times.
+    int nranks = 1; MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+
+    // Idle ranks finalize immediately rather than parking on a barrier: an OpenMPI barrier
+    // busy-waits, so N-1 ranks spinning there would burn N-1 cores for the whole run -- the exact
+    // __sched_yield pathology this engine exists to remove.
     if (rank != 0) { MPI_Finalize(); return 0; }
     if (argc < 2) { fprintf(stderr, "usage: %s <paramsfile> [restartflag]\n", argv[0]); return 2; }
 
-    auto kv = parse_kv(argv[1]);
-    auto need = [&](const char* k)->std::string {
-        auto it = kv.find(k);
-        if (it == kv.end()) { fprintf(stderr, "params missing %s\n", k); exit(1); }
+    // Claim the footprint the job was actually given. The harness launches real GIZMO as
+    // `mpirun -np R` with OMP_NUM_THREADS=T, i.e. R*T-way parallelism; here rank 0 is the only
+    // worker, and mpirun has pinned it to just its own T hwthreads. Left alone, a 16x2 launch
+    // would run this engine 2-way. So widen the affinity mask back to every online CPU and take
+    // R*T threads -- the same total the job asked for, just all in one process.
+    {
+        const long n_cpus_online = sysconf(_SC_NPROCESSORS_ONLN);
+        cpu_set_t every_cpu;
+        CPU_ZERO(&every_cpu);
+        for (long cpu = 0; cpu < n_cpus_online && cpu < CPU_SETSIZE; ++cpu) CPU_SET(cpu, &every_cpu);
+        if (sched_setaffinity(0, sizeof(every_cpu), &every_cpu) != 0)
+            fprintf(stderr, "warning: could not widen CPU affinity; staying on mpirun's mask\n");
+        const char* omp_threads_env = getenv("OMP_NUM_THREADS");
+        const int threads_per_rank = omp_threads_env ? std::max(1, atoi(omp_threads_env)) : 1;
+        const int n_threads = std::min<long>((long)nranks * threads_per_rank, n_cpus_online);
+        omp_set_num_threads(n_threads);
+        printf("shmem-GIZMO: rank 0 of %d doing all work; %d OpenMP threads (%ld cpus online)\n",
+               nranks, n_threads, n_cpus_online);
+    }
+
+    auto params = parse_kv(argv[1]);
+    auto need = [&](const char* key)->std::string {
+        auto it = params.find(key);
+        if (it == params.end()) { fprintf(stderr, "params missing %s\n", key); exit(1); }
         return it->second;
     };
-    std::string icfile = need("InitCondFile") + ".hdf5";
-    std::string outdir = kv.count("OutputDir") ? kv["OutputDir"] : "output";
-    double tmax   = atof(need("TimeMax").c_str());
-    double dtsnap = kv.count("TimeBetSnapshot") ? atof(kv["TimeBetSnapshot"].c_str()) : tmax;
-    double dtmax  = kv.count("MaxSizeTimestep") ? atof(kv["MaxSizeTimestep"].c_str()) : 1e30;
-    double desngb = kv.count("DesNumNgb") ? atof(kv["DesNumNgb"].c_str()) : 32.0;
-    double cfl    = kv.count("CourantFac") ? atof(kv["CourantFac"].c_str()) : 0.2;
-    double box    = kv.count("BoxSize") ? atof(kv["BoxSize"].c_str()) : 0.0;
+    const std::string icfile = need("InitCondFile") + ".hdf5";
+    const std::string outdir = params.count("OutputDir") ? params["OutputDir"] : "output";
+    const double time_max = atof(need("TimeMax").c_str());
+    const double dt_snapshot =
+        params.count("TimeBetSnapshot") ? atof(params["TimeBetSnapshot"].c_str()) : time_max;
+    const double dt_max =
+        params.count("MaxSizeTimestep") ? atof(params["MaxSizeTimestep"].c_str()) : 1e30;
+    const double des_ngb = params.count("DesNumNgb") ? atof(params["DesNumNgb"].c_str()) : 32.0;
+    const double courant = params.count("CourantFac") ? atof(params["CourantFac"].c_str()) : 0.2;
+    const double box     = params.count("BoxSize") ? atof(params["BoxSize"].c_str()) : 0.0;
 
-    int dim = 3; double gamma = 5.0/3.0;
-    parse_config(dim, gamma);
+    int n_dims = 3; double gamma = 5.0/3.0;
+    parse_config(n_dims, gamma);
     printf("shmem-GIZMO: %s  dim=%d gamma=%.6f box=%g TimeMax=%g DesNumNgb=%g CFL=%g\n",
-           icfile.c_str(), dim, gamma, box, tmax, desngb, cfl);
+           icfile.c_str(), n_dims, gamma, box, time_max, des_ngb, courant);
     fflush(stdout);
 
     // load ICs
-    hid_t f = H5Fopen(icfile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    if (f < 0) { fprintf(stderr, "cannot open %s\n", icfile.c_str()); return 1; }
-    hid_t g = H5Gopen2(f, "PartType0", H5P_DEFAULT);
-    Sim S;
-    S.dim = dim; S.gamma = gamma; S.box = box; S.des_ngb = desngb; S.cfl = cfl;
-    S.P.x = h5_read(g, "Coordinates", 0);
-    S.P.y = h5_read(g, "Coordinates", 1);
-    S.P.z = h5_read(g, "Coordinates", 2);
-    S.P.m = h5_read(g, "Masses", -1);
-    S.vx = h5_read(g, "Velocities", 0);
-    S.vy = h5_read(g, "Velocities", 1);
-    S.vz = h5_read(g, "Velocities", 2);
-    S.u  = h5_read(g, "InternalEnergy", -1);
-    std::vector<double> ids_d = h5_read(g, "ParticleIDs", -1);
-    H5Gclose(g); H5Fclose(f);
-    S.P.soft.assign(S.size(), 0.0);
-    std::vector<long long> ids(S.size());
-    for (size_t i = 0; i < S.size(); ++i) ids[i] = (long long)ids_d[i];
+    hid_t ic_file = H5Fopen(icfile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (ic_file < 0) { fprintf(stderr, "cannot open %s\n", icfile.c_str()); return 1; }
+    hid_t gas_group = H5Gopen2(ic_file, "PartType0", H5P_DEFAULT);
+    Sim sim;
+    sim.dim = n_dims; sim.gamma = gamma; sim.box = box;
+    sim.des_ngb = des_ngb; sim.cfl = courant;
+    sim.P.x = h5_read(gas_group, "Coordinates", 0);
+    sim.P.y = h5_read(gas_group, "Coordinates", 1);
+    sim.P.z = h5_read(gas_group, "Coordinates", 2);
+    sim.P.m = h5_read(gas_group, "Masses", -1);
+    sim.vx  = h5_read(gas_group, "Velocities", 0);
+    sim.vy  = h5_read(gas_group, "Velocities", 1);
+    sim.vz  = h5_read(gas_group, "Velocities", 2);
+    sim.u   = h5_read(gas_group, "InternalEnergy", -1);
+    const std::vector<double> ids_as_double = h5_read(gas_group, "ParticleIDs", -1);
+    H5Gclose(gas_group); H5Fclose(ic_file);
+    sim.P.soft.assign(sim.size(), 0.0);
+    std::vector<long long> particle_ids(sim.size());
+    for (size_t i = 0; i < sim.size(); ++i) particle_ids[i] = (long long)ids_as_double[i];
 
     (void)system(("mkdir -p " + outdir).c_str());
 
     // snapshot 0 needs Density/h populated: run the volume solve once without stepping
     {
-        Tree T = build(S.P);
-        std::vector<uint32_t> all(S.size());
-        for (size_t i = 0; i < all.size(); ++i) all[i] = (uint32_t)i;
-        DensityResult R = density(T, S.P, all, S.des_ngb, {}, S.box, S.dim);
-        S.h = R.h;
-        S.rho.assign(S.size(), 0.0);
-        for (size_t i = 0; i < S.size(); ++i) S.rho[i] = R.rho[i];
+        const Tree tree = build(sim.P);
+        std::vector<uint32_t> all_particles(sim.size());
+        for (size_t i = 0; i < all_particles.size(); ++i) all_particles[i] = (uint32_t)i;
+        const DensityResult solved =
+            density(tree, sim.P, all_particles, sim.des_ngb, {}, sim.box, sim.dim);
+        sim.h = solved.h;
+        sim.rho = solved.rho;
     }
-    write_snapshot(S, ids, outdir, 0, 0.0);
+    write_snapshot(sim, particle_ids, outdir, 0, 0.0);
 
-    double t = 0; int snap = 1; int steps = 0;
-    double next_snap = dtsnap;
-    while (t < tmax - 1e-12) {
-        double target = std::min(next_snap, tmax);
-        t += mfm_step(S, std::min(dtmax, target - t));
-        ++steps;
-        if (t >= target - 1e-12 && target < tmax) {
-            write_snapshot(S, ids, outdir, snap++, t);
-            next_snap += dtsnap;
+    double time = 0; int snapshot_num = 1; int n_steps = 0;
+    double next_snapshot_time = dt_snapshot;
+    const auto wall_start = std::chrono::steady_clock::now();
+    while (time < time_max - 1e-12) {
+        const double target_time = std::min(next_snapshot_time, time_max);
+        time += mfm_step(sim, std::min(dt_max, target_time - time));
+        ++n_steps;
+        if (n_steps % 200 == 0) {
+            const double wall_elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+            printf("  step %d  t=%.5g/%g  %.2f ms/step\n",
+                   n_steps, time, time_max, 1e3 * wall_elapsed / n_steps);
+            fflush(stdout);
+        }
+        if (time >= target_time - 1e-12 && target_time < time_max) {
+            write_snapshot(sim, particle_ids, outdir, snapshot_num++, time);
+            next_snapshot_time += dt_snapshot;
         }
     }
-    write_snapshot(S, ids, outdir, snap, t);
-    printf("done: t=%.6g in %d steps\n", t, steps);
+    write_snapshot(sim, particle_ids, outdir, snapshot_num, time);
+    printf("done: t=%.6g in %d steps\n", time, n_steps);
     MPI_Finalize();
     return 0;
 }

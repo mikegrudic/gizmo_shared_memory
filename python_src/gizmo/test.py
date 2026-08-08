@@ -192,6 +192,11 @@ def run_test(test_name: str, num_mpi_ranks: int = 1, num_openmp_threads: int = 0
     No-op when GIZMO_TEST_SKIP_BUILD_RUN is set (we're validating externally produced snapshots)."""
     if environ.get("GIZMO_TEST_SKIP_BUILD_RUN"):
         return
+    if environ.get("GIZMO_PREBUILT"):
+        # The shared-memory engine in shmem/ has no MPI decomposition: one process does all the
+        # work. Under the normal R x T launch the other R-1 ranks would just sit in the collective
+        # MPI_Finalize for the whole run. Give it the same total core count as a single rank.
+        num_mpi_ranks, num_openmp_threads = 1, num_mpi_ranks * max(num_openmp_threads, 1)
     if num_openmp_threads > 0:
         environ["OMP_NUM_THREADS"] = str(num_openmp_threads)
     else:
