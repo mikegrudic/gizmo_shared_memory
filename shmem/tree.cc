@@ -124,7 +124,7 @@ Tree build(const Particles& P, BuildTimes* bt) {
         lo[1] = std::min(lo[1], P.y[i]); hi[1] = std::max(hi[1], P.y[i]);
         lo[2] = std::min(lo[2], P.z[i]); hi[2] = std::max(hi[2], P.z[i]);
     }
-    if(bt) bt->bbox = now_ms()-t_a; t_a = now_ms();
+    if(bt) { bt->bbox = now_ms()-t_a; } t_a = now_ms();
     double cx = 0.5*(lo[0]+hi[0]), cy = 0.5*(lo[1]+hi[1]), cz = 0.5*(lo[2]+hi[2]);
     double side = std::max(hi[0]-lo[0], std::max(hi[1]-lo[1], hi[2]-lo[2])) * 1.0000001;
     if (side <= 0) side = 1.0;
@@ -140,10 +140,10 @@ Tree build(const Particles& P, BuildTimes* bt) {
         key[i] = morton(a, b, c);
         order[i] = (uint32_t)i;
     }
-    if(bt) bt->keys = now_ms()-t_a; t_a = now_ms();
+    if(bt) { bt->keys = now_ms()-t_a; } t_a = now_ms();
     __gnu_parallel::sort(order.begin(), order.end(),
               [&](uint32_t a, uint32_t b) { return key[a] < key[b]; });
-    if(bt) bt->sort = now_ms()-t_a; t_a = now_ms();
+    if(bt) { bt->sort = now_ms()-t_a; } t_a = now_ms();
     std::vector<uint64_t> skey(n);
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) skey[i] = key[order[i]];
@@ -165,13 +165,13 @@ Tree build(const Particles& P, BuildTimes* bt) {
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
         T.plo.resize(nn); T.phi.resize(nn);
     }
-    if(bt) bt->recurse = now_ms()-t_a; t_a = now_ms();
+    if(bt) { bt->recurse = now_ms()-t_a; } t_a = now_ms();
     setup_walk(T, T.root, -1);
     // Leaf ranges index the Morton-sorted order, so the tree owns it: a leaf's particles are
     // orderbuf[plo..phi), contiguous by construction.
     T.orderbuf.swap(order);
 
-    if(bt) bt->links = now_ms()-t_a; t_a = now_ms();
+    if(bt) { bt->links = now_ms()-t_a; } t_a = now_ms();
     // Pack the traversal copy: one 64-byte line per node instead of 9 scattered arrays.
     T.wn.resize(T.nnodes());
     #pragma omp parallel for schedule(static)

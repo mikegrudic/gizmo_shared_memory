@@ -16,3 +16,5 @@ step_overhead: step_overhead.cc
 clean:
 	rm -f $(BIN)
 .PHONY: all clean
+test_hydro: test_hydro.cc hydro.cc hydro.h tree.cc tree.h
+	$(CXX) $(CXXFLAGS) -o $@ test_hydro.cc hydro.cc tree.cc
