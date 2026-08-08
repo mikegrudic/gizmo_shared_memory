@@ -71,7 +71,13 @@ struct Sim {
     bool   adaptive_soft = true;       // ADAPTIVE_GRAVSOFT_FORGAS: soften on h, not a fixed length
     double eta_grav   = 0.025;         // accuracy of the dt = sqrt(2 eta eps / |a|) criterion
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
-    double pending_half_kick = 0.0;    // dt/2 owed from the previous step's closing kick
+    // Half-kick owed by each particle from the close of ITS OWN previous step. Must be per
+    // particle: with a spread of timebins the closing half-kick a particle owes is half of its own
+    // last step, which has nothing to do with the system step. A single shared scalar silently
+    // under-kicks every particle on a longer bin -- 25% low for a bin-0 particle alongside bin-1
+    // neighbours -- so gravity comes out systematically weak exactly where the bin spread is
+    // widest, which in a collapse is the core.
+    std::vector<double> pending_half_kick;
 
     // ---- individual (hierarchical) timesteps ----
     // A particle on bin b steps dt_base / 2^b. Time is tracked as an INTEGER count of ticks, where

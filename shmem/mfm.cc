@@ -702,15 +702,17 @@ double mfm_step(Sim& sim, double dt_max) {
     // this step's opening half-kick use the same acceleration and are applied together. That is
     // what keeps the scheme a proper leapfrog on one tree walk per step rather than two.
     if (sim.gravity_on) {
+        sim.pending_half_kick.resize(n_part, 0.0);
         #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
-            const double kick_dt = sim.pending_half_kick + 0.5 * dt_of[i];
+            const double kick_dt = sim.pending_half_kick[i] + 0.5 * dt_of[i];
             sim.vx[i] += sim.a_grav[i][0] * kick_dt;
             sim.vy[i] += sim.a_grav[i][1] * kick_dt;
             sim.vz[i] += sim.a_grav[i][2] * kick_dt;
+            // what THIS particle will owe when it next becomes active -- half of its OWN step
+            sim.pending_half_kick[i] = 0.5 * dt_of[i];
         }
-        sim.pending_half_kick = 0.5 * dt;
         // The predicted primitives carry velocity, so re-predict after the kick rather than
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
         // scale and adds no jump across a face).

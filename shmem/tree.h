@@ -141,6 +141,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                    double theta, double G, int batch /* = 8 */, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az);
 
+// Gravitational potential at each target, spline-softened to match accel(). Separate from the
+// force walk because it is only wanted for diagnostics -- but it is the diagnostic that matters
+// for a self-gravitating run, since kinetic + internal alone is not a conserved quantity and can
+// look perfectly steady while the integrator quietly mis-applies gravity.
+void potential(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
+               double theta, double G, std::vector<double>& phi);
+
 // Direct O(N*M) summation, for validating the tree.
 void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, double G,
                  std::vector<double>& ax, std::vector<double>& ay, std::vector<double>& az);

@@ -8,13 +8,41 @@ static double now_ms(){using c=std::chrono::steady_clock;
 
 namespace shmem {
 
-// Softened point-mass acceleration, Plummer-equivalent. Kept trivial for now: the validation target
-// is the TREE (opening criterion, traversal, moments), not the force kernel, and a spline kernel can
-// be dropped in later without touching the traversal.
-static inline void kick(const Vec3d& offset, double mass, double softening_sq, Vec3d& accel) {
-    const double r_sq = offset.norm_sq() + softening_sq;
-    const double inv_r_cubed = 1.0 / (r_sq * std::sqrt(r_sq));
-    accel += offset * (mass * inv_r_cubed);
+// (1/r) d(phi)/dr for cubic-spline softening -- GIZMO's kernel_gravity(mode=1), mesh/kernel.h.
+// Multiply by the offset vector to get the acceleration.
+//
+// The decisive property is that this is EXACTLY Newtonian for r >= h. Plummer softening,
+// 1/(r^2+eps^2)^{3/2}, never is: it sits at 0.35 of Newtonian at r=eps, 0.72 at 2eps and 0.86 at
+// 3eps, so with adaptive softening (eps = h) it under-counts gravity across a whole neighbourhood
+// rather than just below the resolution limit. In Evrard that suppressed the central density by
+// about 2x against the reference solution -- and a PRESSURELESS free-fall test cannot see it,
+// because there the softening length is tiny next to the cloud and the error never bites.
+static inline double spline_force_over_r(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double h_inv3 = h_inv * h_inv * h_inv;
+    const double u = r * h_inv;
+    if (u >= 1.0) return 1.0 / (r * r * r);          // Newtonian outside the softening
+    if (u < 0.5) return h_inv3 * (10.666666666666667 + u*u*(32.0*u - 38.4));
+    return h_inv3 * (21.333333333333332 - 48.0*u + 38.4*u*u - 10.666666666666667*u*u*u
+                     - 0.06666666666666667/(u*u*u));
+}
+
+// phi(r) for the same cubic spline -- GIZMO's kernel_gravity(mode=-1). Exactly -1/r beyond h, so
+// the potential and the force below come from one consistent kernel.
+static inline double spline_potential(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double u = r * h_inv;
+    if (u >= 1.0) return -1.0 / r;
+    if (u < 0.5)
+        return h_inv * (-2.8 + u*u*(5.333333333333333 + u*u*(6.4*u - 9.6)));
+    return h_inv * (-3.2 + 0.06666666666666667/u
+                    + u*u*(10.666666666666667 + u*(-16.0 + u*(9.6 - 2.1333333333333333*u))));
+}
+
+static inline void kick(const Vec3d& offset, double mass, double softening, Vec3d& accel) {
+    const double r = offset.norm();
+    if (r <= 0) return;
+    accel += offset * (mass * spline_force_over_r(r, std::max(softening, 1e-300)));
 }
 
 // Component form, for the grouped walk ONLY. That loop keeps its batch in SoA scratch buffers on
@@ -22,13 +50,15 @@ static inline void kick(const Vec3d& offset, double mass, double softening_sq, V
 // which is the entire reason grouping wins. Feeding it Vec3d would make the batch AoS and give that
 // back, so the one hot loop that wants components gets them.
 static inline void kick(double offset_x, double offset_y, double offset_z,
-                        double mass, double softening_sq,
+                        double mass, double softening,
                         double& accel_x, double& accel_y, double& accel_z) {
-    const double r_sq = offset_x*offset_x + offset_y*offset_y + offset_z*offset_z + softening_sq;
-    const double inv_r_cubed = 1.0 / (r_sq * std::sqrt(r_sq));
-    accel_x += mass * offset_x * inv_r_cubed;
-    accel_y += mass * offset_y * inv_r_cubed;
-    accel_z += mass * offset_z * inv_r_cubed;
+    const double r_sq = offset_x*offset_x + offset_y*offset_y + offset_z*offset_z;
+    if (r_sq <= 0) return;
+    const double force_over_r =
+        mass * spline_force_over_r(std::sqrt(r_sq), std::max(softening, 1e-300));
+    accel_x += offset_x * force_over_r;
+    accel_y += offset_y * force_over_r;
+    accel_z += offset_z * force_over_r;
 }
 
 int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
@@ -229,11 +259,11 @@ void accel(const Tree& tree, const Particles& particles, const std::vector<uint3
                         if (j == target) continue;
                         const double soft = std::max(
                             soft_target, particles.soft.empty() ? 0.0 : particles.soft[j]);
-                        kick(particles.pos(j) - pos_target, particles.m[j], soft*soft, accel);
+                        kick(particles.pos(j) - pos_target, particles.m[j], soft, accel);
                     }
                 } else {                                  // far enough: use the monopole
                     const double soft = std::max(soft_target, (double)node.soft);
-                    kick(to_com, node.mass, soft*soft, accel);
+                    kick(to_com, node.mass, soft, accel);
                 }
                 node_id = node.next;
             } else {
@@ -271,11 +301,11 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
                         uint32_t q = T.orderbuf[i];
                         if (q == p) continue;
                         double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-                        kick(P.pos(q) - xp, P.m[q], e2*e2, acc);
+                        kick(P.pos(q) - xp, P.m[q], e2, acc);
                     }
                 } else {
                     double e2 = std::max(eps, T.soft[node]);
-                    kick(d, T.mass[node], e2*e2, acc);
+                    kick(d, T.mass[node], e2, acc);
                 }
                 node = T.next[node];
             } else {
@@ -335,13 +365,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                         for (int i = 0; i < nb_; ++i) {
                             if (targets[lo+i] == q) continue;
                             double e = std::max(te[i], qs);
-                            kick(qx-tx[i], qy-ty[i], qz-tz[i], qm, e*e, oax[i], oay[i], oaz[i]);
+                            kick(qx-tx[i], qy-ty[i], qz-tz[i], qm, e, oax[i], oay[i], oaz[i]);
                         }
                     }
                 } else {
                     for (int i = 0; i < nb_; ++i) {
                         double e = std::max(te[i], (double)w.soft);
-                        kick(w.cx-tx[i], w.cy-ty[i], w.cz-tz[i], w.mass, e*e, oax[i], oay[i], oaz[i]);
+                        kick(w.cx-tx[i], w.cy-ty[i], w.cz-tz[i], w.mass, e, oax[i], oay[i], oaz[i]);
                     }
                 }
                 node = w.next;
@@ -351,6 +381,47 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
         }
         for (int i = 0; i < nb_; ++i) { ax[lo+i]=G*oax[i]; ay[lo+i]=G*oay[i]; az[lo+i]=G*oaz[i]; }
 
+    }
+}
+
+void potential(const Tree& tree, const Particles& particles, const std::vector<uint32_t>& targets,
+               double theta, double G, std::vector<double>& phi) {
+    const size_t n_targets = targets.size();
+    phi.assign(n_targets, 0.0);
+    const double theta_sq = theta * theta;
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (size_t t = 0; t < n_targets; ++t) {
+        const uint32_t target = targets[t];
+        const Vec3d pos_target = particles.pos(target);
+        const double soft_target = particles.soft.empty() ? 0.0 : particles.soft[target];
+        double sum = 0;
+        const WNode* __restrict nodes = tree.wn.data();
+        int node_id = tree.root;
+        while (node_id >= 0) {
+            const WNode& node = nodes[node_id];
+            const Vec3d to_com = Vec3d{node.cx, node.cy, node.cz} - pos_target;
+            const double r_sq = to_com.norm_sq();
+            if (node.first < 0 || node.s * node.s < theta_sq * r_sq) {
+                if (node.first < 0) {
+                    for (int slot = node.plo; slot < node.phi; ++slot) {
+                        const uint32_t j = tree.orderbuf[slot];
+                        if (j == target) continue;
+                        const double soft = std::max(
+                            soft_target, particles.soft.empty() ? 0.0 : particles.soft[j]);
+                        const double r = (particles.pos(j) - pos_target).norm();
+                        if (r > 0) sum += particles.m[j] * spline_potential(r, std::max(soft, 1e-300));
+                    }
+                } else {
+                    const double soft = std::max(soft_target, (double)node.soft);
+                    const double r = std::sqrt(r_sq);
+                    if (r > 0) sum += node.mass * spline_potential(r, std::max(soft, 1e-300));
+                }
+                node_id = node.next;
+            } else {
+                node_id = node.first;
+            }
+        }
+        phi[t] = G * sum;
     }
 }
 
@@ -367,7 +438,7 @@ void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, doubl
         for (size_t q = 0; q < n; ++q) {
             if (q == p) continue;
             double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-            kick(P.pos(q) - xp, P.m[q], e2*e2, acc);
+            kick(P.pos(q) - xp, P.m[q], e2, acc);
         }
         ax[t] = G*acc[0]; ay[t] = G*acc[1]; az[t] = G*acc[2];
     }
