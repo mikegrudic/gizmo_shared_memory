@@ -35,9 +35,9 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
                const std::vector<uint64_t>& key, int lo, int hi, int level,
                double cxi, double cyi, double czi, double sz) {
     // Lock-free allocation: arrays are pre-sized (worst case ~2N/LEAF_MAX interior+leaf nodes,
-    // bounded by 2N), so claiming a node is one atomic increment. The earlier critical section
-    // around ten push_backs serialised every task on one lock and made the parallel build 3x SLOWER
-    // than the serial one.
+    // bounded by 2N), so claiming a node is one atomic increment. Do NOT replace this with a
+    // critical section around push_backs on the node arrays -- that serialises every task on one
+    // lock and measured 3x SLOWER than building the tree serially.
     int me;
     #pragma omp atomic capture
     me = T.nalloc++;

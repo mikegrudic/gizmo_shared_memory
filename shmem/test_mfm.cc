@@ -274,5 +274,84 @@ int main(int argc, char** argv) {
         }
         if (bad) { printf("  [gradients] %d configuration(s) failed exactness\n", bad); return 1; }
     }
+
+    // ---------- self-gravity: pressureless collapse of a uniform sphere ----------
+    // A cold uniform sphere collapses HOMOLOGOUSLY, so every shell follows the same exact
+    // parametric solution and the whole cloud is one measurement:
+    //     r/r0 = cos^2(beta),   t = sqrt(3/(8 pi G rho0)) * (beta + sin beta cos beta)
+    // reaching r=0 at t_ff = sqrt(3 pi / (32 G rho0)).
+    // This tests the force MAGNITUDE and the KDK time integration together, which the tree's
+    // own accuracy check (vs direct summation) cannot: that one validates the walk against
+    // brute force, and would pass just as well with G, the softening, or the kick sequence wrong.
+    // Swept over SOFTENING, not dt. Halving dt moves the answer by <1%% of itself, so the residual
+    // is not time-integration error; it is the softening, which weakens gravity below eps and must
+    // therefore SLOW the collapse. Adaptive softening puts eps at the kernel radius, ~0.13 of the
+    // sphere radius here, so a percent-level lag is expected physics rather than a bug. The test is
+    // that the error falls toward zero as eps does -- that is what pins G, the kick sequence and
+    // the force normalisation simultaneously. (eps=0 is the unsoftened limit; safe on a lattice,
+    // where the closest pair is a full grid spacing apart.)
+    for (double soften : {0.0, 0.03, 0.01}) {
+        const int n_side = 32;
+        const double radius0 = 1.0, G = 1.0, total_mass = 1.0;
+        Sim sim = make_lattice(n_side, n_side, n_side, 2.0);      // cube of side 2, centred at 1
+        // carve the inscribed sphere out of the lattice
+        Sim sphere; sphere.box = 0.0; sphere.dim = 3;
+        for (size_t i = 0; i < sim.size(); ++i) {
+            const Vec3d offset = sim.P.pos(i) - Vec3d{1.0, 1.0, 1.0};
+            if (offset.norm() > radius0) continue;
+            sphere.P.x.push_back(offset[0]);
+            sphere.P.y.push_back(offset[1]);
+            sphere.P.z.push_back(offset[2]);
+        }
+        const size_t n_part = sphere.P.x.size();
+        sphere.P.m.assign(n_part, total_mass / n_part);
+        sphere.P.soft.assign(n_part, 0.0);
+        sphere.vx.assign(n_part, 0.0); sphere.vy.assign(n_part, 0.0); sphere.vz.assign(n_part, 0.0);
+        sphere.u.assign(n_part, 1e-8);          // cold: pressure must not resist the collapse
+        sphere.gamma = 5.0/3.0; sphere.des_ngb = 32.0; sphere.cfl = 0.2;
+        sphere.gravity_on = true; sphere.G = G; sphere.theta = 0.4;
+        // soften == 0 selects the adaptive (h-based) softening the evrard config asks for;
+        // the finite values are fixed softenings well below the sphere radius.
+        sphere.adaptive_soft = (soften == 0.0);
+        sphere.soft_min = soften;
+        sphere.eta_grav = 0.00625;
+
+        const double rho0 = total_mass / (4.0/3.0*M_PI*radius0*radius0*radius0);
+        const double t_ff = std::sqrt(3.0*M_PI / (32.0*G*rho0));
+        const double t_end = 0.4 * t_ff;
+
+        auto median_radius = [&](const Sim& s) {
+            std::vector<double> radii(s.size());
+            for (size_t i = 0; i < s.size(); ++i) radii[i] = s.P.pos(i).norm();
+            std::nth_element(radii.begin(), radii.begin()+radii.size()/2, radii.end());
+            return radii[radii.size()/2];
+        };
+        const double r_med0 = median_radius(sphere);
+
+        double t = 0;
+        int steps = 0;
+        while (t < t_end - 1e-12) { t += mfm_step(sphere, t_end - t); ++steps; }
+
+        // exact: solve t/sqrt(3/(8 pi G rho0)) = beta + sin beta cos beta for beta, then r/r0
+        const double tau = t / std::sqrt(3.0/(8.0*M_PI*G*rho0));
+        double lo = 0, hi = M_PI/2;
+        for (int it = 0; it < 200; ++it) {
+            const double mid = 0.5*(lo+hi);
+            if (mid + std::sin(mid)*std::cos(mid) < tau) lo = mid; else hi = mid;
+        }
+        const double beta = 0.5*(lo+hi);
+        const double ratio_exact = std::cos(beta)*std::cos(beta);
+        const double ratio_sim = median_radius(sphere) / r_med0;
+        const double err = std::abs(ratio_sim - ratio_exact) / ratio_exact;
+
+        char soft_label[32];
+        if (soften == 0.0) snprintf(soft_label, sizeof soft_label, "adaptive(~h)");
+        else snprintf(soft_label, sizeof soft_label, "%.3f", soften);
+        printf("  [gravity] cold sphere N=%zu, eps=%-12s t=%.2f t_ff in %4d steps: "
+               "r/r0 = %.5f vs %.5f exact, rel err = %.2e  %s\n",
+               n_part, soft_label, t/t_ff, steps, ratio_sim, ratio_exact, err,
+               err < 0.02 ? "OK" : "** FAIL **");
+        if (err >= 0.02) return 1;
+    }
     return 0;
 }

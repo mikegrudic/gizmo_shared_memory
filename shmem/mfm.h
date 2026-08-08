@@ -25,7 +25,7 @@
 namespace shmem {
 
 struct Sim {
-    Particles P;                       // positions + masses (+ soft, unused here)
+    Particles P;                       // positions + masses + gravitational softening
     std::vector<double> vx, vy, vz;    // velocities
     std::vector<double> u;             // specific internal energy
     double gamma = 5.0 / 3.0;
@@ -34,6 +34,16 @@ struct Sim {
     double des_ngb = 32.0;
     double cfl     = 0.25;
 
+    // ---- self-gravity (off unless gravity_on; SELFGRAVITY_OFF in the suite configs) ----
+    bool   gravity_on = false;
+    double G          = 1.0;           // GravityConstantInternal
+    double theta      = 0.5;           // Barnes-Hut opening angle
+    double soft_min   = 0.0;           // floor on the gas softening (SofteningGas)
+    bool   adaptive_soft = true;       // ADAPTIVE_GRAVSOFT_FORGAS: soften on h, not a fixed length
+    double eta_grav   = 0.025;         // accuracy of the dt = sqrt(2 eta eps / |a|) criterion
+    std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
+    double pending_half_kick = 0.0;    // dt/2 owed from the previous step's closing kick
+
     // derived per step
     std::vector<double> h, ninv, rho, press;
 
@@ -41,6 +51,12 @@ struct Sim {
 };
 
 // One MUSCL-Hancock step at global dt; returns the dt actually taken (min of CFL and dt_max).
+//
+// With gravity_on this is a leapfrog KDK, arranged so that only ONE tree walk per step is needed.
+// The trick is that a step's closing half-kick and the next step's opening half-kick both use the
+// acceleration at the SAME instant -- the shared sync point -- so they can be applied together from
+// one evaluation. `pending_half_kick` carries the dt/2 owed by the previous step; a fresh Sim starts
+// at 0, which makes the very first step a correct half-step opening.
 double mfm_step(Sim& sim, double dt_max);
 
 // Diagnostics used by the tests.

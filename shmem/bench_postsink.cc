@@ -4,8 +4,9 @@
 // to be the DENSEST cells, since dt ~ 1/sqrt(G rho) orders timesteps by density. That set is what
 // the deepest timebin actually contains: for 620 cells it spans 0.0033 pc, under 1% of the cloud.
 //
-// Compared against the same number of cells chosen at random -- the pessimal case my earlier
-// synthetic test wrongly used, kept here to show the size of that error.
+// Compared against the same number of cells chosen at RANDOM. That is the pessimal case, and it is
+// what a synthetic active set gives you by default; the two are reported side by side because the
+// gap between them is large enough to invalidate any walk timing measured the naive way.
 #include "tree.h"
 #include <algorithm>
 #include <chrono>

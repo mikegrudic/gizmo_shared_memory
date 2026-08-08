@@ -45,13 +45,20 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 }
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
-static void parse_config(int& n_dims, double& gamma) {
+static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft) {
+    // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
+    // switch it off -- the opposite default would silently drop gravity from any test whose
+    // Config.sh simply does not mention it.
+    gravity_on = true;
+    adaptive_soft = false;
     for (const char* path : {"Config.sh", "../../Config.sh"}) {
         FILE* file = fopen(path, "r");
         if (!file) continue;
         char line[512];
         while (fgets(line, sizeof line, file)) {
             if (line[0] == '#') continue;
+            if (strncmp(line, "SELFGRAVITY_OFF", 15) == 0) gravity_on = false;
+            if (strncmp(line, "ADAPTIVE_GRAVSOFT_FORGAS", 24) == 0) adaptive_soft = true;
             int dims_from_config;
             if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
                 n_dims = dims_from_config;
@@ -226,9 +233,17 @@ int main(int argc, char** argv) {
     const double box     = params.count("BoxSize") ? atof(params["BoxSize"].c_str()) : 0.0;
 
     int n_dims = 3; double gamma = 5.0/3.0;
-    parse_config(n_dims, gamma);
+    bool gravity_on = false, adaptive_soft = false;
+    parse_config(n_dims, gamma, gravity_on, adaptive_soft);
+    const double grav_const = params.count("GravityConstantInternal")
+                            ? atof(params["GravityConstantInternal"].c_str()) : 1.0;
+    const double soft_gas = params.count("SofteningGas")
+                          ? atof(params["SofteningGas"].c_str()) : 0.0;
     printf("shmem-GIZMO: %s  dim=%d gamma=%.6f box=%g TimeMax=%g DesNumNgb=%g CFL=%g\n",
            icfile.c_str(), n_dims, gamma, box, time_max, des_ngb, courant);
+    printf("shmem-GIZMO: gravity=%s%s G=%g SofteningGas=%g\n",
+           gravity_on ? "on" : "off", (gravity_on && adaptive_soft) ? " (adaptive)" : "",
+           grav_const, soft_gas);
     fflush(stdout);
 
     // load ICs
@@ -238,6 +253,8 @@ int main(int argc, char** argv) {
     Sim sim;
     sim.dim = n_dims; sim.gamma = gamma; sim.box = box;
     sim.des_ngb = des_ngb; sim.cfl = courant;
+    sim.gravity_on = gravity_on; sim.G = grav_const;
+    sim.soft_min = soft_gas; sim.adaptive_soft = adaptive_soft;
     sim.P.x = h5_read(gas_group, "Coordinates", 0);
     sim.P.y = h5_read(gas_group, "Coordinates", 1);
     sim.P.z = h5_read(gas_group, "Coordinates", 2);
@@ -269,15 +286,23 @@ int main(int argc, char** argv) {
     double time = 0; int snapshot_num = 1; int n_steps = 0;
     double next_snapshot_time = dt_snapshot;
     const auto wall_start = std::chrono::steady_clock::now();
+    // Heartbeat on WALL CLOCK, not step count: a step-count heartbeat stays silent until it first
+    // fires, so the slower the run the longer it reports nothing -- backwards from what is wanted.
+    double next_report = 10.0;
     while (time < time_max - 1e-12) {
         const double target_time = std::min(next_snapshot_time, time_max);
-        time += mfm_step(sim, std::min(dt_max, target_time - time));
+        const double dt_taken = mfm_step(sim, std::min(dt_max, target_time - time));
+        time += dt_taken;
         ++n_steps;
-        if (n_steps % 200 == 0) {
-            const double wall_elapsed =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
-            printf("  step %d  t=%.5g/%g  %.2f ms/step\n",
-                   n_steps, time, time_max, 1e3 * wall_elapsed / n_steps);
+        const double wall_elapsed =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+        if (wall_elapsed >= next_report) {
+            next_report = wall_elapsed + 10.0;
+            const double frac = time / time_max;
+            printf("  step %d  t=%.5g/%g (%.1f%%)  dt=%.3g  %.0f ms/step  eta %.1f min\n",
+                   n_steps, time, time_max, 100.0*frac, dt_taken,
+                   1e3 * wall_elapsed / n_steps,
+                   frac > 0 ? wall_elapsed * (1.0/frac - 1.0) / 60.0 : -1.0);
             fflush(stdout);
         }
         if (time >= target_time - 1e-12 && target_time < time_max) {
