@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
                     if (dim >= 3) S.P.z[i] += jit*d*std::sin(41.0*i);
                 }
                 double err = linear_gradient_error(S);
-                bool ok = err < 1e-9;
+                bool ok = (err >= 0.0) && (err < 1e-9);      // negative = no interior to score
                 if (!ok) ++bad;
                 printf("  [gradients] %dD jitter=%.2f: max rel err vs exact linear = %.3e  %s\n",
                        dim, jit, err, ok ? "OK" : "** FAIL **");

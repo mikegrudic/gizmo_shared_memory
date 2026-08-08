@@ -41,6 +41,14 @@ static inline Vec3d min_image(Vec3d separation, double box) {
 // box lengths per step, and a lone `coord -= box` would leave the coordinate outside the box.
 static inline double fold_into_box(double coord, double box) {
     if (box <= 0) return coord;
+    // Fast paths first. This runs for EVERY particle EVERY step, and fmod is a libm call an order
+    // of magnitude dearer than a compare -- with millions of particles it was the single largest
+    // cost in the drift. Almost always the coordinate is already inside, or one box out; the fmod
+    // is kept only for the genuine multi-box jump (a fast advection test can cross more than one
+    // box length per step, which is why a lone subtract is not enough).
+    if (coord >= 0.0 && coord < box) return coord;
+    if (coord >= box && coord < 2.0*box) return coord - box;
+    if (coord < 0.0 && coord >= -box)   return coord + box;
     coord = std::fmod(coord, box);
     return (coord < 0) ? coord + box : coord;
 }

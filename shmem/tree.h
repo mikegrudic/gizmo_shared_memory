@@ -84,6 +84,13 @@ struct Tree {
     int root = 0;
     int nalloc = 0;                     // bump allocator cursor for lock-free node claiming
 
+    // Conservative inflation of every node's opening radius, so a tree built at earlier positions
+    // stays USABLE after particles have drifted. Set it to (an upper bound on) how far any particle
+    // has moved since the build: the neighbour prune then still cannot reject a node that contains a
+    // true neighbour, because leaf tests read live coordinates and only the prune is approximate.
+    // This is what lets the tree be reused across many sync points instead of rebuilt every one.
+    double pad = 0.0;
+
     size_t nnodes() const { return mass.size(); }   // valid after build() trims to nalloc
 };
 

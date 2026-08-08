@@ -10,8 +10,9 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
     while (node_id >= 0) {
         const WNode& node = nodes[node_id];
         const Vec3d to_com = min_image(Vec3d{node.cx, node.cy, node.cz} - centre, box);
-        // conservative: every particle in the node lies within node.s of its centre of mass
-        const double keep_within = radius + node.s;
+        // conservative: every particle in the node lies within node.s of its centre of mass, plus
+        // tree.pad for however far particles have drifted since the tree was built
+        const double keep_within = radius + node.s + tree.pad;
         if (to_com.norm_sq() > keep_within * keep_within) { node_id = node.next; continue; }
         if (node.first < 0) {
             for (int slot = node.plo; slot < node.phi; ++slot) {

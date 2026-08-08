@@ -255,6 +255,12 @@ int main(int argc, char** argv) {
     sim.des_ngb = des_ngb; sim.cfl = courant;
     sim.gravity_on = gravity_on; sim.G = grav_const;
     sim.soft_min = soft_gas; sim.adaptive_soft = adaptive_soft;
+    // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
+    sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
+    if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));
+    set_time_base(sim, dt_snapshot, dt_max);
+    printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
+           sim.individual_timesteps ? "individual" : "global", sim.dt_base);
     sim.P.x = h5_read(gas_group, "Coordinates", 0);
     sim.P.y = h5_read(gas_group, "Coordinates", 1);
     sim.P.z = h5_read(gas_group, "Coordinates", 2);
@@ -271,16 +277,9 @@ int main(int argc, char** argv) {
 
     (void)system(("mkdir -p " + outdir).c_str());
 
-    // snapshot 0 needs Density/h populated: run the volume solve once without stepping
-    {
-        const Tree tree = build(sim.P);
-        std::vector<uint32_t> all_particles(sim.size());
-        for (size_t i = 0; i < all_particles.size(); ++i) all_particles[i] = (uint32_t)i;
-        const DensityResult solved =
-            density(tree, sim.P, all_particles, sim.des_ngb, {}, sim.box, sim.dim);
-        sim.h = solved.h;
-        sim.rho = solved.rho;
-    }
+    // snapshot 0 needs Density/h populated. Use the engine's own volume solve, NOT the SPH-style
+    // sum_j m_j W that the neighbour routine returns -- see compute_initial_state.
+    compute_initial_state(sim);
     write_snapshot(sim, particle_ids, outdir, 0, 0.0);
 
     double time = 0; int snapshot_num = 1; int n_steps = 0;
@@ -304,6 +303,10 @@ int main(int argc, char** argv) {
                    1e3 * wall_elapsed / n_steps,
                    frac > 0 ? wall_elapsed * (1.0/frac - 1.0) / 60.0 : -1.0);
             fflush(stdout);
+            // On the same heartbeat rather than every sync: GIZMO dumps this per sync point, which
+            // here would be thousands of tables. This keeps it readable while still showing how the
+            // hierarchy evolves as the run proceeds.
+            if (sim.individual_timesteps) print_timebins(sim, dt_taken, time);
         }
         if (time >= target_time - 1e-12 && target_time < time_max) {
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time);

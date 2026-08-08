@@ -11,16 +11,19 @@
 // Lagrangian and mass-per-particle constant -- and the remaining fluxes in the lab frame are
 //   dP/dt = -|A| P* nhat        dE/dt = -|A| P* (v_face . nhat)
 //
-// Reconstruction: linear, with a pairwise minmod limit at each face (no per-particle scalar
-// limiter yet). Time integration: global-timestep MUSCL-Hancock -- primitives predicted a half
-// step with the Lagrangian derivatives (Drho/Dt = -rho div v, Dv/Dt = -grad P/rho,
+// Reconstruction: linear, limited ONCE PER PARTICLE against its whole neighbourhood (Hopkins 2015
+// appendix B), with only a range clamp at each face. Time integration: MUSCL-Hancock -- primitives
+// predicted a half step with the Lagrangian derivatives (Drho/Dt = -rho div v, Dv/Dt = -grad P/rho,
 // Du/Dt = -(P/rho) div v), then one flux evaluation. Second order in smooth flow.
 //
-// Deliberately NOT here yet: individual timesteps, self-gravity coupling, wakeups. The tier-1
-// tests (soundwave, shocktube, square) validate exactly this much.
+// Also here: self-gravity as a leapfrog KDK sharing one tree walk per step, and hierarchical
+// individual timesteps with Saitoh-Makino wakeups.
+//
+// Deliberately NOT here yet: sink particles, MHD, cooling, a barotropic EOS.
 
 #pragma once
 #include <array>
+#include <utility>
 #include "hydro.h"
 
 namespace shmem {
@@ -71,20 +74,56 @@ struct Sim {
     double pending_half_kick = 0.0;    // dt/2 owed from the previous step's closing kick
 
     // ---- individual (hierarchical) timesteps ----
-    // Every particle's step is dt_max / 2^bin, so all steps are commensurate and every particle's
-    // sync points are a subset of the shortest bin's. Off by default: with one bin this reduces
-    // exactly to the global-timestep scheme.
-    bool  individual_timesteps = false;
-    int   max_bins  = 20;              // deepest allowed level below dt_max
-    int   bin_limit = 4;               // Saitoh-Makino: a particle may not sit this many bins
-                                       // above an active neighbour (see wake_neighbours)
-    std::vector<int> bin;              // current timebin per particle
+    // A particle on bin b steps dt_base / 2^b. Time is tracked as an INTEGER count of ticks, where
+    // one tick = dt_base / 2^MAX_BINS, so every particle's sync points are exactly a subset of the
+    // finer bins' and there is no drift from repeated floating-point addition. dt_base is chosen by
+    // the caller to divide the snapshot interval exactly (see set_time_base), which is what lets the
+    // run land on snapshot times and TimeMax to the bit.
+    // Off by default: with every particle on bin 0 this reduces exactly to the global scheme.
+    static constexpr int MAX_BINS = 30;
+    bool      individual_timesteps = false;
+    double    dt_base    = 0.0;        // step of bin 0; 0 until set_time_base()
+    long long clock_ticks = 0;         // current time, in ticks of dt_base / 2^MAX_BINS
+    int       bin_limit  = 3;          // Saitoh-Makino: a particle may not sit more than this many
+                                       // bins above an ACTIVE neighbour, or a shock outruns it
+    std::vector<int>      bin;         // current timebin per particle
     std::vector<uint32_t> active;      // indices due at this sync point
+    // wall time attributed to each bin, for the cpu-frac column of the timebin dump: a sync is
+    // charged to its LONGEST-dt active bin, since that is what made the step expensive
+    std::vector<double>    bin_cpu_sum;
+    std::vector<long long> bin_cpu_n;
+    long long sync_point = 0;
+
+    long long ticks_in_bin(int b) const { return 1LL << (MAX_BINS - b); }
+    double    dt_of_bin(int b)    const { return dt_base / (double)(1LL << b); }
+    bool      is_active(size_t i) const {
+        return !individual_timesteps || (clock_ticks % ticks_in_bin(bin[i])) == 0;
+    }
 
     // derived per step; under individual timesteps only the ACTIVE entries are refreshed and the
     // rest keep their values from each particle's own last update
     std::vector<double> h, ninv, rho, press;
     Work work;
+
+    // ---- persistent tree ----
+    // Rebuilding costs O(N log N) whatever the active fraction, so with individual timesteps it
+    // dominates completely: at ~100 active out of 2e6 the rebuild was measured at ~130 ms against
+    // ~3 ms of actual physics. The tree is therefore kept and REUSED, with Tree::pad inflated by
+    // how far particles have drifted so neighbour searches stay exact, and rebuilt only when that
+    // pad has grown enough to make the search inefficient.
+    Tree   tree;
+    bool   tree_valid = false;
+    double drift_since_build = 0.0;    // upper bound on any particle's displacement since build
+    double tree_rebuild_pad_frac = 0.25;  // rebuild once pad exceeds this fraction of a typical h
+    long long tree_builds = 0;         // diagnostic
+
+    // scratch reused across steps, so a sync does not allocate and zero several N-sized arrays
+    std::vector<double> dt_of, dmom_x, dmom_y, dmom_z, denergy;
+    std::vector<std::pair<uint32_t,int>> wake_requests;   // (particle, bin it must drop to)
+    // particles that received flux this sync (actives + their neighbours), duplicates allowed
+    std::vector<uint32_t> touched;
+    std::vector<std::vector<uint32_t>> active_chunks;     // per-thread, merged into `active`
+    std::vector<uint32_t> halo;        // actives + their neighbours; geometry refreshed for these
 
     size_t size() const { return P.size(); }
 };
@@ -97,6 +136,34 @@ struct Sim {
 // one evaluation. `pending_half_kick` carries the dt/2 owed by the previous step; a fresh Sim starts
 // at 0, which makes the very first step a correct half-step opening.
 double mfm_step(Sim& sim, double dt_max);
+
+// Choose dt_base for the individual-timestep hierarchy: the largest step not exceeding
+// max_step that divides `interval` (the snapshot spacing) a whole number of times. Every
+// snapshot boundary is then an exact integer number of ticks, so a run lands on its output
+// times and on TimeMax exactly, however the bins are distributed.
+void set_time_base(Sim& sim, double interval, double max_step);
+
+// Populate h, volume, density and pressure for every particle without taking a step, so the t=0
+// snapshot carries the same fields the scheme itself uses.
+//
+// Worth having as a function rather than a few lines in the driver: MFM's density is m_i/V_i with
+// V_i from the partition of unity, which on a uniform lattice stays SHARP across a contact because
+// the mass carries the contrast. The SPH-style sum_j m_j W is a different quantity -- it smooths
+// mass over the kernel -- and using it produces a visibly wrong t=0 state at any contact
+// discontinuity (in test/square it made the exactly-uniform initial pressure vary by 84%, in a
+// square-shaped ring on the interface).
+void compute_initial_state(Sim& sim);
+
+// Dump the timebin hierarchy in GIZMO's format (core/run.cc), so output from the two engines can be
+// read side by side. NOTE the bin convention is INVERTED relative to GIZMO's: here bin 0 is the
+// LONGEST step (dt_base) and deeper bins are shorter, whereas GIZMO numbers upward with dt. Rows are
+// still printed longest-step first, so the table reads the same way; `dt` is printed explicitly so
+// there is nothing to infer from the index.
+//   X          this bin is active at this sync point
+//   <          the longest-step bin that is active, i.e. what sets the system step
+//   cumulative particles in this bin and every shorter one -- the count actually being integrated
+//              at that level and below
+void print_timebins(const Sim& sim, double systemstep, double time);
 
 // Diagnostics used by the tests.
 struct Conserved { double mass, px, py, pz, E; };
