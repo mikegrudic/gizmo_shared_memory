@@ -14,6 +14,7 @@
 #include "mfm.h"
 #include <algorithm>
 #include <cstdio>
+#include <sys/stat.h>
 #include <vector>
 
 using namespace shmem;
@@ -98,6 +99,9 @@ static Sim make_lattice(int nx, int ny, int nz, double box) {
 
 int main(int argc, char** argv) {
     int quick = (argc > 1 && argv[1][0]=='q');
+    mkdir("plots", 0775);
+    FILE* fconv = fopen("plots/soundwave_convergence.txt", "w");
+    fprintf(fconv, "# n1  L1_over_A   (half period, A=1e-4)\n");
 
     // ---------- soundwave convergence series ----------
     // A = 1e-4: at A = 0.01 the physical nonlinear steepening of a simple wave (~2A relative)
@@ -132,7 +136,18 @@ int main(int argc, char** argv) {
         l1 /= (N*A);
         printf("  [soundwave %2d^3] half period, %3d steps: L1(v)/A = %.3e   (E drift %.1e)\n",
                n1, steps, l1, std::abs(c1.E-c0.E)/c0.E);
+        fprintf(fconv, "%d %.6e\n", n1, l1);
+        {   // dump v(x) for the finest level for the wave-shape panel
+            char fn[64]; snprintf(fn, 64, "plots/soundwave_n%d.txt", n1);
+            FILE* fw = fopen(fn, "w");
+            fprintf(fw, "# x  vx_over_A  vx_exact_over_A   t=%.2f\n", tend);
+            for (size_t i = 0; i < N; i += (n1>=32?7:1))   // thin the 32^3 dump
+                fprintf(fw, "%.6f %.6e %.6e\n", S.P.x[i], S.vx[i]/A,
+                        std::sin(kw*(S.P.x[i] - tend)));
+            fclose(fw);
+        }
     }
+    fclose(fconv);
 
     // ---------- Sod shocktube ----------
     {
@@ -181,6 +196,22 @@ int main(int argc, char** argv) {
                N, tend, steps, l1/cnt, cnt);
         printf("      exact: P*=%.4f u*=%.4f | conservation: mass %.1e E %.3e\n",
                ex.pst, ex.ust, std::abs(c1.mass-c0.mass)/c0.mass, std::abs(c1.E-c0.E)/c0.E);
+        {   // full profile dump for plotting: particle scatter + exact curve
+            FILE* fp = fopen("plots/sod_profile.txt", "w");
+            fprintf(fp, "# x  rho  vx  P   (t=%.2f)\n", tend);
+            for (size_t i = 0; i < N; i += 16)
+                fprintf(fp, "%.6f %.6e %.6e %.6e\n", S.P.x[i], S.rho[i], S.vx[i],
+                        (S.gamma-1)*S.rho[i]*S.u[i]);
+            fclose(fp);
+            FILE* fe = fopen("plots/sod_exact.txt", "w");
+            fprintf(fe, "# x  rho  vx  P\n");
+            for (int k = 0; k <= 800; ++k) {
+                double x = 0.1 + 0.8*k/800.0, re, ue, pe;
+                ex.sample((x-0.5)/tend, re, ue, pe);
+                fprintf(fe, "%.6f %.6e %.6e %.6e\n", x, re, ue, pe);
+            }
+            fclose(fe);
+        }
         // station profile: mean rho and vx in thin slabs vs exact -- locates the failure mode
         printf("      %-8s %10s %10s %10s %10s\n","x","<rho>","rho_ex","<vx>","vx_ex");
         for (double xs : {0.30, 0.42, 0.55, 0.62, 0.70, 0.76}) {

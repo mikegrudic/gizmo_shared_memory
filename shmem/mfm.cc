@@ -246,9 +246,14 @@ double mfm_step(Sim& S, double dt_max) {
         double m = S.P.m[i];
         double px = m*S.vx[i] + dpx[i], py = m*S.vy[i] + dpy[i], pz = m*S.vz[i] + dpz[i];
         double E  = m*(S.u[i] + 0.5*(S.vx[i]*S.vx[i]+S.vy[i]*S.vy[i]+S.vz[i]*S.vz[i])) + dE[i];
+        double vxo = S.vx[i], vyo = S.vy[i], vzo = S.vz[i];
         S.vx[i] = px/m; S.vy[i] = py/m; S.vz[i] = pz/m;
         S.u[i]  = std::max(E/m - 0.5*(S.vx[i]*S.vx[i]+S.vy[i]*S.vy[i]+S.vz[i]*S.vz[i]), 1e-30);
-        S.P.x[i] += S.vx[i]*dt; S.P.y[i] += S.vy[i]*dt; S.P.z[i] += S.vz[i]*dt;
+        // TIME-CENTRED drift: x += (v_old + v_new)/2 dt. Drifting with the post-kick velocity is
+        // backward Euler on position -- it produced a clean systematic PHASE LAG in the soundwave
+        // (visible in plots/soundwave.png as the whole wave trailing the exact curve) and capped
+        // convergence at ~order 1. The average recovers the second-order leapfrog phase behaviour.
+        S.P.x[i] += 0.5*(vxo+S.vx[i])*dt; S.P.y[i] += 0.5*(vyo+S.vy[i])*dt; S.P.z[i] += 0.5*(vzo+S.vz[i])*dt;
         if (S.box > 0) {
             auto pw=[&](double& c){ if (c >= S.box) c -= S.box; else if (c < 0) c += S.box; };
             pw(S.P.x[i]); pw(S.P.y[i]); pw(S.P.z[i]);
