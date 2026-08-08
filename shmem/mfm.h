@@ -29,6 +29,7 @@ struct Sim {
     std::vector<double> vx, vy, vz;    // velocities
     std::vector<double> u;             // specific internal energy
     double gamma = 5.0 / 3.0;
+    int    dim   = 3;                  // 1/2/3; matches BOX_SPATIAL_DIMENSION in the suite configs
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;
     double cfl     = 0.25;

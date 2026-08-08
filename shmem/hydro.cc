@@ -27,7 +27,7 @@ void ngb_search(const Tree& T, const Particles& P, double x, double y, double z,
 }
 
 DensityResult density(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-                      double des_ngb, const std::vector<double>& h0, double box) {
+                      double des_ngb, const std::vector<double>& h0, double box, int dim) {
     const size_t nt = targets.size();
     DensityResult R;
     R.h.assign(nt, 0.0); R.rho.assign(nt, 0.0); R.nngb.assign(nt, 0); R.iters.assign(nt, 0);
@@ -42,7 +42,11 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
             lo[2]=std::min(lo[2],P.z[i]); hi[2]=std::max(hi[2],P.z[i]);
         }
         double vol = (hi[0]-lo[0])*(hi[1]-lo[1])*(hi[2]-lo[2]);
+        // per-dimension guess: des_ngb particles at mean number density (vol here is the 3D
+        // bbox volume; degenerate dims collapse it, so guard with the 1D/2D extents)
         hguess = std::cbrt(3.0*des_ngb*vol / (4.0*M_PI*P.size()));
+        if (dim == 1) hguess = 0.5*des_ngb*(hi[0]-lo[0])/P.size();
+        if (dim == 2) hguess = std::sqrt(des_ngb*(hi[0]-lo[0])*(hi[1]-lo[1])/(M_PI*P.size()));
     }
 
     #pragma omp parallel
@@ -62,11 +66,10 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
                 for (uint32_t q : ngb) {
                     double dx = wrap(P.x[q]-px, box), dy = wrap(P.y[q]-py, box), dz = wrap(P.z[q]-pz, box);
                     double r = std::sqrt(dx*dx + dy*dy + dz*dz);
-                    wsum += kernel_w(r, h);
-                    dwdh += kernel_dwdh(r, h);
+                    wsum += kernel_w(r, h, dim);
+                    dwdh += kernel_dwdh(r, h, dim);
                 }
-                const double pref = 4.0 * M_PI / 3.0;
-                double neff = pref * h*h*h * wsum;
+                double neff = ball_vol(h, dim) * wsum;
                 double f = neff - des_ngb;
                 if (std::abs(f) < 1e-4 * des_ngb) break;
                 if (f > 0) hhi = h; else hlo = h;
@@ -74,7 +77,7 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
                 // Newton on N_eff(h), guarded by the bracket. dN/dh = pref*(3h^2 wsum + h^3 dwdh);
                 // it is positive away from pathological configurations, but the guard makes any
                 // bad step safe: fall back to bisection / geometric growth.
-                double dndh = pref * (3.0*h*h*wsum + h*h*h*dwdh);
+                double dndh = ball_vol(h, dim) * ((double)dim/h*wsum + dwdh);
                 double hnew = (dndh > 0) ? h - f / dndh : 0.0;
                 if (hnew <= hlo || (hhi > 0 && hnew >= hhi) || hnew <= 0) {
                     if (hhi > 0) hnew = (hlo > 0) ? std::sqrt(hlo * hhi) : 0.5 * hhi;
@@ -90,7 +93,7 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
                 double dx = wrap(P.x[q]-px, box), dy = wrap(P.y[q]-py, box), dz = wrap(P.z[q]-pz, box);
                 double r = std::sqrt(dx*dx + dy*dy + dz*dz);
                 if (r < h) ++inside;
-                rho += P.m[q] * kernel_w(r, h);
+                rho += P.m[q] * kernel_w(r, h, dim);
             }
             R.h[t] = h; R.rho[t] = rho; R.nngb[t] = inside; R.iters[t] = it;
         }

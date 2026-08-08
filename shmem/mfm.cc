@@ -5,7 +5,22 @@ namespace shmem {
 
 // 3x3 symmetric inverse; returns false if the condition is hopeless (degenerate neighbour
 // geometry). Callers fall back to zero gradients there -- first-order but safe, GIZMO does the same.
-static bool inv3(const double E[6], double B[9]) {
+// Rank-d inversion of the packed symmetric moments matrix. In 1D/2D the dead rows/columns are
+// identically zero (all particle offsets vanish there), so the 3x3 inverse does not exist; invert
+// the live block and zero the rest, which makes gradients and faces exactly in-plane.
+static bool invd(const double E[6], double B[9], int dim) {
+    for (int k = 0; k < 9; ++k) B[k] = 0;
+    if (dim == 1) {
+        if (std::abs(E[0]) < 1e-300) return false;
+        B[0] = 1.0 / E[0];
+        return true;
+    }
+    if (dim == 2) {
+        double det = E[0]*E[3] - E[1]*E[1];
+        if (std::abs(det) < 1e-300) return false;
+        B[0] =  E[3]/det; B[1] = -E[1]/det; B[3] = -E[1]/det; B[4] = E[0]/det;
+        return true;
+    }
     // E packed: xx, xy, xz, yy, yz, zz
     double a=E[0], b=E[1], c=E[2], d=E[3], e=E[4], f=E[5];
     double det = a*(d*f - e*e) - b*(b*f - e*c) + c*(b*e - d*c);
@@ -48,7 +63,7 @@ static void solve_h_and_volumes(Sim& S, const Tree& T) {
     for (size_t i = 0; i < n; ++i) all[i] = (uint32_t)i;
     std::vector<double> h0 = S.h;              // warm start from last step if present
     if (h0.size() != n) h0.clear();
-    DensityResult R = density(T, S.P, all, S.des_ngb, h0, S.box);
+    DensityResult R = density(T, S.P, all, S.des_ngb, h0, S.box, S.dim);
     S.h = R.h;
     S.ninv.assign(n, 0.0); S.rho.assign(n, 0.0); S.press.assign(n, 0.0);
     #pragma omp parallel
@@ -61,7 +76,7 @@ static void solve_h_and_volumes(Sim& S, const Tree& T) {
             double wsum = 0;
             for (uint32_t q : ngb) {
                 double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                wsum += kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i]);
+                wsum += kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
             }
             S.ninv[i] = 1.0 / wsum;                       // V_i: MFM volume from partition of unity
             S.rho[i]  = S.P.m[i] * wsum;                  // rho_i = m_i / V_i
@@ -84,16 +99,16 @@ static void gradients(Sim& S, const Tree& T, Work& W) {
             double E[6] = {0,0,0,0,0,0};
             for (uint32_t q : ngb) {
                 double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i]);
+                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
                 E[0]+=dx*dx*w; E[1]+=dx*dy*w; E[2]+=dx*dz*w; E[3]+=dy*dy*w; E[4]+=dy*dz*w; E[5]+=dz*dz*w;
             }
             double* B = &W.B[9*i];
-            if (!inv3(E, B)) { for (int k=0;k<9;++k) B[k]=0; continue; }   // zero gradients fallback
+            if (!invd(E, B, S.dim)) { continue; }   // B already zeroed: zero-gradient fallback
             const double f0[5] = {S.rho[i], S.vx[i], S.vy[i], S.vz[i], S.press[i]};
             double acc[5][3] = {{0}};
             for (uint32_t q : ngb) {
                 double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i]);
+                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
                 const double fj[5] = {S.rho[q], S.vx[q], S.vy[q], S.vz[q], S.press[q]};
                 for (int f = 0; f < 5; ++f) {
                     double df = (fj[f] - f0[f]) * w;
@@ -151,8 +166,8 @@ static void fluxes(Sim& S, const Tree& T, Work& W, double dt,
                 // see it; otherwise the higher index picks it up. A plain q<=i skip drops the
                 // asymmetric pairs that only the larger-h side can see.
                 if (q < i && r < S.h[q]) continue;
-                double wi = kernel_w(r, S.h[i]);
-                double wq = kernel_w(r, S.h[q]);
+                double wi = kernel_w(r, S.h[i], S.dim);
+                double wq = kernel_w(r, S.h[q], S.dim);
                 // face vector A_ij (points i -> q)
                 const double *Bi = &W.B[9*i], *Bq = &W.B[9*q];
                 double Vi = S.ninv[i], Vq = S.ninv[q];
@@ -291,7 +306,7 @@ double face_closure(Sim& S, int nsample) {
             if (q == i) continue;
             double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
             double r = std::sqrt(dx*dx+dy*dy+dz*dz);
-            double wi = kernel_w(r, S.h[i]), wq = kernel_w(r, S.h[q]);
+            double wi = kernel_w(r, S.h[i], S.dim), wq = kernel_w(r, S.h[q], S.dim);
             if (wi <= 0 && wq <= 0) continue;
             const double *Bi = &W.B[9*i], *Bq = &W.B[9*q];
             double Vi = S.ninv[i], Vq = S.ninv[q];

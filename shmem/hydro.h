@@ -21,24 +21,36 @@
 
 namespace shmem {
 
-// ---- cubic spline (Monaghan & Lattanzio 1985), 3D, support radius h ----
-static inline double kernel_w(double r, double h) {
+// ---- cubic spline (Monaghan & Lattanzio 1985), support radius h, dimension-aware ----
+// GIZMO's tier-1 suite tests are 1D and 2D (BOX_SPATIAL_DIMENSION), so the kernel, the
+// effective-neighbour ball volume and the E-matrix rank all carry `dim`. Norms for support
+// radius h: 1D 4/3/h, 2D 40/(7 pi h^2), 3D 8/(pi h^3).
+static inline double kernel_norm(double h, int dim) {
+    if (dim == 1) return (4.0/3.0) / h;
+    if (dim == 2) return 40.0 / (7.0*M_PI * h * h);
+    return 8.0 / (M_PI * h * h * h);
+}
+static inline double ball_vol(double h, int dim) {       // volume of the unit-d ball of radius h
+    if (dim == 1) return 2.0 * h;
+    if (dim == 2) return M_PI * h * h;
+    return 4.0*M_PI/3.0 * h*h*h;
+}
+static inline double kernel_w(double r, double h, int dim = 3) {
     double q = r / h;
     if (q >= 1.0) return 0.0;
-    const double norm = 8.0 / (M_PI * h * h * h);
+    const double norm = kernel_norm(h, dim);
     if (q < 0.5) return norm * (1.0 - 6.0 * q * q + 6.0 * q * q * q);
     double u = 1.0 - q;
     return norm * 2.0 * u * u * u;
 }
-static inline double kernel_dwdh(double r, double h) {   // dW/dh at fixed r
+static inline double kernel_dwdh(double r, double h, int dim = 3) {   // dW/dh at fixed r
     double q = r / h;
     if (q >= 1.0) return 0.0;
-    const double norm = 8.0 / (M_PI * h * h * h);
-    // W = norm * f(q); dW/dh = -(3/h) W - (q/h) norm f'(q)
+    const double norm = kernel_norm(h, dim);
     double f, fp;
     if (q < 0.5) { f = 1.0 - 6.0*q*q + 6.0*q*q*q; fp = -12.0*q + 18.0*q*q; }
     else { double u = 1.0 - q; f = 2.0*u*u*u; fp = -6.0*u*u; }
-    return -(3.0 / h) * norm * f - (q / h) * norm * fp;
+    return -((double)dim / h) * norm * f - (q / h) * norm * fp;
 }
 
 // All particles within radius `rad` of (x,y,z). Appends indices to `out` (not cleared).
@@ -57,6 +69,6 @@ struct DensityResult {
 // Solve N_eff(h_i) = des_ngb for every target and return h and rho.
 // h0 is the initial guess (per target; pass empty to derive from the mean interparticle spacing).
 DensityResult density(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-                      double des_ngb, const std::vector<double>& h0, double box = 0.0);
+                      double des_ngb, const std::vector<double>& h0, double box = 0.0, int dim = 3);
 
 }  // namespace shmem

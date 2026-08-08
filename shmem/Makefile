@@ -20,3 +20,5 @@ test_hydro: test_hydro.cc hydro.cc hydro.h tree.cc tree.h
 	$(CXX) $(CXXFLAGS) -o $@ test_hydro.cc hydro.cc tree.cc
 test_mfm: test_mfm.cc mfm.cc mfm.h hydro.cc hydro.h tree.cc tree.h
 	$(CXX) $(CXXFLAGS) -o $@ test_mfm.cc mfm.cc hydro.cc tree.cc
+suite_runner: suite_runner.cc mfm.cc mfm.h hydro.cc hydro.h tree.cc tree.h
+	$(CXX) $(CXXFLAGS) -I$(HDF5_BASE)/include -o $@ suite_runner.cc mfm.cc hydro.cc tree.cc -L$(HDF5_BASE)/lib -lhdf5 -Wl,-rpath,$(HDF5_BASE)/lib
