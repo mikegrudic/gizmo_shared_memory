@@ -1,324 +1,445 @@
 #include "mfm.h"
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 
 namespace shmem {
 
-// 3x3 symmetric inverse; returns false if the condition is hopeless (degenerate neighbour
-// geometry). Callers fall back to zero gradients there -- first-order but safe, GIZMO does the same.
-// Rank-d inversion of the packed symmetric moments matrix. In 1D/2D the dead rows/columns are
-// identically zero (all particle offsets vanish there), so the 3x3 inverse does not exist; invert
-// the live block and zero the rest, which makes gradients and faces exactly in-plane.
-static bool invd(const double E[6], double B[9], int dim) {
-    for (int k = 0; k < 9; ++k) B[k] = 0;
-    if (dim == 1) {
-        if (std::abs(E[0]) < 1e-300) return false;
-        B[0] = 1.0 / E[0];
+// Rank-d inverse of the symmetric moments matrix E, returning false when the neighbour geometry is
+// degenerate; callers fall back to zero gradients there -- first order but safe, as GIZMO does.
+// In 1D/2D the dead rows/columns of E are identically zero (every particle offset vanishes there),
+// so the full 3x3 inverse does not exist: invert the live block and leave the rest zero, which
+// makes gradients and faces exactly in-plane.
+static bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dims) {
+    inverse = Mat3d{};                               // zeroed: also the failure/fallback state
+    if (n_dims == 1) {
+        if (std::abs(moments[0][0]) < 1e-300) return false;
+        inverse[0][0] = 1.0 / moments[0][0];
         return true;
     }
-    if (dim == 2) {
-        double det = E[0]*E[3] - E[1]*E[1];
+    if (n_dims == 2) {
+        const double det = moments[0][0]*moments[1][1] - moments[0][1]*moments[0][1];
         if (std::abs(det) < 1e-300) return false;
-        B[0] =  E[3]/det; B[1] = -E[1]/det; B[3] = -E[1]/det; B[4] = E[0]/det;
+        inverse[0][0] =  moments[1][1]/det; inverse[0][1] = -moments[0][1]/det;
+        inverse[1][0] = -moments[0][1]/det; inverse[1][1] =  moments[0][0]/det;
         return true;
     }
-    // E packed: xx, xy, xz, yy, yz, zz
-    double a=E[0], b=E[1], c=E[2], d=E[3], e=E[4], f=E[5];
-    double det = a*(d*f - e*e) - b*(b*f - e*c) + c*(b*e - d*c);
-    if (std::abs(det) < 1e-300) return false;
-    double inv = 1.0 / det;
-    B[0]=(d*f-e*e)*inv; B[1]=(c*e-b*f)*inv; B[2]=(b*e-c*d)*inv;
-    B[3]=B[1];          B[4]=(a*f-c*c)*inv; B[5]=(b*c-a*e)*inv;
-    B[6]=B[2];          B[7]=B[5];          B[8]=(a*d-b*b)*inv;
-    return true;
+    // 3D: hand the live 3x3 to the shared, unit-tested Mat3 inverse rather than a second copy.
+    const Mat3d full{{ {moments[0][0], moments[0][1], moments[0][2]},
+                       {moments[1][0], moments[1][1], moments[1][2]},
+                       {moments[2][0], moments[2][1], moments[2][2]} }};
+    return full.invert(inverse) != 0.0;              // invert() zeroes and returns 0 if singular
 }
 
-static inline double minmod(double a, double b) {
+[[nodiscard]] static constexpr double minmod(double a, double b) noexcept {
     return (a*b <= 0) ? 0.0 : (std::abs(a) < std::abs(b) ? a : b);
 }
 
-// HLLC for ideal gas, 1D states normal to the face. Returns contact speed S* and pressure P*.
-// Wave speed estimates: Davis. Inputs are the face-frame normal velocities.
-static void hllc_star(double rhoL, double uL, double pL, double rhoR, double uR, double pR,
-                      double gamma, double& Sstar, double& Pstar) {
-    double cL = std::sqrt(gamma * pL / rhoL), cR = std::sqrt(gamma * pR / rhoR);
-    double SL = std::min(uL - cL, uR - cR);
-    double SR = std::max(uL + cL, uR + cR);
-    double num = pR - pL + rhoL*uL*(SL - uL) - rhoR*uR*(SR - uR);
-    double den = rhoL*(SL - uL) - rhoR*(SR - uR);
-    Sstar = (std::abs(den) > 1e-300) ? num / den : 0.5*(uL + uR);
-    Pstar = pL + rhoL*(SL - uL)*(Sstar - uL);
-    if (Pstar < 0) Pstar = 0.5*(pL + pR);       // vacuum-adjacent guard; tests never hit it
+// The five primitive fields, in the one order used by gradients, reconstruction and the Riemann
+// state vectors. Named rather than bare 0..4: the flux loop indexes these arrays a dozen times and
+// a transposed velocity component is otherwise invisible.
+enum PrimitiveField : int { FIELD_DENSITY = 0, FIELD_VX, FIELD_VY, FIELD_VZ, FIELD_PRESSURE,
+                            NUM_FIELDS };
+using PrimitiveState = std::array<double, NUM_FIELDS>;
+
+// Contact-wave speed and pressure from the Riemann fan -- the only two quantities the Lagrangian
+// MFM flux needs, since the mass flux vanishes by construction.
+struct ContactState { double speed, pressure; };
+
+// HLLC for an ideal gas, states already rotated so the given velocities are normal to the face.
+// Wave-speed estimates: Davis.
+[[nodiscard]] static ContactState solve_hllc_contact(
+        double density_left,  double vnorm_left,  double pressure_left,
+        double density_right, double vnorm_right, double pressure_right, double gamma) {
+    const double csound_left  = std::sqrt(gamma * pressure_left  / density_left);
+    const double csound_right = std::sqrt(gamma * pressure_right / density_right);
+    const double wave_left  = std::min(vnorm_left - csound_left, vnorm_right - csound_right);
+    const double wave_right = std::max(vnorm_left + csound_left, vnorm_right + csound_right);
+    const double numerator = pressure_right - pressure_left
+                           + density_left  * vnorm_left  * (wave_left  - vnorm_left)
+                           - density_right * vnorm_right * (wave_right - vnorm_right);
+    const double denominator = density_left  * (wave_left  - vnorm_left)
+                             - density_right * (wave_right - vnorm_right);
+    const double contact_speed = (std::abs(denominator) > 1e-300)
+                               ? numerator / denominator : 0.5*(vnorm_left + vnorm_right);
+    double contact_pressure = pressure_left
+                            + density_left * (wave_left - vnorm_left) * (contact_speed - vnorm_left);
+    // vacuum-adjacent guard; the tier-1 tests never reach it
+    if (contact_pressure < 0) contact_pressure = 0.5*(pressure_left + pressure_right);
+    return {contact_speed, contact_pressure};
 }
 
 // per-step scratch shared by the phases
 struct Work {
-    std::vector<double> B;                     // 9 per particle
-    std::vector<double> gr[5];                 // gradients of rho, vx, vy, vz, P (3 each)
-    std::vector<double> rho2, vx2, vy2, vz2, p2;  // half-step predicted primitives
+    std::vector<Mat3d> moments_inv;                            // E^-1, one per particle
+    std::array<std::vector<Vec3d>, NUM_FIELDS> gradient;       // gradient of each primitive field
+    std::array<std::vector<double>, NUM_FIELDS> predicted;     // half-step predicted primitives
+    std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
 };
 
-static void solve_h_and_volumes(Sim& S, const Tree& T) {
-    const size_t n = S.size();
-    std::vector<uint32_t> all(n);
-    for (size_t i = 0; i < n; ++i) all[i] = (uint32_t)i;
-    std::vector<double> h0 = S.h;              // warm start from last step if present
-    if (h0.size() != n) h0.clear();
-    DensityResult R = density(T, S.P, all, S.des_ngb, h0, S.box, S.dim);
-    S.h = R.h;
-    S.ninv.assign(n, 0.0); S.rho.assign(n, 0.0); S.press.assign(n, 0.0);
+static void solve_h_and_volumes(Sim& sim, const Tree& tree) {
+    const size_t n_part = sim.size();
+    std::vector<uint32_t> all_particles(n_part);
+    for (size_t i = 0; i < n_part; ++i) all_particles[i] = (uint32_t)i;
+    std::vector<double> h_guess = sim.h;        // warm start from last step if present
+    if (h_guess.size() != n_part) h_guess.clear();
+    const DensityResult solved =
+        density(tree, sim.P, all_particles, sim.des_ngb, h_guess, sim.box, sim.dim);
+    sim.h = solved.h;
+    sim.ninv.assign(n_part, 0.0); sim.rho.assign(n_part, 0.0); sim.press.assign(n_part, 0.0);
     #pragma omp parallel
     {
-        std::vector<uint32_t> ngb;
+        std::vector<uint32_t> neighbours;
         #pragma omp for schedule(dynamic, 64)
-        for (size_t i = 0; i < n; ++i) {
-            ngb.clear();
-            ngb_search(T, S.P, S.P.x[i], S.P.y[i], S.P.z[i], S.h[i], ngb, S.box);
-            double wsum = 0;
-            for (uint32_t q : ngb) {
-                double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                wsum += kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
+        for (size_t i = 0; i < n_part; ++i) {
+            const Vec3d pos_i = sim.P.pos(i);
+            neighbours.clear();
+            ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
+            double weight_sum = 0;
+            for (uint32_t j : neighbours) {
+                const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
+                weight_sum += kernel_w(offset.norm(), sim.h[i], sim.dim);
             }
-            S.ninv[i] = 1.0 / wsum;                       // V_i: MFM volume from partition of unity
-            S.rho[i]  = S.P.m[i] * wsum;                  // rho_i = m_i / V_i
-            S.press[i] = (S.gamma - 1.0) * S.rho[i] * S.u[i];
+            sim.ninv[i]  = 1.0 / weight_sum;             // V_i: MFM volume from partition of unity
+            sim.rho[i]   = sim.P.m[i] * weight_sum;      // rho_i = m_i / V_i
+            sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
         }
     }
 }
 
-static void gradients(Sim& S, const Tree& T, Work& W) {
-    const size_t n = S.size();
-    W.B.assign(9*n, 0.0);
-    for (auto& g : W.gr) g.assign(3*n, 0.0);
+static void gradients(Sim& sim, const Tree& tree, Work& work) {
+    const size_t n_part = sim.size();
+    work.moments_inv.assign(n_part, Mat3d{});
+    for (auto& field_gradient : work.gradient) field_gradient.assign(n_part, Vec3d{});
+    work.signal_speed.assign(n_part, 0.0);
     #pragma omp parallel
     {
-        std::vector<uint32_t> ngb;
+        std::vector<uint32_t> neighbours;
         #pragma omp for schedule(dynamic, 64)
-        for (size_t i = 0; i < n; ++i) {
-            ngb.clear();
-            ngb_search(T, S.P, S.P.x[i], S.P.y[i], S.P.z[i], S.h[i], ngb, S.box);
-            double E[6] = {0,0,0,0,0,0};
-            for (uint32_t q : ngb) {
-                double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
-                E[0]+=dx*dx*w; E[1]+=dx*dy*w; E[2]+=dx*dz*w; E[3]+=dy*dy*w; E[4]+=dy*dz*w; E[5]+=dz*dz*w;
-            }
-            double* B = &W.B[9*i];
-            if (!invd(E, B, S.dim)) { continue; }   // B already zeroed: zero-gradient fallback
-            const double f0[5] = {S.rho[i], S.vx[i], S.vy[i], S.vz[i], S.press[i]};
-            double acc[5][3] = {{0}};
-            for (uint32_t q : ngb) {
-                double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                double w = kernel_w(std::sqrt(dx*dx+dy*dy+dz*dz), S.h[i], S.dim);
-                const double fj[5] = {S.rho[q], S.vx[q], S.vy[q], S.vz[q], S.press[q]};
-                for (int f = 0; f < 5; ++f) {
-                    double df = (fj[f] - f0[f]) * w;
-                    acc[f][0] += df*dx; acc[f][1] += df*dy; acc[f][2] += df*dz;
+        for (size_t i = 0; i < n_part; ++i) {
+            const Vec3d pos_i = sim.P.pos(i);
+            const Vec3d vel_i{sim.vx[i], sim.vy[i], sim.vz[i]};
+            neighbours.clear();
+            ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
+
+            SymTensor3d moments{0,0,0,0,0,0};     // E_i = sum_j (dx ox dx) W_ij
+            // Signal speed, Monaghan (1997): c_i + c_j minus the APPROACH speed along the pair
+            // axis. Built only from RELATIVE velocities, so a uniform boost of the whole domain
+            // leaves it unchanged -- the square test advects at |v|~1300 and a lab-frame |v| here
+            // would shrink dt by ~1700x for a flow that is trivially Galilean-equivalent to rest.
+            const double csound_i = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+            double signal_speed = 2.0 * csound_i;   // floor: the i==j / no-neighbour case
+            for (uint32_t j : neighbours) {
+                const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
+                const double separation = offset.norm();
+                const double weight = kernel_w(separation, sim.h[i], sim.dim);
+                moments += outer_product(offset) * weight;
+                if (separation > 0) {
+                    const Vec3d rel_vel = vel_i - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
+                    const double approach_speed = dot(rel_vel, offset) / separation;
+                    const double csound_j = std::sqrt(sim.gamma * sim.press[j] / sim.rho[j]);
+                    signal_speed = std::max(signal_speed,
+                                            csound_i + csound_j - std::min(0.0, approach_speed));
                 }
             }
-            for (int f = 0; f < 5; ++f) {
-                W.gr[f][3*i+0] = B[0]*acc[f][0] + B[1]*acc[f][1] + B[2]*acc[f][2];
-                W.gr[f][3*i+1] = B[3]*acc[f][0] + B[4]*acc[f][1] + B[5]*acc[f][2];
-                W.gr[f][3*i+2] = B[6]*acc[f][0] + B[7]*acc[f][1] + B[8]*acc[f][2];
+            work.signal_speed[i] = signal_speed;
+
+            Mat3d& moments_inv = work.moments_inv[i];
+            // already zeroed on failure: that is the zero-gradient fallback
+            if (!invert_moments(moments, moments_inv, sim.dim)) continue;
+
+            const PrimitiveState field_i{sim.rho[i], sim.vx[i], sim.vy[i], sim.vz[i], sim.press[i]};
+            std::array<Vec3d, NUM_FIELDS> weighted_diff_sum{};
+            for (uint32_t j : neighbours) {
+                const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
+                const double weight = kernel_w(offset.norm(), sim.h[i], sim.dim);
+                const PrimitiveState field_j{sim.rho[j], sim.vx[j], sim.vy[j], sim.vz[j],
+                                             sim.press[j]};
+                for (int f = 0; f < NUM_FIELDS; ++f)
+                    weighted_diff_sum[f] += offset * ((field_j[f] - field_i[f]) * weight);
             }
+            for (int f = 0; f < NUM_FIELDS; ++f)
+                work.gradient[f][i] = moments_inv.matvec(weighted_diff_sum[f]);
         }
     }
 }
 
 // Lagrangian half-step prediction of primitives (MUSCL-Hancock predictor).
-static void predict_half(Sim& S, Work& W, double dt) {
-    const size_t n = S.size();
-    W.rho2.resize(n); W.vx2.resize(n); W.vy2.resize(n); W.vz2.resize(n); W.p2.resize(n);
+static void predict_half(Sim& sim, Work& work, double dt) {
+    const size_t n_part = sim.size();
+    for (auto& field : work.predicted) field.resize(n_part);
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n; ++i) {
-        double divv = W.gr[1][3*i+0] + W.gr[2][3*i+1] + W.gr[3][3*i+2];
-        double irho = 1.0 / S.rho[i], hdt = 0.5 * dt;
-        W.rho2[i] = std::max(S.rho[i] * (1.0 - hdt*divv), 1e-30);
-        W.vx2[i]  = S.vx[i] - hdt * irho * W.gr[4][3*i+0];
-        W.vy2[i]  = S.vy[i] - hdt * irho * W.gr[4][3*i+1];
-        W.vz2[i]  = S.vz[i] - hdt * irho * W.gr[4][3*i+2];
-        W.p2[i]   = std::max(S.press[i] * (1.0 - S.gamma*hdt*divv), 1e-30);
+    for (size_t i = 0; i < n_part; ++i) {
+        const double div_vel = work.gradient[FIELD_VX][i][0]
+                             + work.gradient[FIELD_VY][i][1]
+                             + work.gradient[FIELD_VZ][i][2];
+        const double inv_density = 1.0 / sim.rho[i], half_dt = 0.5 * dt;
+        const Vec3d& grad_pressure = work.gradient[FIELD_PRESSURE][i];
+        work.predicted[FIELD_DENSITY][i] = std::max(sim.rho[i] * (1.0 - half_dt*div_vel), 1e-30);
+        work.predicted[FIELD_VX][i] = sim.vx[i] - half_dt * inv_density * grad_pressure[0];
+        work.predicted[FIELD_VY][i] = sim.vy[i] - half_dt * inv_density * grad_pressure[1];
+        work.predicted[FIELD_VZ][i] = sim.vz[i] - half_dt * inv_density * grad_pressure[2];
+        work.predicted[FIELD_PRESSURE][i] =
+            std::max(sim.press[i] * (1.0 - sim.gamma*half_dt*div_vel), 1e-30);
     }
 }
 
 // Flux exchange over unique pairs. Pair discovery from the SMALLER kernel side would miss
-// asymmetric pairs, so: i owns the pair when (i < q) and r < max(h_i, h_q); every pair is then
-// found exactly once because both sides search with max(h_i, h_q) coverage via the union below.
-static void fluxes(Sim& S, const Tree& T, Work& W, double dt,
-                   std::vector<double>& dpx, std::vector<double>& dpy,
-                   std::vector<double>& dpz, std::vector<double>& dE) {
-    const size_t n = S.size();
-    dpx.assign(n,0); dpy.assign(n,0); dpz.assign(n,0); dE.assign(n,0);
+// asymmetric pairs, so: i owns the pair when (i < j) and r < max(h_i, h_j); every pair is then
+// found exactly once because both sides search with max(h_i, h_j) coverage via the union below.
+static void fluxes(Sim& sim, const Tree& tree, Work& work, double dt,
+                   std::vector<double>& dmom_x, std::vector<double>& dmom_y,
+                   std::vector<double>& dmom_z, std::vector<double>& denergy) {
+    const size_t n_part = sim.size();
+    dmom_x.assign(n_part, 0); dmom_y.assign(n_part, 0);
+    dmom_z.assign(n_part, 0); denergy.assign(n_part, 0);
     #pragma omp parallel
     {
-        std::vector<uint32_t> ngb;
+        std::vector<uint32_t> neighbours;
         #pragma omp for schedule(dynamic, 64)
-        for (size_t i = 0; i < n; ++i) {
-            // search with h_i; pairs where h_q > r >= h_i are found from q's side (q also loops)
-            ngb.clear();
-            ngb_search(T, S.P, S.P.x[i], S.P.y[i], S.P.z[i], S.h[i], ngb, S.box);
-            for (uint32_t q : ngb) {
-                if (q == i) continue;
-                double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-                double r = std::sqrt(dx*dx + dy*dy + dz*dz);
-                if (r <= 0) continue;
+        for (size_t i = 0; i < n_part; ++i) {
+            // search with h_i; pairs where h_j > r >= h_i are found from j's side (j also loops)
+            const Vec3d pos_i = sim.P.pos(i);
+            neighbours.clear();
+            ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
+            for (uint32_t j : neighbours) {
+                if (j == i) continue;
+                const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
+                const double separation = offset.norm();
+                if (separation <= 0) continue;
                 // Each pair must be processed EXACTLY once, including asymmetric ones (r < h_i but
-                // r >= h_q, so only i sees q). Ownership: the lower index owns the pair IF it can
-                // see it; otherwise the higher index picks it up. A plain q<=i skip drops the
+                // r >= h_j, so only i sees j). Ownership: the lower index owns the pair IF it can
+                // see it; otherwise the higher index picks it up. A plain j<=i skip drops the
                 // asymmetric pairs that only the larger-h side can see.
-                if (q < i && r < S.h[q]) continue;
-                double wi = kernel_w(r, S.h[i], S.dim);
-                double wq = kernel_w(r, S.h[q], S.dim);
-                // face vector A_ij (points i -> q)
-                const double *Bi = &W.B[9*i], *Bq = &W.B[9*q];
-                double Vi = S.ninv[i], Vq = S.ninv[q];
-                double ax = Vi*(Bi[0]*dx + Bi[1]*dy + Bi[2]*dz)*wi + Vq*(Bq[0]*dx + Bq[1]*dy + Bq[2]*dz)*wq;
-                double ay = Vi*(Bi[3]*dx + Bi[4]*dy + Bi[5]*dz)*wi + Vq*(Bq[3]*dx + Bq[4]*dy + Bq[5]*dz)*wq;
-                double az = Vi*(Bi[6]*dx + Bi[7]*dy + Bi[8]*dz)*wi + Vq*(Bq[6]*dx + Bq[7]*dy + Bq[8]*dz)*wq;
-                double Amag = std::sqrt(ax*ax + ay*ay + az*az);
-                if (Amag <= 0) continue;
-                double nx = ax/Amag, ny = ay/Amag, nz = az/Amag;
+                if (j < i && separation < sim.h[j]) continue;
+                const double weight_i = kernel_w(separation, sim.h[i], sim.dim);
+                const double weight_j = kernel_w(separation, sim.h[j], sim.dim);
+
+                // effective face A_ij (points i -> j): V_i B_i dx W_i(r) + V_j B_j dx W_j(r)
+                const Vec3d face = work.moments_inv[i].matvec(offset) * (sim.ninv[i] * weight_i)
+                                 + work.moments_inv[j].matvec(offset) * (sim.ninv[j] * weight_j);
+                const double face_area = face.norm();
+                if (face_area <= 0) continue;
+                const Vec3d normal = face / face_area;
 
                 // linear reconstruction to the face midpoint, pairwise minmod-limited per field
-                double half[3] = {0.5*dx, 0.5*dy, 0.5*dz};
-                // gradient extrapolation from side a to the face midpoint (sgn: +1 from i, -1 from q)
-                auto recon = [&](int g, size_t a, double sgn)->double {
-                    return sgn*(W.gr[g][3*a+0]*half[0] + W.gr[g][3*a+1]*half[1] + W.gr[g][3*a+2]*half[2]);
+                const Vec3d to_midpoint = offset * 0.5;
+                // gradient extrapolation to the face midpoint (sign: +1 from i, -1 from j)
+                auto extrapolate = [&](int field, size_t side, double sign)->double {
+                    return sign * dot(work.gradient[field][side], to_midpoint);
                 };
-                // fields: 0 rho, 1 vx, 2 vy, 3 vz, 4 P -- reconstruct from the half-step primitives
-                const std::vector<double>* F2[5] = {&W.rho2, &W.vx2, &W.vy2, &W.vz2, &W.p2};
-                double L[5], R[5];
-                for (int f = 0; f < 5; ++f) {
-                    const std::vector<double>& v = *F2[f];
-                    double dfi = recon(f, i, +1.0);
-                    double dfq = recon(f, q, -1.0);
-                    double jump = v[q] - v[i];
-                    dfi = minmod(dfi, 0.5*jump);
-                    dfq = minmod(dfq, -0.5*jump);
-                    L[f] = v[i] + dfi;
-                    R[f] = v[q] + dfq;
+                PrimitiveState left{}, right{};
+                for (int f = 0; f < NUM_FIELDS; ++f) {
+                    const auto& predicted = work.predicted[f];
+                    const double jump = predicted[j] - predicted[i];
+                    left[f]  = predicted[i] + minmod(extrapolate(f, i, +1.0),  0.5*jump);
+                    right[f] = predicted[j] + minmod(extrapolate(f, j, -1.0), -0.5*jump);
                 }
-                if (L[0] <= 0 || R[0] <= 0 || L[4] <= 0 || R[4] <= 0) {   // limiter emergency
-                    L[0]=W.rho2[i]; L[4]=W.p2[i]; R[0]=W.rho2[q]; R[4]=W.p2[q];
+                if (left[FIELD_DENSITY]  <= 0 || right[FIELD_DENSITY]  <= 0 ||
+                    left[FIELD_PRESSURE] <= 0 || right[FIELD_PRESSURE] <= 0) {  // limiter emergency
+                    left[FIELD_DENSITY]   = work.predicted[FIELD_DENSITY][i];
+                    left[FIELD_PRESSURE]  = work.predicted[FIELD_PRESSURE][i];
+                    right[FIELD_DENSITY]  = work.predicted[FIELD_DENSITY][j];
+                    right[FIELD_PRESSURE] = work.predicted[FIELD_PRESSURE][j];
                 }
 
-                // face frame: mean velocity; rotate to the normal
-                double vfx = 0.5*(W.vx2[i]+W.vx2[q]), vfy = 0.5*(W.vy2[i]+W.vy2[q]), vfz = 0.5*(W.vz2[i]+W.vz2[q]);
-                double uL = (L[1]-vfx)*nx + (L[2]-vfy)*ny + (L[3]-vfz)*nz;
-                double uR = (R[1]-vfx)*nx + (R[2]-vfy)*ny + (R[3]-vfz)*nz;
-                double Sstar, Pstar;
-                hllc_star(L[0], uL, L[4], R[0], uR, R[4], S.gamma, Sstar, Pstar);
+                // face frame: mean velocity; rotate the states onto the normal
+                const Vec3d face_vel{
+                    0.5*(work.predicted[FIELD_VX][i] + work.predicted[FIELD_VX][j]),
+                    0.5*(work.predicted[FIELD_VY][i] + work.predicted[FIELD_VY][j]),
+                    0.5*(work.predicted[FIELD_VZ][i] + work.predicted[FIELD_VZ][j])};
+                const double vnorm_left = dot(
+                    Vec3d{left[FIELD_VX], left[FIELD_VY], left[FIELD_VZ]} - face_vel, normal);
+                const double vnorm_right = dot(
+                    Vec3d{right[FIELD_VX], right[FIELD_VY], right[FIELD_VZ]} - face_vel, normal);
+                const auto [contact_speed, contact_pressure] = solve_hllc_contact(
+                    left[FIELD_DENSITY],  vnorm_left,  left[FIELD_PRESSURE],
+                    right[FIELD_DENSITY], vnorm_right, right[FIELD_PRESSURE], sim.gamma);
 
-                // Lagrangian flux: zero mass flux; pressure P* acts across A, face moves at
-                // v_face = v_frame + S* nhat (lab). Momentum from i to q along +nhat.
-                double vfn = vfx*nx + vfy*ny + vfz*nz + Sstar;      // lab-frame normal face speed
-                double fP  = Pstar * Amag * dt;
-                double fE  = Pstar * vfn * Amag * dt;
+                // Lagrangian flux: zero mass flux; P* acts across the face, which moves at
+                // v_frame + S* nhat in the lab. Momentum goes from i to j along +nhat.
+                const double face_speed_lab = dot(face_vel, normal) + contact_speed;
+                const Vec3d momentum_flux = normal * (contact_pressure * face_area * dt);
+                const double energy_flux = contact_pressure * face_speed_lab * face_area * dt;
                 #pragma omp atomic
-                dpx[i] -= fP * nx;
+                dmom_x[i] -= momentum_flux[0];
                 #pragma omp atomic
-                dpy[i] -= fP * ny;
+                dmom_y[i] -= momentum_flux[1];
                 #pragma omp atomic
-                dpz[i] -= fP * nz;
+                dmom_z[i] -= momentum_flux[2];
                 #pragma omp atomic
-                dE[i]  -= fE;
+                denergy[i] -= energy_flux;
                 #pragma omp atomic
-                dpx[q] += fP * nx;
+                dmom_x[j] += momentum_flux[0];
                 #pragma omp atomic
-                dpy[q] += fP * ny;
+                dmom_y[j] += momentum_flux[1];
                 #pragma omp atomic
-                dpz[q] += fP * nz;
+                dmom_z[j] += momentum_flux[2];
                 #pragma omp atomic
-                dE[q]  += fE;
+                denergy[j] += energy_flux;
             }
         }
     }
 }
 
-double mfm_step(Sim& S, double dt_max) {
-    const size_t n = S.size();
-    Tree T = build(S.P);
-    solve_h_and_volumes(S, T);
+double mfm_step(Sim& sim, double dt_max) {
+    const size_t n_part = sim.size();
+    Tree tree = build(sim.P);
+    solve_h_and_volumes(sim, tree);
 
-    // CFL from signal speed
+    // Gradients first: they need no dt, and their neighbour loop is where the signal speed
+    // comes from.
+    Work work;
+    gradients(sim, tree, work);
+
+    // CFL from the Galilean-invariant signal speed (see gradients()).
     double dt = dt_max;
     #pragma omp parallel for reduction(min:dt) schedule(static)
-    for (size_t i = 0; i < n; ++i) {
-        double c = std::sqrt(S.gamma * S.press[i] / S.rho[i]);
-        double v = std::sqrt(S.vx[i]*S.vx[i] + S.vy[i]*S.vy[i] + S.vz[i]*S.vz[i]);
-        dt = std::min(dt, S.cfl * S.h[i] / (c + v + 1e-300));
+    for (size_t i = 0; i < n_part; ++i) {
+        dt = std::min(dt, sim.cfl * sim.h[i] / (work.signal_speed[i] + 1e-300));
     }
 
-    Work W;
-    gradients(S, T, W);
-    predict_half(S, W, dt);
+    if (getenv("SHMEM_DT_DIAG")) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            size_t limiter = 0; double smallest_dt = 1e300;
+            double h_min = 1e300, h_max = 0, rho_min = 1e300, rho_max = 0;
+            double press_min = 1e300, press_max = -1e300;
+            for (size_t i = 0; i < n_part; ++i) {
+                const double dt_i = sim.cfl * sim.h[i] / (work.signal_speed[i] + 1e-300);
+                if (dt_i < smallest_dt) { smallest_dt = dt_i; limiter = i; }
+                h_min = std::min(h_min, sim.h[i]);         h_max = std::max(h_max, sim.h[i]);
+                rho_min = std::min(rho_min, sim.rho[i]);   rho_max = std::max(rho_max, sim.rho[i]);
+                press_min = std::min(press_min, sim.press[i]);
+                press_max = std::max(press_max, sim.press[i]);
+            }
+            const Vec3d vel_limiter{sim.vx[limiter], sim.vy[limiter], sim.vz[limiter]};
+            fprintf(stderr, "[dt-diag] n=%zu dim=%d h:[%.4g,%.4g] rho:[%.4g,%.4g] P:[%.4g,%.4g]\n",
+                    n_part, sim.dim, h_min, h_max, rho_min, rho_max, press_min, press_max);
+            fprintf(stderr, "[dt-diag] limiter i=%zu dt=%.4g h=%.4g rho=%.4g P=%.4g cs=%.4g "
+                    "vsig=%.4g |v_lab|=%.4g x=(%.4g,%.4g,%.4g)\n",
+                    limiter, smallest_dt, sim.h[limiter], sim.rho[limiter], sim.press[limiter],
+                    std::sqrt(sim.gamma*sim.press[limiter]/sim.rho[limiter]),
+                    work.signal_speed[limiter], vel_limiter.norm(),
+                    sim.P.x[limiter], sim.P.y[limiter], sim.P.z[limiter]);
+        }
+    }
 
-    std::vector<double> dpx, dpy, dpz, dE;
-    fluxes(S, T, W, dt, dpx, dpy, dpz, dE);
+    predict_half(sim, work, dt);
+
+    std::vector<double> dmom_x, dmom_y, dmom_z, denergy;
+    fluxes(sim, tree, work, dt, dmom_x, dmom_y, dmom_z, denergy);
 
     // conserved update + Lagrangian drift
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n; ++i) {
-        double m = S.P.m[i];
-        double px = m*S.vx[i] + dpx[i], py = m*S.vy[i] + dpy[i], pz = m*S.vz[i] + dpz[i];
-        double E  = m*(S.u[i] + 0.5*(S.vx[i]*S.vx[i]+S.vy[i]*S.vy[i]+S.vz[i]*S.vz[i])) + dE[i];
-        double vxo = S.vx[i], vyo = S.vy[i], vzo = S.vz[i];
-        S.vx[i] = px/m; S.vy[i] = py/m; S.vz[i] = pz/m;
-        S.u[i]  = std::max(E/m - 0.5*(S.vx[i]*S.vx[i]+S.vy[i]*S.vy[i]+S.vz[i]*S.vz[i]), 1e-30);
+    for (size_t i = 0; i < n_part; ++i) {
+        const double mass = sim.P.m[i];
+        const Vec3d vel_old{sim.vx[i], sim.vy[i], sim.vz[i]};
+        const Vec3d momentum = vel_old * mass + Vec3d{dmom_x[i], dmom_y[i], dmom_z[i]};
+        const double energy = mass * (sim.u[i] + 0.5*vel_old.norm_sq()) + denergy[i];
+
+        const Vec3d vel_new = momentum / mass;
+        sim.vx[i] = vel_new[0]; sim.vy[i] = vel_new[1]; sim.vz[i] = vel_new[2];
+        sim.u[i] = std::max(energy/mass - 0.5*vel_new.norm_sq(), 1e-30);
+
         // TIME-CENTRED drift: x += (v_old + v_new)/2 dt. Drifting with the post-kick velocity is
         // backward Euler on position -- it produced a clean systematic PHASE LAG in the soundwave
         // (visible in plots/soundwave.png as the whole wave trailing the exact curve) and capped
         // convergence at ~order 1. The average recovers the second-order leapfrog phase behaviour.
-        S.P.x[i] += 0.5*(vxo+S.vx[i])*dt; S.P.y[i] += 0.5*(vyo+S.vy[i])*dt; S.P.z[i] += 0.5*(vzo+S.vz[i])*dt;
-        if (S.box > 0) {
-            auto pw=[&](double& c){ if (c >= S.box) c -= S.box; else if (c < 0) c += S.box; };
-            pw(S.P.x[i]); pw(S.P.y[i]); pw(S.P.z[i]);
-        }
+        Vec3d pos_new = sim.P.pos(i) + (vel_old + vel_new) * (0.5 * dt);
+        if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
+        sim.P.x[i] = pos_new[0]; sim.P.y[i] = pos_new[1]; sim.P.z[i] = pos_new[2];
     }
     return dt;
 }
 
-Conserved totals(const Sim& S) {
-    Conserved c{0,0,0,0,0};
-    for (size_t i = 0; i < S.size(); ++i) {
-        double m = S.P.m[i];
-        c.mass += m; c.px += m*S.vx[i]; c.py += m*S.vy[i]; c.pz += m*S.vz[i];
-        c.E += m*(S.u[i] + 0.5*(S.vx[i]*S.vx[i]+S.vy[i]*S.vy[i]+S.vz[i]*S.vz[i]));
+Conserved totals(const Sim& sim) {
+    Conserved total{0,0,0,0,0};
+    for (size_t i = 0; i < sim.size(); ++i) {
+        const double mass = sim.P.m[i];
+        const Vec3d vel{sim.vx[i], sim.vy[i], sim.vz[i]};
+        total.mass += mass;
+        total.px += mass*vel[0]; total.py += mass*vel[1]; total.pz += mass*vel[2];
+        total.E += mass * (sim.u[i] + 0.5*vel.norm_sq());
     }
-    return c;
+    return total;
 }
 
-double face_closure(Sim& S, int nsample) {
-    Tree T = build(S.P);
-    solve_h_and_volumes(S, T);
-    Work W;
-    gradients(S, T, W);
-    double worst = 0, amax = 0;
-    std::vector<uint32_t> ngb;
-    for (int s = 0; s < nsample; ++s) {
-        size_t i = (size_t)((uint64_t)s * 2654435761u % S.size());
-        ngb.clear();
-        // union coverage: h_i search catches pairs from i's side only; for closure include the
-        // symmetric contribution by searching the larger radius neighbourhood
-        double hmax = S.h[i]; for (size_t q=0;q<S.size();++q) hmax = std::max(hmax, S.h[q]);
-        ngb_search(T, S.P, S.P.x[i], S.P.y[i], S.P.z[i], hmax, ngb, S.box);
-        double sx=0, sy=0, sz=0;
-        for (uint32_t q : ngb) {
-            if (q == i) continue;
-            double dx=wrap(S.P.x[q]-S.P.x[i],S.box), dy=wrap(S.P.y[q]-S.P.y[i],S.box), dz=wrap(S.P.z[q]-S.P.z[i],S.box);
-            double r = std::sqrt(dx*dx+dy*dy+dz*dz);
-            double wi = kernel_w(r, S.h[i], S.dim), wq = kernel_w(r, S.h[q], S.dim);
-            if (wi <= 0 && wq <= 0) continue;
-            const double *Bi = &W.B[9*i], *Bq = &W.B[9*q];
-            double Vi = S.ninv[i], Vq = S.ninv[q];
-            double ax = Vi*(Bi[0]*dx+Bi[1]*dy+Bi[2]*dz)*wi + Vq*(Bq[0]*dx+Bq[1]*dy+Bq[2]*dz)*wq;
-            double ay = Vi*(Bi[3]*dx+Bi[4]*dy+Bi[5]*dz)*wi + Vq*(Bq[3]*dx+Bq[4]*dy+Bq[5]*dz)*wq;
-            double az = Vi*(Bi[6]*dx+Bi[7]*dy+Bi[8]*dz)*wi + Vq*(Bq[6]*dx+Bq[7]*dy+Bq[8]*dz)*wq;
-            sx += ax; sy += ay; sz += az;
-            amax = std::max(amax, std::sqrt(ax*ax+ay*ay+az*az));
-        }
-        worst = std::max(worst, std::sqrt(sx*sx+sy*sy+sz*sz));
+double linear_gradient_error(Sim& sim) {
+    Tree tree = build(sim.P);
+    solve_h_and_volumes(sim, tree);
+
+    // One distinct gradient per field, zeroed in the dead dimensions so 1D/2D stay in-plane.
+    std::array<Vec3d, NUM_FIELDS> exact_gradient{
+        Vec3d{0.30, -0.70, 0.11}, Vec3d{1.30, 0.20, -0.50}, Vec3d{-0.40, 0.90, 0.25},
+        Vec3d{0.60, -0.15, 0.80}, Vec3d{-0.20, 0.35, 1.10}};
+    for (auto& gradient : exact_gradient)
+        for (int d = sim.dim; d < 3; ++d) gradient[d] = 0.0;
+    // constant offsets, large enough to keep density and pressure positive across the box
+    const PrimitiveState field_offset{10.0, 1.0, -2.0, 0.5, 20.0};
+
+    for (size_t i = 0; i < sim.size(); ++i) {
+        const Vec3d pos = sim.P.pos(i);
+        sim.rho[i]   = field_offset[FIELD_DENSITY]  + dot(exact_gradient[FIELD_DENSITY],  pos);
+        sim.vx[i]    = field_offset[FIELD_VX]       + dot(exact_gradient[FIELD_VX],       pos);
+        sim.vy[i]    = field_offset[FIELD_VY]       + dot(exact_gradient[FIELD_VY],       pos);
+        sim.vz[i]    = field_offset[FIELD_VZ]       + dot(exact_gradient[FIELD_VZ],       pos);
+        sim.press[i] = field_offset[FIELD_PRESSURE] + dot(exact_gradient[FIELD_PRESSURE], pos);
     }
-    return (amax > 0) ? worst / amax : 0.0;
+
+    Work work;
+    gradients(sim, tree, work);
+
+    double worst_error = 0;
+    for (size_t i = 0; i < sim.size(); ++i) {
+        // A particle whose moments matrix was singular gets the zero-gradient fallback by design;
+        // that is a separate (geometric) condition, so do not score it as an algebra failure.
+        if (work.moments_inv[i].frobenius_norm_sq() == 0.0) continue;
+        for (int f = 0; f < NUM_FIELDS; ++f) {
+            const double scale = exact_gradient[f].norm();
+            if (scale <= 0) continue;
+            worst_error = std::max(worst_error,
+                                   (work.gradient[f][i] - exact_gradient[f]).norm() / scale);
+        }
+    }
+    return worst_error;
+}
+
+double face_closure(Sim& sim, int nsample) {
+    Tree tree = build(sim.P);
+    solve_h_and_volumes(sim, tree);
+    Work work;
+    gradients(sim, tree, work);
+
+    double worst_residual = 0, largest_face = 0;
+    std::vector<uint32_t> neighbours;
+    for (int s = 0; s < nsample; ++s) {
+        const size_t i = (size_t)((uint64_t)s * 2654435761u % sim.size());
+        // union coverage: an h_i search catches pairs from i's side only; for closure include the
+        // symmetric contribution by searching the largest kernel radius in the system
+        double search_radius = sim.h[i];
+        for (size_t j = 0; j < sim.size(); ++j) search_radius = std::max(search_radius, sim.h[j]);
+        neighbours.clear();
+        const Vec3d pos_i = sim.P.pos(i);
+        ngb_search(tree, sim.P, pos_i, search_radius, neighbours, sim.box);
+
+        Vec3d face_sum{0, 0, 0};
+        for (uint32_t j : neighbours) {
+            if (j == i) continue;
+            const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
+            const double separation = offset.norm();
+            const double weight_i = kernel_w(separation, sim.h[i], sim.dim);
+            const double weight_j = kernel_w(separation, sim.h[j], sim.dim);
+            if (weight_i <= 0 && weight_j <= 0) continue;
+            const Vec3d face = work.moments_inv[i].matvec(offset) * (sim.ninv[i] * weight_i)
+                             + work.moments_inv[j].matvec(offset) * (sim.ninv[j] * weight_j);
+            face_sum += face;
+            largest_face = std::max(largest_face, face.norm());
+        }
+        worst_residual = std::max(worst_residual, face_sum.norm());
+    }
+    return (largest_face > 0) ? worst_residual / largest_face : 0.0;
 }
 
 }  // namespace shmem

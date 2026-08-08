@@ -29,14 +29,13 @@ int main() {
         int bad = 0;
         std::mt19937_64 r2(9);
         for (int trial = 0; trial < 200; ++trial) {
-            double x = U(r2), y = U(r2), z = U(r2), rad = 0.002 + 0.1 * U(r2);
+            const Vec3d c{U(r2), U(r2), U(r2)};
+            const double rad = 0.002 + 0.1 * U(r2);
             std::vector<uint32_t> tree_set;
-            ngb_search(T, P, x, y, z, rad, tree_set);
+            ngb_search(T, P, c, rad, tree_set);
             std::vector<uint32_t> brute;
-            for (size_t q = 0; q < N; ++q) {
-                double dx=P.x[q]-x, dy=P.y[q]-y, dz=P.z[q]-z;
-                if (dx*dx+dy*dy+dz*dz < rad*rad) brute.push_back((uint32_t)q);
-            }
+            for (size_t q = 0; q < N; ++q)
+                if ((P.pos(q) - c).norm_sq() < rad*rad) brute.push_back((uint32_t)q);
             std::sort(tree_set.begin(), tree_set.end());
             if (tree_set != brute) ++bad;
         }

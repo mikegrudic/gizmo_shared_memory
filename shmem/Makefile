@@ -2,7 +2,9 @@
 # the tree and threading layer are developed and validated against brute force here first, and
 # replace forcetree/domain once the hydro loop passes the tier-1 tests.
 CXX      ?= g++
-CXXFLAGS ?= -O2 -fopenmp -march=native -Wall
+# C++17 is the floor the site compiler (gcc 8.5) supports fully: structured bindings, if constexpr,
+# std::array CTAD and fold expressions are all used below. No std::span -- that needs gcc 10.
+CXXFLAGS ?= -O2 -fopenmp -march=native -Wall -std=c++17
 BIN = test_tree bench_layout bench_postsink step_overhead
 all: $(BIN)
 test_tree: test_tree.cc tree.cc tree.h

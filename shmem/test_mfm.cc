@@ -219,6 +219,10 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < N; ++i)
                 if (std::abs(S.P.x[i]-xs) < 0.01) { sr+=S.rho[i]; sv+=S.vx[i]; ++c2; }
             double re, ue, pe; ex.sample((xs-0.5)/tend, re, ue, pe);
+            if (c2 == 0) {          // sample slab fell between particle planes; nothing to average
+                printf("      %-8.2f %10s %10.4f %10s %10.4f\n", xs, "-", re, "-", ue);
+                continue;
+            }
             printf("      %-8.2f %10.4f %10.4f %10.4f %10.4f\n", xs, sr/c2, re, sv/c2, ue);
         }
     }
@@ -238,6 +242,37 @@ int main(int argc, char** argv) {
             double fc = face_closure(S, 40);
             printf("  [faces] jitter=%.2f: max |sum_j A_ij| / max|A_ij| = %.3e\n", jit, fc);
         }
+    }
+
+    // ---------- structural: gradients are EXACT for a linear field ----------
+    // Not a convergence check -- exactness holds at any resolution and any disorder, so the
+    // expected answer is round-off. Jittered cases matter most: on a perfect lattice E is
+    // diagonal and a mis-indexed off-diagonal term would stay invisible.
+    {
+        int bad = 0;
+        for (int dim : {1, 2, 3}) {
+            const int nx = (dim >= 1) ? 24 : 1, ny = (dim >= 2) ? 24 : 1, nz = (dim >= 3) ? 24 : 1;
+            for (double jit : {0.0, 0.02}) {
+                Sim S = make_lattice(nx, ny, nz, 1.0);
+                S.dim = dim;
+                S.box = 0.0;                    // linear field is discontinuous across a wrap
+                S.des_ngb = (dim == 1) ? 4.0 : (dim == 2 ? 12.0 : 32.0);
+                size_t N = S.size();
+                const double d = 1.0 / nx;
+                for (size_t i = 0; i < N; ++i) {
+                    S.P.m[i] = 1.0/N; S.u[i] = 1.0;
+                    if (dim >= 1) S.P.x[i] += jit*d*std::sin(17.0*i);
+                    if (dim >= 2) S.P.y[i] += jit*d*std::cos(29.0*i);
+                    if (dim >= 3) S.P.z[i] += jit*d*std::sin(41.0*i);
+                }
+                double err = linear_gradient_error(S);
+                bool ok = err < 1e-9;
+                if (!ok) ++bad;
+                printf("  [gradients] %dD jitter=%.2f: max rel err vs exact linear = %.3e  %s\n",
+                       dim, jit, err, ok ? "OK" : "** FAIL **");
+            }
+        }
+        if (bad) { printf("  [gradients] %d configuration(s) failed exactness\n", bad); return 1; }
     }
     return 0;
 }

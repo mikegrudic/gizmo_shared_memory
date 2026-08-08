@@ -41,14 +41,24 @@ struct Sim {
 };
 
 // One MUSCL-Hancock step at global dt; returns the dt actually taken (min of CFL and dt_max).
-double mfm_step(Sim& S, double dt_max);
+double mfm_step(Sim& sim, double dt_max);
 
 // Diagnostics used by the tests.
 struct Conserved { double mass, px, py, pz, E; };
-Conserved totals(const Sim& S);
+Conserved totals(const Sim& sim);
 
 // Face-closure check: max_i |sum_j A_ij| / max|A| over a sample of particles. Discrete surface
 // integral of a closed volume; large values mean broken faces, not just inaccuracy.
-double face_closure(Sim& S, int nsample);
+double face_closure(Sim& sim, int nsample);
+
+// Gradient-exactness check. The matrix gradient B_i sum_j (f_j-f_i)(x_j-x_i) W_ij reproduces any
+// LINEAR field exactly, for ANY neighbour configuration whose E_i is invertible -- it is the
+// defining property of the discretisation, not an accuracy statement. So it is the sharpest
+// available test of the E/B algebra: a transposed or mis-indexed tensor element still looks
+// plausible in a convergence study but destroys exactness here immediately.
+// Overwrites the sim's primitive fields with known linear profiles. Non-periodic only (a linear
+// field is discontinuous across a periodic wrap).
+// Returns max over particles and fields of |grad_computed - grad_exact| / |grad_exact|.
+double linear_gradient_error(Sim& sim);
 
 }  // namespace shmem

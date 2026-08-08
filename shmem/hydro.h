@@ -53,11 +53,11 @@ static inline double kernel_dwdh(double r, double h, int dim = 3) {   // dW/dh a
     return -((double)dim / h) * norm * f - (q / h) * norm * fp;
 }
 
-// All particles within radius `rad` of (x,y,z). Appends indices to `out` (not cleared).
+// All particles within `radius` of `centre`. APPENDS indices to `found` (does not clear it).
 // Prune: every particle in a node lies within (node.s) of the node COM by construction of
-// s = size + delta, so a node can be skipped when dist(COM, centre) > rad + s.
-void ngb_search(const Tree& T, const Particles& P, double x, double y, double z,
-                double rad, std::vector<uint32_t>& out, double box = 0.0);
+// s = size + delta, so a node can be skipped when dist(COM, centre) > radius + s.
+void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centre,
+                double radius, std::vector<uint32_t>& found, double box = 0.0);
 
 struct DensityResult {
     std::vector<double> h;        // converged support radius
@@ -66,9 +66,10 @@ struct DensityResult {
     std::vector<int>    iters;    // solver iterations (diagnostic)
 };
 
-// Solve N_eff(h_i) = des_ngb for every target and return h and rho.
-// h0 is the initial guess (per target; pass empty to derive from the mean interparticle spacing).
-DensityResult density(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-                      double des_ngb, const std::vector<double>& h0, double box = 0.0, int dim = 3);
+// Solve N_eff(h_i) = des_ngb for every target and return h and rho. `h_start` is the per-target
+// initial guess; pass an empty vector to derive one from the mean interparticle spacing.
+DensityResult density(const Tree& tree, const Particles& particles,
+                      const std::vector<uint32_t>& targets, double des_ngb,
+                      const std::vector<double>& h_start, double box = 0.0, int n_dims = 3);
 
 }  // namespace shmem

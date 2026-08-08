@@ -11,11 +11,24 @@ namespace shmem {
 // Softened point-mass acceleration, Plummer-equivalent. Kept trivial for now: the validation target
 // is the TREE (opening criterion, traversal, moments), not the force kernel, and a spline kernel can
 // be dropped in later without touching the traversal.
-static inline void kick(double dx, double dy, double dz, double m, double eps2,
-                        double& ax, double& ay, double& az) {
-    double r2 = dx*dx + dy*dy + dz*dz + eps2;
-    double inv = 1.0 / (r2 * std::sqrt(r2));      // 1/r^3
-    ax += m * dx * inv; ay += m * dy * inv; az += m * dz * inv;
+static inline void kick(const Vec3d& offset, double mass, double softening_sq, Vec3d& accel) {
+    const double r_sq = offset.norm_sq() + softening_sq;
+    const double inv_r_cubed = 1.0 / (r_sq * std::sqrt(r_sq));
+    accel += offset * (mass * inv_r_cubed);
+}
+
+// Component form, for the grouped walk ONLY. That loop keeps its batch in SoA scratch buffers on
+// purpose -- contiguous per-component arrays are what let the inner loop over the batch vectorise,
+// which is the entire reason grouping wins. Feeding it Vec3d would make the batch AoS and give that
+// back, so the one hot loop that wants components gets them.
+static inline void kick(double offset_x, double offset_y, double offset_z,
+                        double mass, double softening_sq,
+                        double& accel_x, double& accel_y, double& accel_z) {
+    const double r_sq = offset_x*offset_x + offset_y*offset_y + offset_z*offset_z + softening_sq;
+    const double inv_r_cubed = 1.0 / (r_sq * std::sqrt(r_sq));
+    accel_x += mass * offset_x * inv_r_cubed;
+    accel_y += mass * offset_y * inv_r_cubed;
+    accel_z += mass * offset_z * inv_r_cubed;
 }
 
 int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
@@ -187,46 +200,47 @@ Tree build(const Particles& P, BuildTimes* bt) {
     return T;
 }
 
-void accel(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
+void accel(const Tree& tree, const Particles& particles, const std::vector<uint32_t>& targets,
            double theta, double G, std::vector<double>& ax, std::vector<double>& ay,
            std::vector<double>& az) {
-    const size_t nt = targets.size();
-    ax.assign(nt, 0.0); ay.assign(nt, 0.0); az.assign(nt, 0.0);
-    const double theta2 = theta * theta;
+    const size_t n_targets = targets.size();
+    ax.assign(n_targets, 0.0); ay.assign(n_targets, 0.0); az.assign(n_targets, 0.0);
+    const double theta_sq = theta * theta;
 
     // Plain parallel-for over the ACTIVE list. step_overhead showed this beats a persistent pool
     // (4x) and beats capping the width (2.5x) in exactly this regime.
     #pragma omp parallel for schedule(dynamic, 16)
-    for (size_t t = 0; t < nt; ++t) {
-        const uint32_t p = targets[t];
-        const double px = P.x[p], py = P.y[p], pz = P.z[p];
-        const double eps = P.soft.empty() ? 0.0 : P.soft[p];
-        double sx = 0, sy = 0, sz = 0;
+    for (size_t t = 0; t < n_targets; ++t) {
+        const uint32_t target = targets[t];
+        const Vec3d pos_target = particles.pos(target);
+        const double soft_target = particles.soft.empty() ? 0.0 : particles.soft[target];
+        Vec3d accel{0, 0, 0};
 
-        const WNode* __restrict W = T.wn.data();
-        int node = T.root;
-        while (node >= 0) {
-            const WNode& w = W[node];                     // ONE cache line per visit
-            double dx = w.cx - px, dy = w.cy - py, dz = w.cz - pz;
-            double r2 = dx*dx + dy*dy + dz*dz;
-            if (w.first < 0 || w.s * w.s < theta2 * r2) {
-                if (w.first < 0) {                        // leaf: direct sum over its particles
-                    for (int i = w.plo; i < w.phi; ++i) {
-                        uint32_t q = T.orderbuf[i];
-                        if (q == p) continue;
-                        double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-                        kick(P.x[q]-px, P.y[q]-py, P.z[q]-pz, P.m[q], e2*e2, sx, sy, sz);
+        const WNode* __restrict nodes = tree.wn.data();
+        int node_id = tree.root;
+        while (node_id >= 0) {
+            const WNode& node = nodes[node_id];           // ONE cache line per visit
+            const Vec3d to_com = Vec3d{node.cx, node.cy, node.cz} - pos_target;
+            const double r_sq = to_com.norm_sq();
+            if (node.first < 0 || node.s * node.s < theta_sq * r_sq) {
+                if (node.first < 0) {                     // leaf: direct sum over its particles
+                    for (int slot = node.plo; slot < node.phi; ++slot) {
+                        const uint32_t j = tree.orderbuf[slot];
+                        if (j == target) continue;
+                        const double soft = std::max(
+                            soft_target, particles.soft.empty() ? 0.0 : particles.soft[j]);
+                        kick(particles.pos(j) - pos_target, particles.m[j], soft*soft, accel);
                     }
-                } else {                                   // far enough: use the monopole
-                    double e2 = std::max(eps, (double)w.soft);
-                    kick(dx, dy, dz, w.mass, e2*e2, sx, sy, sz);
+                } else {                                  // far enough: use the monopole
+                    const double soft = std::max(soft_target, (double)node.soft);
+                    kick(to_com, node.mass, soft*soft, accel);
                 }
-                node = w.next;
+                node_id = node.next;
             } else {
-                node = w.first;                            // too close: descend
+                node_id = node.first;                     // too close: descend
             }
         }
-        ax[t] = G * sx; ay[t] = G * sy; az[t] = G * sz;
+        ax[t] = G * accel[0]; ay[t] = G * accel[1]; az[t] = G * accel[2];
     }
 }
 
@@ -242,33 +256,33 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
     #pragma omp parallel for schedule(dynamic, 16)
     for (size_t t = 0; t < nt; ++t) {
         const uint32_t p = targets[t];
-        const double px = P.x[p], py = P.y[p], pz = P.z[p];
+        const Vec3d xp = P.pos(p);
         const double eps = P.soft.empty() ? 0.0 : P.soft[p];
-        double sx = 0, sy = 0, sz = 0;
+        Vec3d acc{0, 0, 0};
 
         int node = T.root;
         while (node >= 0) {
-            double dx = T.cx[node] - px, dy = T.cy[node] - py, dz = T.cz[node] - pz;
-            double r2 = dx*dx + dy*dy + dz*dz;
-            double s = T.size[node] + T.delta[node];
+            const Vec3d d = Vec3d{T.cx[node], T.cy[node], T.cz[node]} - xp;
+            const double r2 = d.norm_sq();
+            const double s = T.size[node] + T.delta[node];
             if (T.first[node] < 0 || s * s < theta2 * r2) {
                 if (T.first[node] < 0) {
                     for (int i = T.plo[node]; i < T.phi[node]; ++i) {
                         uint32_t q = T.orderbuf[i];
                         if (q == p) continue;
                         double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-                        kick(P.x[q]-px, P.y[q]-py, P.z[q]-pz, P.m[q], e2*e2, sx, sy, sz);
+                        kick(P.pos(q) - xp, P.m[q], e2*e2, acc);
                     }
                 } else {
                     double e2 = std::max(eps, T.soft[node]);
-                    kick(dx, dy, dz, T.mass[node], e2*e2, sx, sy, sz);
+                    kick(d, T.mass[node], e2*e2, acc);
                 }
                 node = T.next[node];
             } else {
                 node = T.first[node];
             }
         }
-        ax[t] = G * sx; ay[t] = G * sy; az[t] = G * sz;
+        ax[t] = G * acc[0]; ay[t] = G * acc[1]; az[t] = G * acc[2];
     }
 }
 
@@ -347,15 +361,15 @@ void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, doubl
     #pragma omp parallel for schedule(static)
     for (size_t t = 0; t < nt; ++t) {
         uint32_t p = targets[t];
-        double px = P.x[p], py = P.y[p], pz = P.z[p];
+        const Vec3d xp = P.pos(p);
         double eps = P.soft.empty() ? 0.0 : P.soft[p];
-        double sx = 0, sy = 0, sz = 0;
+        Vec3d acc{0, 0, 0};
         for (size_t q = 0; q < n; ++q) {
             if (q == p) continue;
             double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-            kick(P.x[q]-px, P.y[q]-py, P.z[q]-pz, P.m[q], e2*e2, sx, sy, sz);
+            kick(P.pos(q) - xp, P.m[q], e2*e2, acc);
         }
-        ax[t] = G*sx; ay[t] = G*sy; az[t] = G*sz;
+        ax[t] = G*acc[0]; ay[t] = G*acc[1]; az[t] = G*acc[2];
     }
 }
 

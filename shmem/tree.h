@@ -29,11 +29,15 @@
 #include <numeric>
 #include <vector>
 
+#include "vec.h"                   // Vec3/Mat3/SymmetricTensor2 + the periodic wrap helpers
+
 namespace shmem {
 
 struct Particles {                 // SoA: the walk reads x/y/z/m for many particles at once
     std::vector<double> x, y, z, m, soft;
     size_t size() const { return m.size(); }
+
+    Vec3d pos(size_t i) const { return Vec3d{x[i], y[i], z[i]}; }
 };
 
 // ---- Morton (Z-order) key: interleave the low 21 bits of each coordinate ----
@@ -48,13 +52,6 @@ static inline uint64_t spread3(uint64_t v) {
 }
 static inline uint64_t morton(uint32_t a, uint32_t b, uint32_t c) {
     return spread3(a) | (spread3(b) << 1) | (spread3(c) << 2);
-}
-
-// Minimum-image displacement for periodic boxes; box <= 0 means non-periodic. Valid while the
-// query radius + node size stays below box/2, which holds for kernel-scale searches.
-static inline double wrap(double d, double box) {
-    if (box > 0) { if (d > 0.5*box) d -= box; else if (d < -0.5*box) d += box; }
-    return d;
 }
 
 // Packed node for TRAVERSAL. SoA is right for bulk particle loops but wrong for a tree walk, which
