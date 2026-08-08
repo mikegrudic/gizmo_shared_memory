@@ -405,6 +405,20 @@ void compute_initial_state(Sim& sim) {
     solve_h_and_volumes(sim, sim.tree, all_particles);
 }
 
+void compute_potential(Sim& sim) {
+    const size_t n_part = sim.size();
+    sim.phi.assign(n_part, 0.0);
+    if (!sim.gravity_on) return;
+    if (!sim.tree_valid || sim.tree.nnodes() == 0) {
+        sim.tree = build(sim.P);
+        sim.tree_valid = true;
+        sim.drift_since_build = 0.0;
+    }
+    std::vector<uint32_t> all_particles(n_part);
+    for (size_t i = 0; i < n_part; ++i) all_particles[i] = (uint32_t)i;
+    potential(sim.tree, sim.P, all_particles, sim.theta, sim.G, sim.phi);
+}
+
 void set_time_base(Sim& sim, double interval, double max_step) {
     // n = how many equal pieces the snapshot interval must be cut into for each to fit inside
     // max_step. Using interval/n rather than max_step itself is what makes the boundary exact.

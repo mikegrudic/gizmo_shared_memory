@@ -45,12 +45,14 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 }
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
-static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft) {
+static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
+                         bool& output_potential) {
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
     gravity_on = true;
     adaptive_soft = false;
+    output_potential = false;
     for (const char* path : {"Config.sh", "../../Config.sh"}) {
         FILE* file = fopen(path, "r");
         if (!file) continue;
@@ -59,6 +61,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             if (line[0] == '#') continue;
             if (strncmp(line, "SELFGRAVITY_OFF", 15) == 0) gravity_on = false;
             if (strncmp(line, "ADAPTIVE_GRAVSOFT_FORGAS", 24) == 0) adaptive_soft = true;
+            if (strncmp(line, "OUTPUT_POTENTIAL", 16) == 0) output_potential = true;
             int dims_from_config;
             if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
                 n_dims = dims_from_config;
@@ -171,6 +174,7 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
     write_scalar_field("InternalEnergy", sim.u);
     write_scalar_field("Density", sim.rho);
     write_scalar_field("SmoothingLength", sim.h);
+    if (sim.output_potential && sim.phi.size() == n_part) write_scalar_field("Potential", sim.phi);
     {
         hsize_t dims = n_part;
         hid_t space = H5Screate_simple(1, &dims, nullptr);
@@ -233,8 +237,8 @@ int main(int argc, char** argv) {
     const double box     = params.count("BoxSize") ? atof(params["BoxSize"].c_str()) : 0.0;
 
     int n_dims = 3; double gamma = 5.0/3.0;
-    bool gravity_on = false, adaptive_soft = false;
-    parse_config(n_dims, gamma, gravity_on, adaptive_soft);
+    bool gravity_on = false, adaptive_soft = false, output_potential = false;
+    parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential);
     const double grav_const = params.count("GravityConstantInternal")
                             ? atof(params["GravityConstantInternal"].c_str()) : 1.0;
     const double soft_gas = params.count("SofteningGas")
@@ -255,6 +259,7 @@ int main(int argc, char** argv) {
     sim.des_ngb = des_ngb; sim.cfl = courant;
     sim.gravity_on = gravity_on; sim.G = grav_const;
     sim.soft_min = soft_gas; sim.adaptive_soft = adaptive_soft;
+    sim.output_potential = output_potential;
     // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
     if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));
@@ -280,6 +285,7 @@ int main(int argc, char** argv) {
     // snapshot 0 needs Density/h populated. Use the engine's own volume solve, NOT the SPH-style
     // sum_j m_j W that the neighbour routine returns -- see compute_initial_state.
     compute_initial_state(sim);
+    if (sim.output_potential) compute_potential(sim);
     write_snapshot(sim, particle_ids, outdir, 0, 0.0);
 
     double time = 0; int snapshot_num = 1; int n_steps = 0;
@@ -309,10 +315,12 @@ int main(int argc, char** argv) {
             if (sim.individual_timesteps) print_timebins(sim, dt_taken, time);
         }
         if (time >= target_time - 1e-12 && target_time < time_max) {
+            if (sim.output_potential) compute_potential(sim);
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time);
             next_snapshot_time += dt_snapshot;
         }
     }
+    if (sim.output_potential) compute_potential(sim);
     write_snapshot(sim, particle_ids, outdir, snapshot_num, time);
     printf("done: t=%.6g in %d steps\n", time, n_steps);
     MPI_Finalize();

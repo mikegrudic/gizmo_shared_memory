@@ -69,6 +69,8 @@ struct Sim {
     double theta      = 0.5;           // Barnes-Hut opening angle
     double soft_min   = 0.0;           // floor on the gas softening (SofteningGas)
     bool   adaptive_soft = true;       // ADAPTIVE_GRAVSOFT_FORGAS: soften on h, not a fixed length
+    bool   output_potential = false;   // OUTPUT_POTENTIAL: write phi so energy/momentum checks work
+    std::vector<double> phi;           // gravitational potential, filled only when writing output
     double eta_grav   = 0.025;         // accuracy of the dt = sqrt(2 eta eps / |a|) criterion
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
     // Half-kick owed by each particle from the close of ITS OWN previous step. Must be per
@@ -159,6 +161,13 @@ void set_time_base(Sim& sim, double interval, double max_step);
 // discontinuity (in test/square it made the exactly-uniform initial pressure vary by 84%, in a
 // square-shaped ring on the interface).
 void compute_initial_state(Sim& sim);
+
+// Fill sim.phi with the gravitational potential at the current positions, for OUTPUT_POTENTIAL.
+// Only called when writing a snapshot -- the run itself never needs it, but without it neither the
+// energy budget nor the momentum-drift normalisation can be evaluated at all: both scale by
+// v_grav = sqrt(|W|/M), and a cold start falls back to v_rms(0) ~ 0, which inflates the reported
+// drift by orders of magnitude even when momentum is conserved to 1e-5.
+void compute_potential(Sim& sim);
 
 // Dump the timebin hierarchy in GIZMO's format (core/run.cc), so output from the two engines can be
 // read side by side. NOTE the bin convention is INVERTED relative to GIZMO's: here bin 0 is the
