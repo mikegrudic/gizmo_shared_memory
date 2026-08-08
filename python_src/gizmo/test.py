@@ -125,6 +125,12 @@ def build_gizmo_for_test(test_name: str, num_openmp_threads: int = 0, extra_conf
         return
     system("rm -f GIZMO test/*/GIZMO")
     system(f"cp test/{test_name}/Config.sh .")
+    prebuilt = environ.get("GIZMO_PREBUILT")
+    if prebuilt:
+        # run the suite against an externally built engine (e.g. the shared-memory prototype in
+        # shmem/): skip the make, stage the binary exactly where the normal path puts it
+        system(f"cp {prebuilt} test/{test_name}/GIZMO && chmod +x test/{test_name}/GIZMO")
+        return
     if num_openmp_threads > 0:
         with open("Config.sh", "a") as f:
             f.write(f"\nOPENMP={num_openmp_threads}\n")
