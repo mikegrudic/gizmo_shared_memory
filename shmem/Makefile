@@ -18,3 +18,5 @@ clean:
 .PHONY: all clean
 test_hydro: test_hydro.cc hydro.cc hydro.h tree.cc tree.h
 	$(CXX) $(CXXFLAGS) -o $@ test_hydro.cc hydro.cc tree.cc
+test_mfm: test_mfm.cc mfm.cc mfm.h hydro.cc hydro.h tree.cc tree.h
+	$(CXX) $(CXXFLAGS) -o $@ test_mfm.cc mfm.cc hydro.cc tree.cc

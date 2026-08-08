@@ -3,20 +3,20 @@
 namespace shmem {
 
 void ngb_search(const Tree& T, const Particles& P, double x, double y, double z,
-                double rad, std::vector<uint32_t>& out) {
+                double rad, std::vector<uint32_t>& out, double box) {
     const WNode* __restrict W = T.wn.data();
     const double rad2_pad = rad;             // node prune uses rad + s, particle test uses rad
     int node = T.root;
     while (node >= 0) {
         const WNode& w = W[node];
-        double dx = w.cx - x, dy = w.cy - y, dz = w.cz - z;
+        double dx = wrap(w.cx - x, box), dy = wrap(w.cy - y, box), dz = wrap(w.cz - z, box);
         double r2 = dx*dx + dy*dy + dz*dz;
         double keep = rad2_pad + w.s;        // conservative: all node particles are within s of COM
         if (r2 > keep * keep) { node = w.next; continue; }
         if (w.first < 0) {
             for (int i = w.plo; i < w.phi; ++i) {
                 uint32_t q = T.orderbuf[i];
-                double qx = P.x[q]-x, qy = P.y[q]-y, qz = P.z[q]-z;
+                double qx = wrap(P.x[q]-x, box), qy = wrap(P.y[q]-y, box), qz = wrap(P.z[q]-z, box);
                 if (qx*qx + qy*qy + qz*qz < rad*rad) out.push_back(q);
             }
             node = w.next;
@@ -27,7 +27,7 @@ void ngb_search(const Tree& T, const Particles& P, double x, double y, double z,
 }
 
 DensityResult density(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-                      double des_ngb, const std::vector<double>& h0) {
+                      double des_ngb, const std::vector<double>& h0, double box) {
     const size_t nt = targets.size();
     DensityResult R;
     R.h.assign(nt, 0.0); R.rho.assign(nt, 0.0); R.nngb.assign(nt, 0); R.iters.assign(nt, 0);
@@ -57,10 +57,10 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
             int it = 0;
             for (; it < 100; ++it) {
                 ngb.clear();
-                ngb_search(T, P, px, py, pz, h, ngb);
+                ngb_search(T, P, px, py, pz, h, ngb, box);
                 double wsum = 0.0, dwdh = 0.0;
                 for (uint32_t q : ngb) {
-                    double dx = P.x[q]-px, dy = P.y[q]-py, dz = P.z[q]-pz;
+                    double dx = wrap(P.x[q]-px, box), dy = wrap(P.y[q]-py, box), dz = wrap(P.z[q]-pz, box);
                     double r = std::sqrt(dx*dx + dy*dy + dz*dz);
                     wsum += kernel_w(r, h);
                     dwdh += kernel_dwdh(r, h);
@@ -84,10 +84,10 @@ DensityResult density(const Tree& T, const Particles& P, const std::vector<uint3
             }
             // final density on the converged h
             ngb.clear();
-            ngb_search(T, P, px, py, pz, h, ngb);
+            ngb_search(T, P, px, py, pz, h, ngb, box);
             double rho = 0.0; int inside = 0;
             for (uint32_t q : ngb) {
-                double dx = P.x[q]-px, dy = P.y[q]-py, dz = P.z[q]-pz;
+                double dx = wrap(P.x[q]-px, box), dy = wrap(P.y[q]-py, box), dz = wrap(P.z[q]-pz, box);
                 double r = std::sqrt(dx*dx + dy*dy + dz*dz);
                 if (r < h) ++inside;
                 rho += P.m[q] * kernel_w(r, h);

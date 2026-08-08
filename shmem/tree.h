@@ -50,6 +50,13 @@ static inline uint64_t morton(uint32_t a, uint32_t b, uint32_t c) {
     return spread3(a) | (spread3(b) << 1) | (spread3(c) << 2);
 }
 
+// Minimum-image displacement for periodic boxes; box <= 0 means non-periodic. Valid while the
+// query radius + node size stays below box/2, which holds for kernel-scale searches.
+static inline double wrap(double d, double box) {
+    if (box > 0) { if (d > 0.5*box) d -= box; else if (d < -0.5*box) d += box; }
+    return d;
+}
+
 // Packed node for TRAVERSAL. SoA is right for bulk particle loops but wrong for a tree walk, which
 // needs every field of ONE node: with 11 separate arrays each visit touched ~9 cache lines and cost
 // ~108 ns (measured), i.e. DRAM latency per node. Packed into exactly one 64-byte line the walk

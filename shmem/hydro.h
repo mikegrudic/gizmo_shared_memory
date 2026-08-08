@@ -45,7 +45,7 @@ static inline double kernel_dwdh(double r, double h) {   // dW/dh at fixed r
 // Prune: every particle in a node lies within (node.s) of the node COM by construction of
 // s = size + delta, so a node can be skipped when dist(COM, centre) > rad + s.
 void ngb_search(const Tree& T, const Particles& P, double x, double y, double z,
-                double rad, std::vector<uint32_t>& out);
+                double rad, std::vector<uint32_t>& out, double box = 0.0);
 
 struct DensityResult {
     std::vector<double> h;        // converged support radius
@@ -57,6 +57,6 @@ struct DensityResult {
 // Solve N_eff(h_i) = des_ngb for every target and return h and rho.
 // h0 is the initial guess (per target; pass empty to derive from the mean interparticle spacing).
 DensityResult density(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-                      double des_ngb, const std::vector<double>& h0);
+                      double des_ngb, const std::vector<double>& h0, double box = 0.0);
 
 }  // namespace shmem
