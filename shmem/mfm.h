@@ -90,6 +90,25 @@ struct Sim {
     double gamma = 5.0 / 3.0;
     int    dim   = 3;                  // 1/2/3; matches BOX_SPATIAL_DIMENSION in the suite configs
 
+    // ---- equation of state ----
+    // One mechanism, three laws. IDEAL is the ordinary P = (gamma-1) rho u with u evolved by the
+    // energy equation. The other two make PRESSURE A FUNCTION OF DENSITY ALONE and overwrite u
+    // from it at every evaluation: they stand in for radiative cooling, so shock heating is not
+    // retained and the energy equation's answer is deliberately discarded.
+    enum class EosLaw { IDEAL, ENFORCE_ADIABAT, BAROTROPIC };
+    EosLaw eos_law     = EosLaw::IDEAL;
+    double eos_adiabat = 0.0;          // EOS_ENFORCE_ADIABAT=A: P = A rho^gamma, code units
+    int    baro_variant = 0;           // EOS_GMC_BAROTROPIC=N: 0 = MI2000 piecewise, 1..4 = BBB03
+    bool   baro_soundspeed = false;    // EOS_GMC_BAROTROPIC_SOUNDSPEED: sound speed from the
+                                       // barotrope's own dlnP/dlnrho rather than from gamma
+    double nh_per_code_density = 0.0;  // code rho -> n_H [cm^-3]
+    double code_press_per_cgs  = 0.0;  // cgs pressure -> code pressure
+    // Per-particle sound speed. A barotrope's dP/drho differs from gamma P/rho off the adiabatic
+    // branch, and GIZMO feeds THAT into the Riemann wavespeeds (EOS_GMC_BAROTROPIC implies
+    // EOS_GENERAL), so it is carried explicitly rather than re-derived from a single gamma at
+    // each use site.
+    std::vector<double> csnd;
+    bool eos_is_ideal() const { return eos_law == EosLaw::IDEAL; }
 
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;

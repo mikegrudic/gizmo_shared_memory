@@ -38,7 +38,12 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
     while (fgets(line, sizeof line, file)) {
         char key[128], value[256];
         if (line[0] == '%' || line[0] == '#') continue;
-        if (sscanf(line, "%127s %255s", key, value) == 2) settings[key] = value;
+        if (sscanf(line, "%127s %255s", key, value) == 2) {
+            // Values may be followed -- or entirely replaced -- by an inline comment, as
+            // shu1977.params does for GravityConstantInternal ("%4301 ... calculated by code
+            // if =0"). Treat a comment-leading value as absent rather than as atof()'s 0.
+            if (value[0] != '%' && value[0] != '#') settings[key] = value;
+        }
     }
     fclose(file);
     return settings;
@@ -46,7 +51,8 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
-                         bool& output_potential, bool& tidal_criterion, bool& box_periodic) {
+                         bool& output_potential, bool& tidal_criterion, bool& box_periodic,
+                         double& eos_adiabat, int& baro_variant, bool& baro_soundspeed) {
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -55,6 +61,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
     output_potential = false;
     tidal_criterion = false;
     box_periodic = false;
+    eos_adiabat = 0.0; baro_variant = -1; baro_soundspeed = false;
     // GIZMO_CONFIG (set by the pytest harness's GIZMO_PREBUILT path) names the staged config --
     // base + per-variant extra flags -- explicitly. The cwd/root fallbacks serve standalone runs;
     // under pytest the cwd copy is the pristine base WITHOUT the variant flags, which is exactly
@@ -90,6 +97,15 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             // Periodicity is a COMPILE flag in GIZMO, not a params entry: a params file may carry
             // BoxSize > 0 (plummer: 300, shu1977: 4.34) for a run that is nevertheless open.
             if (flag("BOX_PERIODIC"))             box_periodic = true;
+            if (flag("EOS_GMC_BAROTROPIC_SOUNDSPEED")) baro_soundspeed = true;
+            double adiabat_value;
+            if (flag("EOS_ENFORCE_ADIABAT") &&
+                sscanf(line, "EOS_ENFORCE_ADIABAT=%lf", &adiabat_value) == 1)
+                eos_adiabat = adiabat_value;
+            int baro_value;
+            if (flag("EOS_GMC_BAROTROPIC"))
+                baro_variant = (sscanf(line, "EOS_GMC_BAROTROPIC=%d", &baro_value) == 1)
+                             ? baro_value : 0;   // bare flag = the MI2000 piecewise form
             int dims_from_config;
             if (flag("BOX_SPATIAL_DIMENSION") &&
                 sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
@@ -316,10 +332,24 @@ int main(int argc, char** argv) {
     int n_dims = 3; double gamma = 5.0/3.0;
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
     bool tidal_criterion = false, box_periodic = false;
+    double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
-                 box_periodic);
-    const double grav_const = params.count("GravityConstantInternal")
-                            ? atof(params["GravityConstantInternal"].c_str()) : 1.0;
+                 box_periodic, eos_adiabat, baro_variant, baro_soundspeed);
+    // Units first: G falls back to the PHYSICAL constant in code units when the params file
+    // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
+    // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
+    // GIZMO's own (kpc / 1e10 Msun / km s^-1), so a params file that omits them is unchanged.
+    const double unit_length_cgs = params.count("UnitLength_in_cm")
+                                 ? atof(params["UnitLength_in_cm"].c_str()) : 3.085678e21;
+    const double unit_mass_cgs   = params.count("UnitMass_in_g")
+                                 ? atof(params["UnitMass_in_g"].c_str()) : 1.989e43;
+    const double unit_vel_cgs    = params.count("UnitVelocity_in_cm_per_s")
+                                 ? atof(params["UnitVelocity_in_cm_per_s"].c_str()) : 1.0e5;
+    const double GRAVITY_CGS = 6.674e-8;
+    double grav_const = params.count("GravityConstantInternal")
+                      ? atof(params["GravityConstantInternal"].c_str()) : 0.0;
+    if (!(grav_const > 0))
+        grav_const = GRAVITY_CGS * unit_mass_cgs / (unit_length_cgs * unit_vel_cgs * unit_vel_cgs);
     // Softening params come in two GIZMO spellings; accept both. Values in the file are
     // Plummer-equivalent; the engine stores the KERNEL EXTENT = 2.8x (GIZMO's ForceSoftening).
     auto soft_param = [&](const char* name_a, const char* name_b) -> double {
@@ -356,6 +386,30 @@ int main(int argc, char** argv) {
     for (int t = 0; t < 6; ++t) sim.soft_fixed[t] = 2.8 * soft_plummer[t];
     sim.output_potential = output_potential;
     sim.tidal_criterion = tidal_criterion;
+
+    // ---- EOS ----
+    // The barotropic constants are tabulated against n_H in cm^-3 and return cgs pressure, so
+    // both conversions are precomputed from the unit system read above.
+    const double unit_density_cgs = unit_mass_cgs / (unit_length_cgs*unit_length_cgs*unit_length_cgs);
+    const double PROTONMASS = 1.6726e-24, HYDROGEN_MASSFRAC = 0.76;
+    sim.nh_per_code_density = unit_density_cgs * HYDROGEN_MASSFRAC / PROTONMASS;
+    sim.code_press_per_cgs  = 1.0 / (unit_density_cgs * unit_vel_cgs * unit_vel_cgs);
+    if (baro_variant >= 0) {
+        sim.eos_law = Sim::EosLaw::BAROTROPIC;
+        sim.baro_variant = baro_variant;
+        sim.baro_soundspeed = baro_soundspeed;
+    } else if (eos_adiabat > 0) {
+        sim.eos_law = Sim::EosLaw::ENFORCE_ADIABAT;
+        sim.eos_adiabat = eos_adiabat;
+    }
+    if (!sim.eos_is_ideal())
+        printf("shmem-GIZMO: EOS %s%s  (n_H per code rho = %.4g cm^-3, P_code per P_cgs = %.4g)\n",
+               sim.eos_law == Sim::EosLaw::ENFORCE_ADIABAT ? "enforced adiabat P = A rho^gamma"
+                                                           : "GMC barotropic",
+               sim.eos_law == Sim::EosLaw::BAROTROPIC
+                   ? (sim.baro_soundspeed ? " variant/soundspeed-from-barotrope" : " variant")
+                   : "",
+               sim.nh_per_code_density, sim.code_press_per_cgs);
     if (params.count("ErrTolIntAccuracy")) sim.eta_grav = atof(params["ErrTolIntAccuracy"].c_str());
     if (params.count("ErrTolTheta"))    sim.theta = atof(params["ErrTolTheta"].c_str());
     if (params.count("ErrTolForceAcc")) sim.err_tol_force_acc = atof(params["ErrTolForceAcc"].c_str());

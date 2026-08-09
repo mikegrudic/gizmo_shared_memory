@@ -53,6 +53,84 @@ static bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dim
     return full.invert(inverse) != 0.0;              // invert() zeroes and returns 0 if singular
 }
 
+// ---------------------------------------------------------------------------------------------
+// EQUATION OF STATE. Sets pressure and sound speed for one particle, and -- for the laws where
+// pressure is a function of density alone -- writes the internal energy back from it.
+//
+// Ported from GIZMO's eos/eos.cc (with the user's barotropic variants). Constants are in cgs and
+// take n_H, so density is converted out to cgs and the pressure converted back.
+//
+// The u write-back must use the THERMODYNAMIC index gamma, never the barotrope's local
+// dlnP/dlnrho: u = P/(rho (gamma_eff-1)) diverges as gamma_eff -> 1 on the isothermal branch.
+// gamma_eff exists only to set the sound speed, and only when EOS_GMC_BAROTROPIC_SOUNDSPEED asks
+// for it -- otherwise the isothermal branch would reach the Riemann solver at sqrt(gamma) c_s0
+// instead of c_s0.
+static inline void eos_apply(Sim& sim, size_t i) {
+    const double rho = sim.rho[i];
+    if (rho <= 0) { sim.press[i] = 0; if (!sim.csnd.empty()) sim.csnd[i] = 0; return; }
+    double press, gamma_eff = sim.gamma, gamma_index = sim.gamma;
+
+    switch (sim.eos_law) {
+    case Sim::EosLaw::IDEAL:
+        press = (sim.gamma - 1.0) * rho * sim.u[i];
+        break;
+    case Sim::EosLaw::ENFORCE_ADIABAT:
+        press = sim.eos_adiabat * std::pow(rho, sim.gamma);
+        break;
+    case Sim::EosLaw::BAROTROPIC: {
+        const double nH = rho * sim.nh_per_code_density;
+        double p_cgs;
+        if (sim.baro_variant == 0) {
+            // Masunaga & Inutsuka 2000 / Federrath+ 2014 piecewise form
+            const double g = (nH < 2.30181e16) ? 1.4 : (5.0 / 3.0);
+            if      (nH < 1.49468e8)  { p_cgs = 6.60677e-16 * nH;                gamma_eff = 1.0; }
+            else if (nH < 2.30181e11) { p_cgs = 1.00585e-16 * std::pow(nH, 1.1); gamma_eff = 1.1; }
+            else if (nH < 2.30181e16) { p_cgs = 3.92567e-20 * std::pow(nH, g);   gamma_eff = g;   }
+            else if (nH < 2.30181e21) { p_cgs = 3.1783e-15  * std::pow(nH, 1.1); gamma_eff = 1.1; }
+            else                      { p_cgs = 2.49841e-27 * std::pow(nH, g);   gamma_eff = g;   }
+            gamma_index = g;
+        } else {
+            // Bate, Bonnell & Bromm 2003 family: isothermal below n_crit, adiabatic above.
+            // 1/2 join at the critical density, 3/4 join smoothly (Hopkins' EOS_MHD_CORE form);
+            // odd variants use gamma = 7/5, even 5/3.
+            const double nH_crit = 6.0e10, p_iso = 6.60677e-16 * nH;
+            const double g = (sim.baro_variant == 1 || sim.baro_variant == 3) ? 1.4 : (5.0 / 3.0);
+            gamma_index = g;
+            if (sim.baro_variant <= 2) {
+                if (nH < nH_crit) { p_cgs = p_iso; gamma_eff = 1.0; }
+                else { p_cgs = 6.60677e-16 * nH_crit * std::pow(nH / nH_crit, g); gamma_eff = g; }
+            } else {
+                // smooth: P = c_s0^2 rho sqrt(1 + (rho/rho_crit)^(2(gamma-1))), which exceeds the
+                // piecewise form by at most sqrt(2) in P (9% in c_s), at rho_crit
+                const double x = std::pow(nH / nH_crit, 2.0 * (g - 1.0));
+                p_cgs = p_iso * std::sqrt(1.0 + x);
+                gamma_eff = 1.0 + (g - 1.0) * x / (1.0 + x);   // runs 1 -> gamma, (1+g)/2 at crit
+            }
+        }
+        press = p_cgs * sim.code_press_per_cgs;
+        break;
+    }
+    default:
+        press = (sim.gamma - 1.0) * rho * sim.u[i];
+        break;
+    }
+
+    sim.press[i] = press;
+    if (sim.eos_law != Sim::EosLaw::IDEAL)
+        sim.u[i] = press / (rho * (gamma_index - 1.0));
+    if (!sim.csnd.empty()) {
+        const double g_cs = (sim.eos_law == Sim::EosLaw::BAROTROPIC && sim.baro_soundspeed)
+                          ? gamma_eff : sim.gamma;
+        sim.csnd[i] = std::sqrt(g_cs * press / rho);
+    }
+}
+
+// Sound speed for particle i, from the EOS when one is carried and from gamma P/rho otherwise.
+static inline double sound_speed(const Sim& sim, size_t i) {
+    if (!sim.csnd.empty() && sim.csnd[i] > 0) return sim.csnd[i];
+    return std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+}
+
 [[nodiscard]] static constexpr double minmod(double a, double b) noexcept {
     return (a*b <= 0) ? 0.0 : (std::abs(a) < std::abs(b) ? a : b);
 }
@@ -122,11 +200,15 @@ struct ContactState { double speed, pressure; };
 
 // HLLC for an ideal gas, states already rotated so the given velocities are normal to the face.
 // Wave-speed estimates: Davis.
+// gamma_left/gamma_right are the LOCAL effective adiabatic indices, so a barotrope reaches the
+// wavespeeds at its own dP/drho rather than at the thermodynamic gamma -- GIZMO's EOS_GENERAL
+// pathway. For an ideal gas both are simply gamma and this reduces to the usual estimate.
 [[nodiscard]] static ContactState solve_hllc_contact(
         double density_left,  double vnorm_left,  double pressure_left,
-        double density_right, double vnorm_right, double pressure_right, double gamma) {
-    const double csound_left  = std::sqrt(gamma * pressure_left  / density_left);
-    const double csound_right = std::sqrt(gamma * pressure_right / density_right);
+        double density_right, double vnorm_right, double pressure_right,
+        double gamma_left, double gamma_right) {
+    const double csound_left  = std::sqrt(gamma_left  * pressure_left  / density_left);
+    const double csound_right = std::sqrt(gamma_right * pressure_right / density_right);
     const double wave_left  = std::min(vnorm_left - csound_left, vnorm_right - csound_right);
     const double wave_right = std::max(vnorm_left + csound_left, vnorm_right + csound_right);
     const double numerator = pressure_right - pressure_left
@@ -151,6 +233,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     sim.h.resize(n_part); sim.ninv.resize(n_part);
     sim.rho.resize(n_part); sim.press.resize(n_part);
     sim.omega.resize(n_part, 1.0);
+    sim.csnd.resize(n_part, 0.0);
 
     std::vector<double> h_guess(active.size());
     const bool have_guess = !sim.h.empty();
@@ -214,7 +297,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
             }
             sim.ninv[i]  = 1.0 / weight_sum;             // V_i: MFM volume from partition of unity
             sim.rho[i]   = sim.P.m[i] * weight_sum;      // rho_i = m_i / V_i
-            sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
+            eos_apply(sim, i);
             {
                 // grad-h factor, GIZMO's DrkernNgbFactor: guards against pathological dn/dh as
                 // GIZMO does (the -0.9 test), else 1
@@ -257,7 +340,7 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
             // axis. Built only from RELATIVE velocities, so a uniform boost of the whole domain
             // leaves it unchanged -- the square test advects at |v|~1300 and a lab-frame |v| here
             // would shrink dt by ~1700x for a flow that is trivially Galilean-equivalent to rest.
-            const double csound_i = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+            const double csound_i = sound_speed(sim, i);
             double signal_speed = 2.0 * csound_i;   // floor: the i==j / no-neighbour case
             for (uint32_t j : neighbours) {
                 if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
@@ -268,7 +351,7 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                 if (separation > 0) {
                     const Vec3d rel_vel = vel_i - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
                     const double approach_speed = dot(rel_vel, offset) / separation;
-                    const double csound_j = std::sqrt(sim.gamma * sim.press[j] / sim.rho[j]);
+                    const double csound_j = sound_speed(sim, j);
                     signal_speed = std::max(signal_speed,
                                             csound_i + csound_j - std::min(0.0, approach_speed));
                 }
@@ -503,9 +586,15 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                     Vec3d{left[FIELD_VX], left[FIELD_VY], left[FIELD_VZ]} - face_vel, normal);
                 const double vnorm_right = dot(
                     Vec3d{right[FIELD_VX], right[FIELD_VY], right[FIELD_VZ]} - face_vel, normal);
+                // Effective index per side, cs^2 rho / P, so the reconstructed face state keeps
+                // the local barotropic stiffness instead of being forced back onto gamma.
+                const double geff_i = sim.eos_is_ideal() ? sim.gamma
+                    : sound_speed(sim, i)*sound_speed(sim, i) * sim.rho[i] / sim.press[i];
+                const double geff_j = sim.eos_is_ideal() ? sim.gamma
+                    : sound_speed(sim, j)*sound_speed(sim, j) * sim.rho[j] / sim.press[j];
                 const auto [contact_speed, contact_pressure] = solve_hllc_contact(
                     left[FIELD_DENSITY],  vnorm_left,  left[FIELD_PRESSURE],
-                    right[FIELD_DENSITY], vnorm_right, right[FIELD_PRESSURE], sim.gamma);
+                    right[FIELD_DENSITY], vnorm_right, right[FIELD_PRESSURE], geff_i, geff_j);
 
                 // Lagrangian flux: zero mass flux; P* acts across the face, which moves at
                 // v_frame + S* nhat in the lab. Momentum goes from i to j along +nhat.
@@ -533,10 +622,13 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 {
                     const double eps_big   = sim.gravity_on ? 0.6  : 0.5;
                     const double eps_small = sim.gravity_on ? 1e-2 : 1e-3;
-                    const double cs_i = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
-                    const double cs_j = std::sqrt(sim.gamma * sim.press[j] / sim.rho[j]);
+                    const double cs_i = sound_speed(sim, i);
+                    const double cs_j = sound_speed(sim, j);
                     const double sm_over_c = std::abs(contact_speed) / std::min(cs_i, cs_j);
-                    if (sm_over_c < eps_big) {
+                    // Ideal gas only: under a density-driven EOS the internal energy is reset from
+                    // P(rho) every evaluation, so swapping in an adiabatic energy flux changes
+                    // nothing that survives the next eos_apply.
+                    if (sim.eos_is_ideal() && sm_over_c < eps_big) {
                         // vdotr from the same predicted velocities the reconstruction used;
                         // dv.dp is orientation-free
                         const Vec3d dv{work.predicted[FIELD_VX][i] - work.predicted[FIELD_VX][j],
@@ -721,7 +813,7 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
             for (size_t i = 0; i < sim.size() && shown < 4; ++i) {
                 if (sim.bin[i] != deepest) continue;
                 ++shown;
-                const double cs = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+                const double cs = sound_speed(sim, i);
                 printf("      deep  i=%7zu h=%.4e rho=%.4e P=%.4e cs=%.3f vsig=%.3f "
                        "h/vsig=%.3e x=(%.3f,%.3f)\n", i, sim.h[i], sim.rho[i], sim.press[i], cs,
                        sim.work.signal_speed[i], sim.h[i]/(sim.work.signal_speed[i]+1e-300),
@@ -731,7 +823,7 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
             for (size_t i = 0; i < sim.size() && shown < 2; ++i) {
                 if (sim.bin[i] != shallowest) continue;
                 ++shown;
-                const double cs = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+                const double cs = sound_speed(sim, i);
                 printf("      shal  i=%7zu h=%.4e rho=%.4e P=%.4e cs=%.3f vsig=%.3f "
                        "h/vsig=%.3e x=(%.3f,%.3f)\n", i, sim.h[i], sim.rho[i], sim.press[i], cs,
                        sim.work.signal_speed[i], sim.h[i]/(sim.work.signal_speed[i]+1e-300),
@@ -1066,8 +1158,10 @@ double mfm_step(Sim& sim, double dt_max) {
         sim.vx[i] = vel_new[0]; sim.vy[i] = vel_new[1]; sim.vz[i] = vel_new[2];
         sim.u[i] = std::max(energy/mass - 0.5*vel_new.norm_sq(), 1e-30);
         // Pressure follows u immediately. Only ACTIVE particles reach here now, so this is simply
-        // keeping a particle's own state self-consistent within its own update.
-        sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
+        // keeping a particle's own state self-consistent within its own update. Under a
+        // density-driven EOS this instead RESETS u from P(rho) -- the energy equation's answer is
+        // discarded on purpose, which is what makes the law stand in for cooling.
+        eos_apply(sim, i);
 
         // TIME-CENTRING correction. Pass 2 below drifts everything with the POST-flux velocity,
         // which alone is backward Euler on position -- it produced a clean systematic phase lag in
@@ -1116,7 +1210,7 @@ double mfm_step(Sim& sim, double dt_max) {
                 const double f = (std::abs(x) < 0.05) ? 1.0 + x*(1.0 + 0.5*x) : std::exp(x);
                 sim.rho[i]  *= f;
                 sim.ninv[i] /= f;
-                sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
+                eos_apply(sim, i);          // P(rho) directly, not a scaling of the old pressure
                 sim.h[i]    *= (std::abs(divv_fac) < 0.15)
                                ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
                                : std::exp(divv_fac / sim.dim);
