@@ -73,6 +73,25 @@ struct Sim {
     // adaptive_soft the gas ignores it (soft_min floors the kernel radius instead).
     std::array<double, 6> soft_fixed{};
     std::vector<uint32_t> active_gas;  // scratch: gas prefix of `active` when types are mixed
+
+    // ---- neighbour-list cache (SHMEM_CACHE_NEIGHBORS) ----
+    // Three hydro phases -- the volume/zeta sums, the gradients and the fluxes -- each search the
+    // SAME centre at the SAME radius, because nothing moves between them (the drift is at the end
+    // of the step and the kicks touch only velocities). Without the cache that is three identical
+    // tree traversals per active particle per step; with it, one, and the other two read a slice
+    // of a flat array.
+    //
+    // Compile-time rather than runtime because it is a memory-for-time trade with no universally
+    // right answer: ~4 bytes per neighbour per active particle (2M actives x ~40 neighbours is
+    // ~320 MB) buys the traversals back. Off by default so the memory footprint stays the same
+    // unless asked for.
+    //
+    // Indexed by POSITION IN THE ACTIVE LIST, not by particle index: all three phases walk the
+    // same active list in the same order, and with a small active fraction keying on k rather
+    // than i keeps the arrays proportional to the work rather than to the box.
+    std::vector<uint32_t> ngb_flat;    // concatenated neighbour lists
+    std::vector<size_t>   ngb_start;   // size nactive+1; entries [ngb_start[k], ngb_start[k+1])
+    bool ngb_cache_valid = false;
     std::vector<uint32_t> grav_targets; // scratch: active list in tree Morton order (see
                                         // compute_gravity -- batch walks need spatial coherence)
     double gamma = 5.0 / 3.0;
