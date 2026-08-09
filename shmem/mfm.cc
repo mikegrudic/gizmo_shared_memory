@@ -828,6 +828,11 @@ double mfm_step(Sim& sim, double dt_max) {
     std::vector<double>& dt_of = sim.dt_of;      // reused: allocating N doubles per sync is not free
     dt_of.resize(n_part);
     double dt;                                   // the interval this call advances the system by
+    long long step_ticks = 0;                    // and the same interval in whole clock ticks
+    // Quantise the caller's cap DOWN to whole ticks, so every dt in this step is an exact tick
+    // count and the clock can never be advanced by a fraction of one (see Sim::ticks_floor).
+    const double dt_cap = sim.individual_timesteps && sim.dt_base > 0
+                        ? sim.time_of_ticks(sim.ticks_floor(dt_max)) : dt_max;
     if (sim.individual_timesteps) {
         assign_bins(sim, active);
         // Wake requests raised by the PREVIOUS sync's flux loop are applied here, before this
@@ -837,15 +842,39 @@ double mfm_step(Sim& sim, double dt_max) {
         for (const auto& [j, floor_bin] : sim.wake_requests)
             if (sim.bin[j] < floor_bin) sim.bin[j] = std::min(floor_bin, Sim::MAX_BINS);
         sim.wake_requests.clear();
-        // dt_max can be shorter than the bin-0 step near a snapshot boundary; cap everyone.
+        // An EMPTY active set is not a quiet sync -- it is impossible in a consistent hierarchy
+        // (bin 0 aligns whenever anything does), so it means the clock has desynchronised. Left
+        // alone it is silent and catastrophic: no particle is kicked, yet the drift pass below
+        // still advances everyone, so the run continues with gravity effectively switched off.
+        // Fail loudly instead of producing plausible-looking ballistic output.
+        if (active.empty()) {
+            fprintf(stderr, "shmem: FATAL -- empty active set at clock %lld (dt_base=%g). The "
+                            "timestep hierarchy has desynchronised; every particle would drift "
+                            "with no gravity from here on.\n", sim.clock_ticks, sim.dt_base);
+            std::abort();
+        }
         int deepest_active = 0;
         #pragma omp parallel for schedule(static) reduction(max:deepest_active)
         for (size_t k = 0; k < active.size(); ++k)
             deepest_active = std::max(deepest_active, sim.bin[active[k]]);
+        // dt_cap can be shorter than the bin-0 step near a snapshot boundary; cap everyone.
         // also O(N) every sync, so also parallel -- and dt_of_bin divides, which is not free
         #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < n_part; ++i) dt_of[i] = std::min(sim.dt_of_bin(sim.bin[i]), dt_max);
-        dt = std::min(sim.dt_of_bin(deepest_active), dt_max);
+        for (size_t i = 0; i < n_part; ++i) dt_of[i] = std::min(sim.dt_of_bin(sim.bin[i]), dt_cap);
+        dt = std::min(sim.dt_of_bin(deepest_active), dt_cap);
+        // dt is now a whole number of ticks by construction: dt_of_bin(b) is 2^(MAX_BINS-b) ticks
+        // and dt_cap was floored to ticks above.
+        step_ticks = sim.ticks_of_time(dt);
+        dt = sim.time_of_ticks(step_ticks);
+        // A zero-tick step would advance neither the clock nor the time, so the driver's loop
+        // could never terminate. It means the caller asked to close an interval shorter than one
+        // tick, which the tick-exact driver never does -- so treat it as a bug, not a short step.
+        if (step_ticks < 1) {
+            fprintf(stderr, "shmem: FATAL -- zero-length step requested (dt_max=%g, one tick=%g). "
+                            "The caller is trying to close a sub-tick interval.\n",
+                    dt_max, sim.time_of_ticks(1));
+            std::abort();
+        }
     } else {
         // CFL from the Galilean-invariant signal speed (see gradients()), plus the gravity
         // criterion; one dt shared by every particle.
@@ -1025,12 +1054,10 @@ double mfm_step(Sim& sim, double dt_max) {
     }
     ++sim.sync_point;
 
-    if (sim.individual_timesteps) {
-        // advance the integer clock by the interval just taken
-        long long ticks = (long long)std::llround(dt / sim.dt_base * (double)(1LL << Sim::MAX_BINS));
-        if (ticks < 1) ticks = 1;
-        sim.clock_ticks += ticks;
-    }
+    // Advance the integer clock by exactly the ticks this step covered. No rounding and no
+    // minimum: step_ticks was derived FROM the tick grid above, so the clock and the dt every
+    // particle was integrated over agree exactly, and the hierarchy stays aligned indefinitely.
+    if (sim.individual_timesteps) sim.clock_ticks += step_ticks;
     return dt;
 }
 

@@ -344,16 +344,30 @@ int main(int argc, char** argv) {
     if (sim.output_potential) compute_potential(sim);
     write_snapshot(sim, particle_ids, outdir, 0, 0.0);
 
+    // Time is tracked in the engine's INTEGER TICKS, not accumulated in floating point. Summing
+    // dt every step leaves a residual at each snapshot boundary, and asking mfm_step to close a
+    // residual smaller than one tick used to desynchronise the whole timestep hierarchy (see
+    // Sim::ticks_floor). Integer targets make every boundary exact and every step a whole
+    // number of ticks, so the question never arises.
     double time = 0; int snapshot_num = 1; int n_steps = 0;
-    double next_snapshot_time = dt_snapshot;
+    const long long end_ticks = sim.individual_timesteps ? sim.ticks_of_time(time_max) : 0;
+    const long long snap_ticks = sim.individual_timesteps ? sim.ticks_of_time(dt_snapshot) : 0;
+    long long next_snapshot_ticks = snap_ticks;
+    double next_snapshot_time = dt_snapshot;     // global-timestep mode keeps the float path
     const auto wall_start = std::chrono::steady_clock::now();
     // Heartbeat on WALL CLOCK, not step count: a step-count heartbeat stays silent until it first
     // fires, so the slower the run the longer it reports nothing -- backwards from what is wanted.
     double next_report = 10.0;
-    while (time < time_max - 1e-12) {
-        const double target_time = std::min(next_snapshot_time, time_max);
-        const double dt_taken = mfm_step(sim, std::min(dt_max, target_time - time));
-        time += dt_taken;
+    while (sim.individual_timesteps ? (sim.clock_ticks < end_ticks) : (time < time_max - 1e-12)) {
+        double dt_allowed;
+        if (sim.individual_timesteps) {
+            const long long target_ticks = std::min(next_snapshot_ticks, end_ticks);
+            dt_allowed = std::min(dt_max, sim.time_of_ticks(target_ticks - sim.clock_ticks));
+        } else {
+            dt_allowed = std::min(dt_max, std::min(next_snapshot_time, time_max) - time);
+        }
+        const double dt_taken = mfm_step(sim, dt_allowed);
+        time = sim.individual_timesteps ? sim.time_now() : time + dt_taken;
         ++n_steps;
         const double wall_elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
@@ -370,9 +384,14 @@ int main(int argc, char** argv) {
             // hierarchy evolves as the run proceeds.
             if (sim.individual_timesteps) print_timebins(sim, dt_taken, time);
         }
-        if (time >= target_time - 1e-12 && target_time < time_max) {
+        const bool at_snapshot = sim.individual_timesteps
+                               ? (sim.clock_ticks >= next_snapshot_ticks && sim.clock_ticks < end_ticks)
+                               : (time >= std::min(next_snapshot_time, time_max) - 1e-12 &&
+                                  next_snapshot_time < time_max);
+        if (at_snapshot) {
             if (sim.output_potential) compute_potential(sim);
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time);
+            next_snapshot_ticks += snap_ticks;
             next_snapshot_time += dt_snapshot;
         }
     }

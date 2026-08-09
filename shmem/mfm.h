@@ -110,6 +110,26 @@ struct Sim {
 
     long long ticks_in_bin(int b) const { return 1LL << (MAX_BINS - b); }
     double    dt_of_bin(int b)    const { return dt_base / (double)(1LL << b); }
+    // The integer clock is the ONLY source of truth for time: a step whose length is not a whole
+    // number of ticks desynchronises the hierarchy permanently, because every particle's sync
+    // points are defined by clock alignment. Once nothing is aligned the active set is empty on
+    // every sync, and an empty active set is silent -- no kicks are applied, and the drift pass
+    // still moves everyone, so the whole system sails on ballistically with gravity switched off.
+    // (That is exactly how plummer/tidal lost its last snapshot interval: one 5e-15 residual step
+    // at a snapshot boundary rounded to 0 ticks, was clamped up to 1, and desynchronised the run.)
+    static constexpr long long TICKS_PER_BASE = 1LL << MAX_BINS;
+    double    time_now()          const { return dt_base * (double)clock_ticks / (double)TICKS_PER_BASE; }
+    double    time_of_ticks(long long k) const { return dt_base * (double)k / (double)TICKS_PER_BASE; }
+    long long ticks_of_time(double t) const {
+        return (long long)std::llround(t / dt_base * (double)TICKS_PER_BASE);
+    }
+    // Largest whole number of ticks not exceeding dt. Returns 0 when dt is below one tick, which
+    // the caller must treat as "no step to take" rather than rounding up to 1.
+    long long ticks_floor(double dt) const {
+        const double k = std::floor(dt / dt_base * (double)TICKS_PER_BASE);
+        if (!(k > 0)) return 0;                                   // also catches NaN
+        return (k >= (double)TICKS_PER_BASE * 4.0) ? TICKS_PER_BASE * 4 : (long long)k;
+    }
     bool      is_active(size_t i) const {
         return !individual_timesteps || (clock_ticks % ticks_in_bin(bin[i])) == 0;
     }
