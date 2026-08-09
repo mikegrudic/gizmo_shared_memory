@@ -1036,7 +1036,10 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
             if (rho * sim.nh_per_code_density > 1e13) v_fast = std::min(v_fast, 0.2);
         }
         const double k_cs = M_PI * v_fast / std::max(particle_size, 1e-300);
-        dv2abs -= divv * divv / 3.0;
+        // Only INFLOW is excused from counting against the virial criterion (sfr_eff.cc:254
+        // guards on divv < 0): near free-fall the inflow speed itself must not bias the cell
+        // against recognizing its own collapse, but outflow is genuine support.
+        if (divv < 0) dv2abs -= divv * divv / 3.0;
         dv2abs += 2.0 * k_cs * k_cs;
         double alpha_vir = dv2abs / (8.0 * M_PI * sim.G * rho);
         {
