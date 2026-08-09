@@ -1,4 +1,5 @@
 #include "hydro.h"
+#include <omp.h>
 
 namespace shmem {
 
@@ -29,11 +30,20 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
 
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb,
-                      const std::vector<double>& h_start, double box, int n_dims) {
+                      const std::vector<double>& h_start, double box, int n_dims,
+                      NeighborCache* cache) {
     const size_t n_targets = targets.size();
     DensityResult result;
     result.h.assign(n_targets, 0.0);    result.rho.assign(n_targets, 0.0);
     result.nngb.assign(n_targets, 0);   result.iters.assign(n_targets, 0);
+
+    // Shared-neighbour-search bookkeeping: each thread appends the converged lists of the targets
+    // it handled to a private buffer and notes where each landed; a prefix sum then places them.
+    // Counting first and re-traversing to fill would put back the traversal this exists to remove.
+    const int cache_threads = cache ? omp_get_max_threads() : 0;
+    std::vector<std::vector<uint32_t>> local_flat(cache_threads);
+    std::vector<std::vector<std::pair<size_t, size_t>>> local_index(cache_threads);
+    if (cache) { cache->clear(); cache->start.assign(n_targets + 1, 0); }
 
     // default guess: des_ngb particles at the global mean density
     double h_default = 0.0;
@@ -57,6 +67,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
     #pragma omp parallel
     {
         std::vector<uint32_t> neighbours;    // per-thread scratch, reused across targets
+        const int tid = cache ? omp_get_thread_num() : 0;
         #pragma omp for schedule(dynamic, 16)
         for (size_t t = 0; t < n_targets; ++t) {
             const Vec3d pos_target = particles.pos(targets[t]);
@@ -114,9 +125,32 @@ DensityResult density(const Tree& tree, const Particles& particles,
                     rho += particles.m[j] * kernel_w(r, h, n_dims);
                 }
             }
+            if (cache) {
+                local_index[tid].emplace_back(t, local_flat[tid].size());
+                local_flat[tid].insert(local_flat[tid].end(), neighbours.begin(), neighbours.end());
+                cache->start[t + 1] = neighbours.size();
+            }
             result.h[t] = h; result.rho[t] = rho;
             result.nngb[t] = n_inside; result.iters[t] = iter;
         }
+    }
+
+    if (cache) {
+        for (size_t t = 0; t < n_targets; ++t) cache->start[t + 1] += cache->start[t];
+        cache->flat.resize(cache->start.back());
+        #pragma omp parallel for schedule(static)
+        for (int th = 0; th < cache_threads; ++th) {
+            const std::vector<uint32_t>& my_flat = local_flat[th];
+            const std::vector<std::pair<size_t, size_t>>& my_index = local_index[th];
+            for (size_t e = 0; e < my_index.size(); ++e) {
+                const size_t t = my_index[e].first, lo = my_index[e].second;
+                const size_t hi = (e + 1 < my_index.size()) ? my_index[e + 1].second
+                                                            : my_flat.size();
+                std::copy(my_flat.begin() + lo, my_flat.begin() + hi,
+                          cache->flat.begin() + cache->start[t]);
+            }
+        }
+        cache->valid = true;
     }
     return result;
 }

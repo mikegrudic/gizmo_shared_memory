@@ -15,9 +15,9 @@ namespace shmem {
 static inline void get_neighbours(const Sim& sim, const Tree& tree, size_t k, const Vec3d& pos_i,
                                   double radius, std::vector<uint32_t>& neighbours) {
 #ifdef SHMEM_CACHE_NEIGHBORS
-    if (sim.ngb_cache_valid && k + 1 < sim.ngb_start.size()) {
-        const size_t lo = sim.ngb_start[k], hi = sim.ngb_start[k + 1];
-        neighbours.assign(sim.ngb_flat.begin() + lo, sim.ngb_flat.begin() + hi);
+    if (sim.ngb_cache.valid && k + 1 < sim.ngb_cache.start.size()) {
+        const size_t lo = sim.ngb_cache.start[k], hi = sim.ngb_cache.start[k + 1];
+        neighbours.assign(sim.ngb_cache.flat.begin() + lo, sim.ngb_cache.flat.begin() + hi);
         return;
     }
 #else
@@ -157,9 +157,35 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     for (size_t k = 0; k < active.size(); ++k) h_guess[k] = have_guess ? sim.h[active[k]] : 0.0;
     if (!have_guess || h_guess.empty() || h_guess[0] <= 0) h_guess.clear();
 
+#ifdef SHMEM_CACHE_NEIGHBORS
+    NeighborCache* const ngb_cache = &sim.ngb_cache;
+#else
+    NeighborCache* const ngb_cache = nullptr;
+#endif
     const DensityResult solved =
-        density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim);
+        density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim, ngb_cache);
     for (size_t k = 0; k < active.size(); ++k) sim.h[active[k]] = solved.h[k];
+
+    // SHMEM_NGB_DIAG: how many tree traversals the h solve costs per target. Each Newton
+    // iteration is a full traversal, so this is the multiplier on the density phase and it
+    // decides whether grouping the solve is worth more than grouping the single-pass consumers.
+    if (getenv("SHMEM_NGB_DIAG") && !active.empty()) {
+        long long sum = 0; int worst = 0;
+        std::vector<int> hist(8, 0);
+        for (size_t k = 0; k < active.size(); ++k) {
+            const int it = solved.iters[k];
+            sum += it; worst = std::max(worst, it);
+            hist[std::min(it, 7)]++;
+        }
+        static int shown = 0;
+        if (shown < 6) {
+            ++shown;
+            fprintf(stderr, "[ngb-diag] nact=%zu  mean iters=%.2f  max=%d  hist(0..7+)=",
+                    active.size(), (double)sum / active.size(), worst);
+            for (int c = 0; c < 8; ++c) fprintf(stderr, " %d", hist[c]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     // Adaptive-softening correction coefficients (GIZMO's AGS_zeta, gravity/ags_rkern.cc), rebuilt
     // here because this loop already owns exactly the neighbour set they integrate over. Refreshed
@@ -168,42 +194,14 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     const bool want_zeta = sim.gravity_on && sim.adaptive_soft && sim.dim == 3;
     if (want_zeta && sim.P.zeta.size() != n_part) sim.P.zeta.assign(n_part, 0.0);
 
-    // This is the one traversal the later phases reuse, so the cache is filled here. Two passes
-    // because the flat layout needs each target's offset before any thread can write: pass one
-    // records the counts, then a serial prefix sum turns them into offsets, then pass two writes
-    // the lists. Cheaper than the alternative of per-thread buffers plus a merge, and it leaves
-    // the lists in active-list order so the later phases stream them.
-#ifdef SHMEM_CACHE_NEIGHBORS
-    sim.ngb_cache_valid = false;
-    sim.ngb_start.assign(active.size() + 1, 0);
-    const int cache_threads = omp_get_max_threads();
-    // Each thread appends its targets' lists to a private buffer while it walks, and records where
-    // each one landed. The alternative -- counting first and traversing again to fill -- would put
-    // back one of the two traversals this is here to remove. Cost is a transient second copy of
-    // the lists (peak ~2x the flat array) until the merge below frees the buffers.
-    std::vector<std::vector<uint32_t>> local_flat(cache_threads);
-    std::vector<std::vector<std::pair<size_t, size_t>>> local_index(cache_threads);
-#endif
-
     #pragma omp parallel
     {
         std::vector<uint32_t> neighbours;
-#ifdef SHMEM_CACHE_NEIGHBORS
-        const int tid = omp_get_thread_num();
-        std::vector<uint32_t>& my_flat = local_flat[tid];
-        std::vector<std::pair<size_t, size_t>>& my_index = local_index[tid];
-#endif
         #pragma omp for schedule(dynamic, 64)
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
             const Vec3d pos_i = sim.P.pos(i);
-            neighbours.clear();
-            ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
-#ifdef SHMEM_CACHE_NEIGHBORS
-            my_index.emplace_back(k, my_flat.size());
-            my_flat.insert(my_flat.end(), neighbours.begin(), neighbours.end());
-            sim.ngb_start[k + 1] = neighbours.size();
-#endif
+            get_neighbours(sim, tree, k, pos_i, sim.h[i], neighbours);
             double weight_sum = 0, dn_dh = 0, dphi_dh_sum = 0;
             for (uint32_t j : neighbours) {
                 if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
@@ -239,23 +237,6 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
         }
     }
 
-#ifdef SHMEM_CACHE_NEIGHBORS
-    // counts -> offsets, then each thread copies its buffer into place
-    for (size_t k = 0; k < active.size(); ++k) sim.ngb_start[k + 1] += sim.ngb_start[k];
-    sim.ngb_flat.resize(sim.ngb_start.back());
-    #pragma omp parallel for schedule(static)
-    for (int t = 0; t < cache_threads; ++t) {
-        const std::vector<uint32_t>& my_flat = local_flat[t];
-        const std::vector<std::pair<size_t, size_t>>& my_index = local_index[t];
-        for (size_t e = 0; e < my_index.size(); ++e) {
-            const size_t k = my_index[e].first, lo = my_index[e].second;
-            const size_t hi = (e + 1 < my_index.size()) ? my_index[e + 1].second : my_flat.size();
-            std::copy(my_flat.begin() + lo, my_flat.begin() + hi,
-                      sim.ngb_flat.begin() + sim.ngb_start[k]);
-        }
-    }
-    sim.ngb_cache_valid = true;
-#endif
 }
 
 static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
@@ -1149,6 +1130,21 @@ double mfm_step(Sim& sim, double dt_max) {
 
     if (profile) {
         const double t_drift = lap();
+        // Cumulative totals as well as the per-step lines: the per-step view is dominated by the
+        // opening all-active step, but a run's cost is dominated by the many cheap deep-bin steps
+        // after it, where the O(N) drift is most of the work. Only the totals answer "what would
+        // fixing this phase actually buy".
+        static double c_tree=0, c_dens=0, c_grad=0, c_grav=0, c_bins=0, c_flux=0, c_drift=0;
+        static long long c_steps = 0;
+        c_tree+=t_tree; c_dens+=t_dens; c_grad+=t_grad; c_grav+=t_grav;
+        c_bins+=t_bins; c_flux+=t_flux; c_drift+=t_drift; ++c_steps;
+        const double tot = c_tree+c_dens+c_grad+c_grav+c_bins+c_flux+c_drift;
+        if (getenv("SHMEM_PROFILE_TOTALS") && tot > 0 && (c_steps % 100) == 0) {
+            fprintf(stderr, "[prof-total] %lld steps  tree=%.1f dens=%.1f grad=%.1f grav=%.1f "
+                            "bins=%.1f flux=%.1f DRIFT=%.1f s  (drift %.1f%% of profiled time)\n",
+                    c_steps, c_tree*1e-3, c_dens*1e-3, c_grad*1e-3, c_grav*1e-3,
+                    c_bins*1e-3, c_flux*1e-3, c_drift*1e-3, 100.0*c_drift/tot);
+        }
         static int shown = 0;
         if (shown < 8) {
             ++shown;

@@ -75,10 +75,27 @@ struct DensityResult {
     std::vector<int>    iters;    // solver iterations (diagnostic)
 };
 
+// SHARED NEIGHBOUR SEARCH. The h solve's LAST iteration is a traversal at exactly the converged
+// h -- which is the same search every downstream consumer then wants to repeat. Handing that
+// iteration's neighbour list out here lets the whole step run on ONE traversal per target
+// instead of one per phase.
+//
+// Flat CSR: target t owns flat[start[t] .. start[t+1]). Indexed by POSITION IN THE TARGET LIST,
+// so with a small active fraction the arrays stay proportional to the work rather than the box.
+struct NeighborCache {
+    std::vector<uint32_t> flat;
+    std::vector<size_t>   start;   // size ntargets+1
+    bool valid = false;
+
+    void clear() { flat.clear(); start.clear(); valid = false; }
+};
+
 // Solve N_eff(h_i) = des_ngb for every target and return h and rho. `h_start` is the per-target
 // initial guess; pass an empty vector to derive one from the mean interparticle spacing.
+// When `cache` is non-null it is filled with each target's neighbour list at the CONVERGED h.
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb,
-                      const std::vector<double>& h_start, double box = 0.0, int n_dims = 3);
+                      const std::vector<double>& h_start, double box = 0.0, int n_dims = 3,
+                      NeighborCache* cache = nullptr);
 
 }  // namespace shmem
