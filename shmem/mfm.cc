@@ -850,10 +850,132 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.h); sw(sim.ninv); sw(sim.rho); sw(sim.press); sw(sim.omega); sw(sim.csnd);
     sw(sim.phi); sw(sim.a_grav); sw(sim.tidal); sw(sim.pending_half_kick);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
+    sw(sim.sink_radius); sw(sim.id);
     sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
     sw(sim.work.moments_inv); sw(sim.work.signal_speed); sw(sim.work.div_vel);
     for (auto& g : sim.work.gradient)  sw(g);
     for (auto& p : sim.work.predicted) sw(p);
+}
+
+// Shrink every per-particle array by one. The doomed particle must already sit in the LAST slot.
+static void pop_particle(Sim& sim) {
+    auto pop = [&](auto& v) { if (!v.empty()) v.pop_back(); };
+    pop(sim.P.x); pop(sim.P.y); pop(sim.P.z); pop(sim.P.m); pop(sim.P.soft); pop(sim.P.zeta);
+    pop(sim.P.type);
+    pop(sim.vx); pop(sim.vy); pop(sim.vz); pop(sim.u);
+    pop(sim.h); pop(sim.ninv); pop(sim.rho); pop(sim.press); pop(sim.omega); pop(sim.csnd);
+    pop(sim.phi); pop(sim.a_grav); pop(sim.tidal); pop(sim.pending_half_kick);
+    pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
+    pop(sim.sink_radius); pop(sim.id);
+    pop(sim.dmom_x); pop(sim.dmom_y); pop(sim.dmom_z); pop(sim.denergy);
+    pop(sim.work.moments_inv); pop(sim.work.signal_speed); pop(sim.work.div_vel);
+    for (auto& g : sim.work.gradient)  pop(g);
+    for (auto& q : sim.work.predicted) pop(q);
+}
+
+// Delete one GAS particle while keeping the gas-first layout contiguous. Two swaps: the doomed
+// cell goes to the end of the gas prefix, then to the very end of the array -- which slides the
+// LAST SINK down into the slot the gas just vacated, so gas stays [0, n_gas-1) and the sinks stay
+// contiguous immediately after it.
+static void remove_gas_particle(Sim& sim, size_t j) {
+    const size_t last_gas = sim.n_gas - 1, last = sim.size() - 1;
+    swap_particles(sim, j, last_gas);
+    if (last_gas != last) swap_particles(sim, last_gas, last);
+    pop_particle(sim);
+    sim.n_gas = last_gas;
+}
+
+// ---------------------------------------------------------------------------------------------
+// SINK ACCRETION -- gravitational capture, Bate-style fixed sink radius.
+// SINGLE_STAR_ACCRETION=12 (declarations/precompiler_logic.h:375) selects SINK_GRAVCAPTURE_GAS +
+// SINK_GRAVCAPTURE_FIXEDSINKRADIUS, so the criteria are sinks/sink_feed.cc:254-300 with
+// sinks/sink.cc:107 sink_check_boundedness:
+//   * inside the fixed sink radius                                    (sink.cc:144)
+//   * bound, counting the gas internal energy: (vrel^2+cs^2)/vesc^2 < 1
+//   * Bate (1995) angular momentum: L^2 < G (M+m) r_sink              (sink_feed.cc:267-269)
+//   * resolution: the cell must be smaller than the sink              (sink.cc:127)
+// vesc carries the enclosed gas as an isothermal-sphere interior (sink.cc:97), which is what makes
+// this a Shu-type capture rather than a two-body one.
+//
+// Serial: accretion events are few per step, they mutate the particle arrays, and running them in
+// index order makes the outcome independent of thread scheduling.
+static void sink_accretion_pass(Sim& sim) {
+    if (!sim.sink_formation || sim.n_gas >= sim.size()) return;
+    static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
+
+    // TWO PHASES, and the split is not stylistic. Deleting a gas cell slides the last sink into
+    // the slot it vacated, so any sink index held across a deletion is stale -- the first version
+    // of this kept eating with a stale index and corrupted the sink's mass. So: scan and decide
+    // first, touching nothing, then apply every deletion afterwards.
+    std::vector<uint32_t> doomed;              // gas indices to remove, ascending
+    std::vector<char> claimed(sim.n_gas, 0);   // a cell may only be swallowed once
+    std::vector<uint32_t> ngb;
+
+    for (size_t sph = sim.n_gas; sph < sim.size(); ++sph) {
+        drift_particle_to(sim, sph, sim.clock_ticks);
+        const double r_sink = sim.sink_radius.empty() ? 0.0 : sim.sink_radius[sph];
+        if (!(r_sink > 0)) continue;
+        const Vec3d pos_s = sim.P.pos(sph);
+        ngb.clear();
+        ngb_search(sim.tree, sim.P, pos_s, r_sink, ngb, sim.box, sim.lazy());
+        for (uint32_t j : ngb) {
+            if (j >= sim.n_gas || claimed[j]) continue;          // gas only, once only
+            const Vec3d dx = min_image(sim.P.pos(j) - pos_s, sim.box);
+            const double r = dx.norm();
+            if (!(r > 0) || r > r_sink) continue;                // inside the fixed sink radius
+            // the cell must be smaller than the sink it falls into (sink.cc:127)
+            if (std::pow(sim.ninv[j], 1.0/sim.dim) > r_sink * 1.396263) continue;
+
+            const Vec3d dv{sim.vx[j] - sim.vx[sph], sim.vy[j] - sim.vy[sph],
+                           sim.vz[j] - sim.vz[sph]};
+            const double vrel_sq = dv.norm_sq();
+            // internal energy enters as an effective speed; gamma ~ 1 is the isothermal hack,
+            // where GIZMO uses 3P/rho rather than 2u (sink.cc:116)
+            const double cs_sq = (std::abs(sim.gamma - 1.0) < 0.1)
+                               ? 3.0 * sim.press[j] / sim.rho[j] : 2.0 * sim.u[j];
+            // enclosed mass: the two bodies plus an isothermal-sphere gas interior (sink.cc:97)
+            const double m_eff = sim.P.m[sph] + sim.P.m[j] + 4.0*M_PI * r*r*r * sim.rho[j];
+            const double vesc_sq = 2.0 * sim.G * m_eff / r;
+            if (!(vesc_sq > 0)) continue;
+            if ((vrel_sq + cs_sq) / vesc_sq >= 1.0) continue;                    // unbound
+            // Bate (1995): angular momentum small enough to actually reach the sink
+            const double rv = dot(dx, dv);
+            const double spec_mom_sq = r*r*vrel_sq - rv*rv;
+            if (spec_mom_sq >= sim.G * (sim.P.m[sph] + sim.P.m[j]) * r_sink) continue;
+
+            // SWALLOW. Mass and momentum conserved exactly; the sink keeps its position (GIZMO
+            // does not recentre single-star sinks) and absorbs the pair's momentum. Safe to apply
+            // now -- this mutates only the SINK, and no index moves until the removal phase.
+            const double m_new = sim.P.m[sph] + sim.P.m[j];
+            sim.vx[sph] = (sim.P.m[sph]*sim.vx[sph] + sim.P.m[j]*sim.vx[j]) / m_new;
+            sim.vy[sph] = (sim.P.m[sph]*sim.vy[sph] + sim.P.m[j]*sim.vy[j]) / m_new;
+            sim.vz[sph] = (sim.P.m[sph]*sim.vz[sph] + sim.P.m[j]*sim.vz[j]) / m_new;
+            sim.P.m[sph] = m_new;
+            claimed[j] = 1; doomed.push_back(j); ++sim.cells_accreted;
+            if (diag)
+                fprintf(stderr, "[sink-eat] sink=%zu ate cell=%u r/r_sink=%.3g vrel/vesc=%.3g "
+                        "M=%.6g\n", sph, j, r/r_sink,
+                        std::sqrt((vrel_sq+cs_sq)/vesc_sq), m_new);
+        }
+    }
+    if (doomed.empty()) return;
+    // Accretion is the one operation that moves mass BETWEEN particle types, so it is the one
+    // that can silently break the books. Check the total against t=0 every time it fires.
+    // DESCENDING: removing index j swaps in the particle at n_gas-1, which is always >= j, so a
+    // still-pending (smaller) index is never the one moved into place.
+    std::sort(doomed.begin(), doomed.end(), std::greater<uint32_t>());
+    for (uint32_t j : doomed) remove_gas_particle(sim, j);
+    // Every index the tree and the neighbour cache hold is now wrong.
+    sim.ngb_cache.clear(); sim.tree_valid = false;
+    if (sim.mass_initial > 0) {
+        double total = 0.0;
+        for (size_t i = 0; i < sim.size(); ++i) total += sim.P.m[i];
+        const double err = std::abs(total - sim.mass_initial) / sim.mass_initial;
+        if (err > 1e-12 || diag)
+            fprintf(stderr, "[sink-mass] total=%.15g initial=%.15g rel_err=%.3g  "
+                    "gas=%zu sinks=%zu accreted=%lld\n", total, sim.mass_initial, err,
+                    sim.n_gas, sim.size() - sim.n_gas, sim.cells_accreted);
+    }
 }
 
 // Test every active gas cell and convert those that pass. Serial: formation is rare (shu1977
@@ -1003,6 +1125,20 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         sim.P.type[last_gas] = 5;
         sim.u[last_gas] = 0.0;
         sim.P.soft[last_gas] = sim.soft_fixed[5] > 0 ? sim.soft_fixed[5] : sim.h[last_gas];
+        // Bate-style FIXED accretion radius, set once, here (galaxy_sf/sfr_eff.cc:602-608): the
+        // volume-equivalent radius at the density where the cell length equals half a Jeans
+        // length, floored at the progenitor's kernel radius. cs is the 0.2 km/s isothermal value,
+        // raised as n^(1/5) once the gas is opacity-limited.
+        if (sim.sink_radius.size() != sim.size()) sim.sink_radius.resize(sim.size(), 0.0);
+        double cs_sink = 0.2 / std::max(sim.vel_to_kms, 1e-300);
+        if (sim.nh_per_code_density > 0) {
+            const double nH = sim.rho[last_gas] * sim.nh_per_code_density;
+            if (nH > 1e10) cs_sink *= std::pow(nH / 1e10, 0.2);
+        }
+        sim.sink_radius[last_gas] = std::max(0.79 * sim.P.m[last_gas] * sim.G / (cs_sink*cs_sink),
+                                             sim.h[last_gas]);
+        printf("shmem-GIZMO: sink radius = %.6g (h was %.6g)\n",
+               sim.sink_radius[last_gas], sim.h[last_gas]);
         ++sim.sinks_formed;
         printf("shmem-GIZMO: sink formed from cell %zu (m=%.6g, rho=%.6g); %lld total\n",
                last_gas, sim.P.m[last_gas], sim.rho[last_gas], sim.sinks_formed);
@@ -1017,6 +1153,8 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
     sim.last_drift.assign(n_part, sim.clock_ticks);
+    sim.mass_initial = 0.0;
+    for (size_t i = 0; i < n_part; ++i) sim.mass_initial += sim.P.m[i];
     const size_t n_gas = std::min(sim.n_gas, n_part);
     std::vector<uint32_t> gas_list(n_gas);
     for (size_t i = 0; i < n_gas; ++i) gas_list[i] = (uint32_t)i;
@@ -1481,6 +1619,7 @@ double mfm_step(Sim& sim, double dt_max) {
     // Sink formation, once the cells' own updates for this step are complete. Serial and after
     // the flux pass because it reorders the particle arrays.
     sink_formation_pass(sim, active_gas, dt_of);
+    sink_accretion_pass(sim);
 
     // Pass 2: drift EVERY particle over the system interval dt. A long-binned particle is drifted
     // in several sub-steps rather than one long one; its velocity is constant between its own

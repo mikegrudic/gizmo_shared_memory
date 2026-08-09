@@ -135,6 +135,7 @@ struct Sim {
     // galaxy_sf/sfr_eff.cc -- see project-shmem-sink-plan for the bit-by-bit mapping.
     bool   sink_formation = false;     // SINGLE_STAR_SINK_FORMATION present in the config
     double mass_to_solar = 1.0;        // code mass -> Msun (UnitMass_in_g / 1.989e33)
+    double vel_to_kms = 1.0;           // code velocity -> km/s (UnitVelocity_in_cm_per_s / 1e5)
     double crit_phys_density = 0.0;    // PhysDensThresh, code units (CritPhysDensity / n_H per rho)
     double max_sfr_timescale = 0.0;    // MaxSfrTimescale, code units
     // Rolling time average of 1/(1+alpha_vir), for the &2048 time-averaged virial criterion. A
@@ -142,6 +143,15 @@ struct Sim {
     // actually thresholds on.
     std::vector<double> alpha_vir_smoothed;
     long long sinks_formed = 0;        // diagnostic
+    long long cells_accreted = 0;      // diagnostic
+    double mass_initial = 0.0;         // total mass at t=0, for the accretion bookkeeping check
+    // Bate-style FIXED accretion radius, set once when the sink forms and carried per particle
+    // (SINK_GRAVCAPTURE_FIXEDSINKRADIUS; galaxy_sf/sfr_eff.cc:602-608). Zero for gas.
+    std::vector<double> sink_radius;
+    // Particle IDs live HERE rather than beside the driver: sink formation swaps particles and
+    // accretion deletes them, so anything parallel to the particle arrays has to be permuted with
+    // them or the snapshot silently mislabels every particle after the first event.
+    std::vector<long long> id;
 
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;

@@ -409,6 +409,7 @@ int main(int argc, char** argv) {
         sim.eos_adiabat = eos_adiabat;
     }
     sim.mass_to_solar = unit_mass_cgs / 1.989e33;
+    sim.vel_to_kms = unit_vel_cgs / 1.0e5;
     sim.sink_formation = sink_formation;
     if (sink_formation) {
         // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
@@ -467,7 +468,7 @@ int main(int argc, char** argv) {
         H5Aread(attr, H5T_NATIVE_DOUBLE, ic_mass_table);
         H5Aclose(attr); H5Gclose(header);
     }
-    std::vector<long long> particle_ids;
+    std::vector<long long>& particle_ids = sim.id;
     std::vector<uint8_t> loaded_types;
     auto append = [](std::vector<double>& dst, const std::vector<double>& src) {
         dst.insert(dst.end(), src.begin(), src.end());
