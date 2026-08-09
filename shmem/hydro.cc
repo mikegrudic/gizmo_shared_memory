@@ -68,6 +68,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
                 ngb_search(tree, particles, pos_target, h, neighbours, box);
                 double weight_sum = 0.0, dweight_dh = 0.0;
                 for (uint32_t j : neighbours) {
+                    if (!particles.is_gas(j)) continue;   // gas h counts GAS neighbours only
                     const double r = min_image(particles.pos(j) - pos_target, box).norm();
                     weight_sum += kernel_w(r, h, n_dims);
                     dweight_dh += kernel_dwdh(r, h, n_dims);
@@ -94,6 +95,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
             ngb_search(tree, particles, pos_target, h, neighbours, box);
             double rho = 0.0; int n_inside = 0;
             for (uint32_t j : neighbours) {
+                if (!particles.is_gas(j)) continue;       // gas density counts GAS neighbours only
                 const double r = min_image(particles.pos(j) - pos_target, box).norm();
                 if (r < h) ++n_inside;
                 rho += particles.m[j] * kernel_w(r, h, n_dims);

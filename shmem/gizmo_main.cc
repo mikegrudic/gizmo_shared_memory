@@ -46,7 +46,7 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
-                         bool& output_potential, bool& tidal_criterion) {
+                         bool& output_potential, bool& tidal_criterion, bool& box_periodic) {
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -54,6 +54,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
     adaptive_soft = false;
     output_potential = false;
     tidal_criterion = false;
+    box_periodic = false;
     // GIZMO_CONFIG (set by the pytest harness's GIZMO_PREBUILT path) names the staged config --
     // base + per-variant extra flags -- explicitly. The cwd/root fallbacks serve standalone runs;
     // under pytest the cwd copy is the pristine base WITHOUT the variant flags, which is exactly
@@ -86,6 +87,9 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             if (flag("ADAPTIVE_GRAVSOFT_FORGAS")) adaptive_soft = true;
             if (flag("OUTPUT_POTENTIAL"))         output_potential = true;
             if (flag("TIDAL_TIMESTEP_CRITERION")) tidal_criterion = true;
+            // Periodicity is a COMPILE flag in GIZMO, not a params entry: a params file may carry
+            // BoxSize > 0 (plummer: 300, shu1977: 4.34) for a run that is nevertheless open.
+            if (flag("BOX_PERIODIC"))             box_periodic = true;
             int dims_from_config;
             if (flag("BOX_SPATIAL_DIMENSION") &&
                 sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
@@ -97,17 +101,17 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                 else if (sscanf(line, "EOS_GAMMA=(%lf)", &numerator) == 1) gamma = numerator;
                 else if (sscanf(line, "EOS_GAMMA=%lf", &numerator) == 1) gamma = numerator;
             }
+            // Flags this engine has no implementation for. Reported rather than ignored in
+            // silence: a suite variant exists precisely to exercise the feature its flag names,
+            // so running it as if the flag were absent makes the variant a duplicate of baseline
+            // that PASSES -- which is how plummer/tidal and evrard/tidal_adaptive went green
+            // without ever enabling the criterion they are named after.
             // ...except the ones this engine satisfies unconditionally, which would otherwise
             // make the warning pure noise: MFM is what the engine IS, output is always double,
             // and DEVELOPER_MODE only exposes extra params (already read by name).
             for (const char* benign : {"HYDRO_MESHLESS_FINITE_MASS", "OUTPUT_IN_DOUBLEPRECISION",
                                        "DEVELOPER_MODE"})
                 flag(benign);
-            // Flags this engine has no implementation for. Reported rather than ignored in
-            // silence: a suite variant exists precisely to exercise the feature its flag names,
-            // so running it as if the flag were absent makes the variant a duplicate of baseline
-            // that PASSES -- which is how plummer/tidal and evrard/tidal_adaptive went green
-            // without ever enabling the criterion they are named after.
             if (!known) {
                 std::string name(line);
                 const size_t comment = name.find('#');       // "FLAG   # why" -- keep just FLAG
@@ -169,15 +173,24 @@ static void write_attr_per_type(hid_t where, const char* name, hid_t type, const
 }
 
 static void write_snapshot(const Sim& sim, const std::vector<long long>& particle_ids,
-                           const std::string& outdir, int snapshot_num, double time) {
+                           const std::string& outdir, int snapshot_num, double time,
+                           double header_box) {
     char filename[512];
     snprintf(filename, sizeof filename, "%s/snapshot_%03d.hdf5", outdir.c_str(), snapshot_num);
     hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     const size_t n_part = sim.size();
 
+    // Types were loaded in ascending order, so each type is one contiguous run of indices.
+    unsigned int count_per_type[6] = {0,0,0,0,0,0};
+    if (sim.P.type.empty()) count_per_type[0] = (unsigned)n_part;
+    else for (size_t i = 0; i < n_part; ++i) count_per_type[sim.P.type[i]]++;
+    size_t type_start[6];
+    for (int t = 0, at = 0; t < 6; ++t) { type_start[t] = at; at += count_per_type[t]; }
+
     hid_t header = H5Gcreate2(file, "Header", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    unsigned int count_per_type[6] = {(unsigned)n_part,0,0,0,0,0}, zeros[6] = {0,0,0,0,0,0};
-    int count_per_type_int[6] = {(int)n_part,0,0,0,0,0};
+    unsigned int zeros[6] = {0,0,0,0,0,0};
+    int count_per_type_int[6];
+    for (int t = 0; t < 6; ++t) count_per_type_int[t] = (int)count_per_type[t];
     double mass_table[6] = {0,0,0,0,0,0};       // 0 => per-particle masses live in the dataset
     write_attr_per_type(header, "NumPart_ThisFile", H5T_NATIVE_INT, count_per_type_int);
     write_attr_per_type(header, "NumPart_Total", H5T_NATIVE_UINT, count_per_type);
@@ -185,7 +198,7 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
     write_attr_per_type(header, "MassTable", H5T_NATIVE_DOUBLE, mass_table);
     write_attr(header, "Time", time);
     write_attr(header, "Redshift", 0.0);
-    write_attr(header, "BoxSize", sim.box);
+    write_attr(header, "BoxSize", header_box);
     write_attr(header, "NumFilesPerSnapshot", 1);
     write_attr(header, "Flag_Sfr", 0);      write_attr(header, "Flag_Cooling", 0);
     write_attr(header, "Flag_Feedback", 0); write_attr(header, "Flag_StellarAge", 0);
@@ -194,47 +207,60 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
     write_attr(header, "Omega0", 0.0);      write_attr(header, "OmegaLambda", 0.0);
     H5Gclose(header);
 
-    hid_t gas_group = H5Gcreate2(file, "PartType0", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    auto write_vector_field = [&](const char* name, const std::vector<double>& comp_x,
-                                  const std::vector<double>& comp_y,
-                                  const std::vector<double>& comp_z) {
-        hsize_t dims[2] = {n_part, 3};
-        hid_t space = H5Screate_simple(2, dims, nullptr);
-        hid_t dataset = H5Dcreate2(gas_group, name, H5T_NATIVE_DOUBLE, space,
-                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> interleaved(3*n_part);
-        for (size_t i = 0; i < n_part; ++i) {
-            interleaved[3*i] = comp_x[i];
-            interleaved[3*i+1] = comp_y[i];
-            interleaved[3*i+2] = comp_z[i];
+    for (int t = 0; t < 6; ++t) {
+        if (count_per_type[t] == 0) continue;
+        const size_t at = type_start[t], n_type = count_per_type[t];
+        char group_name[16];
+        snprintf(group_name, sizeof group_name, "PartType%d", t);
+        hid_t group = H5Gcreate2(file, group_name, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        auto write_vector_field = [&](const char* name, const std::vector<double>& comp_x,
+                                      const std::vector<double>& comp_y,
+                                      const std::vector<double>& comp_z) {
+            hsize_t dims[2] = {n_type, 3};
+            hid_t space = H5Screate_simple(2, dims, nullptr);
+            hid_t dataset = H5Dcreate2(group, name, H5T_NATIVE_DOUBLE, space,
+                                       H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            std::vector<double> interleaved(3*n_type);
+            for (size_t i = 0; i < n_type; ++i) {
+                interleaved[3*i] = comp_x[at + i];
+                interleaved[3*i+1] = comp_y[at + i];
+                interleaved[3*i+2] = comp_z[at + i];
+            }
+            H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     interleaved.data());
+            H5Dclose(dataset); H5Sclose(space);
+        };
+        auto write_scalar_field = [&](const char* name, const std::vector<double>& values) {
+            hsize_t dims = n_type;
+            hid_t space = H5Screate_simple(1, &dims, nullptr);
+            hid_t dataset = H5Dcreate2(group, name, H5T_NATIVE_DOUBLE, space,
+                                       H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     values.data() + at);
+            H5Dclose(dataset); H5Sclose(space);
+        };
+        write_vector_field("Coordinates", sim.P.x, sim.P.y, sim.P.z);
+        write_vector_field("Velocities", sim.vx, sim.vy, sim.vz);
+        write_scalar_field("Masses", sim.P.m);
+        if (t == 0) {
+            write_scalar_field("InternalEnergy", sim.u);
+            write_scalar_field("Density", sim.rho);
+            write_scalar_field("SmoothingLength", sim.h);
         }
-        H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, interleaved.data());
-        H5Dclose(dataset); H5Sclose(space);
-    };
-    auto write_scalar_field = [&](const char* name, const std::vector<double>& values) {
-        hsize_t dims = n_part;
-        hid_t space = H5Screate_simple(1, &dims, nullptr);
-        hid_t dataset = H5Dcreate2(gas_group, name, H5T_NATIVE_DOUBLE, space,
-                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
-        H5Dclose(dataset); H5Sclose(space);
-    };
-    write_vector_field("Coordinates", sim.P.x, sim.P.y, sim.P.z);
-    write_vector_field("Velocities", sim.vx, sim.vy, sim.vz);
-    write_scalar_field("Masses", sim.P.m);
-    write_scalar_field("InternalEnergy", sim.u);
-    write_scalar_field("Density", sim.rho);
-    write_scalar_field("SmoothingLength", sim.h);
-    if (sim.output_potential && sim.phi.size() == n_part) write_scalar_field("Potential", sim.phi);
-    {
-        hsize_t dims = n_part;
-        hid_t space = H5Screate_simple(1, &dims, nullptr);
-        hid_t dataset = H5Dcreate2(gas_group, "ParticleIDs", H5T_NATIVE_LLONG, space,
-                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(dataset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, particle_ids.data());
-        H5Dclose(dataset); H5Sclose(space);
+        if (sim.output_potential && sim.phi.size() == n_part)
+            write_scalar_field("Potential", sim.phi);
+        {
+            hsize_t dims = n_type;
+            hid_t space = H5Screate_simple(1, &dims, nullptr);
+            hid_t dataset = H5Dcreate2(group, "ParticleIDs", H5T_NATIVE_LLONG, space,
+                                       H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(dataset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     particle_ids.data() + at);
+            H5Dclose(dataset); H5Sclose(space);
+        }
+        H5Gclose(group);
     }
-    H5Gclose(gas_group); H5Fclose(file);
+    H5Fclose(file);
     printf("wrote %s (t=%.6g)\n", filename, time); fflush(stdout);
 }
 
@@ -289,28 +315,45 @@ int main(int argc, char** argv) {
 
     int n_dims = 3; double gamma = 5.0/3.0;
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
-    bool tidal_criterion = false;
-    parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion);
+    bool tidal_criterion = false, box_periodic = false;
+    parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
+                 box_periodic);
     const double grav_const = params.count("GravityConstantInternal")
                             ? atof(params["GravityConstantInternal"].c_str()) : 1.0;
-    const double soft_gas = params.count("SofteningGas")
-                          ? atof(params["SofteningGas"].c_str()) : 0.0;
-    printf("shmem-GIZMO: %s  dim=%d gamma=%.6f box=%g TimeMax=%g DesNumNgb=%g CFL=%g\n",
-           icfile.c_str(), n_dims, gamma, box, time_max, des_ngb, courant);
-    printf("shmem-GIZMO: gravity=%s%s G=%g SofteningGas=%g\n",
+    // Softening params come in two GIZMO spellings; accept both. Values in the file are
+    // Plummer-equivalent; the engine stores the KERNEL EXTENT = 2.8x (GIZMO's ForceSoftening).
+    auto soft_param = [&](const char* name_a, const char* name_b) -> double {
+        if (params.count(name_a)) return atof(params[name_a].c_str());
+        if (params.count(name_b)) return atof(params[name_b].c_str());
+        return 0.0;
+    };
+    const double soft_plummer[6] = {
+        soft_param("Softening_Type0", "SofteningGas"),
+        soft_param("Softening_Type1", "SofteningHalo"),
+        soft_param("Softening_Type2", "SofteningDisk"),
+        soft_param("Softening_Type3", "SofteningBulge"),
+        soft_param("Softening_Type4", "SofteningStars"),
+        soft_param("Softening_Type5", "SofteningBndry")};
+    printf("shmem-GIZMO: %s  dim=%d gamma=%.6f box=%g%s TimeMax=%g DesNumNgb=%g CFL=%g\n",
+           icfile.c_str(), n_dims, gamma, box, box_periodic ? " (periodic)" : "",
+           time_max, des_ngb, courant);
+    printf("shmem-GIZMO: gravity=%s%s G=%g soft=(%g,%g)\n",
            gravity_on ? "on" : "off", (gravity_on && adaptive_soft) ? " (adaptive)" : "",
-           grav_const, soft_gas);
+           grav_const, soft_plummer[0], soft_plummer[1]);
     fflush(stdout);
 
     // load ICs
     hid_t ic_file = H5Fopen(icfile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     if (ic_file < 0) { fprintf(stderr, "cannot open %s\n", icfile.c_str()); return 1; }
-    hid_t gas_group = H5Gopen2(ic_file, "PartType0", H5P_DEFAULT);
     Sim sim;
-    sim.dim = n_dims; sim.gamma = gamma; sim.box = box;
+    sim.dim = n_dims; sim.gamma = gamma;
+    // Wrapping is keyed on the CONFIG flag, not on BoxSize: plummer/shu1977 carry a nonzero
+    // BoxSize through an open (non-periodic) run. The header still records the params value.
+    sim.box = box_periodic ? box : 0.0;
     sim.des_ngb = des_ngb; sim.cfl = courant;
     sim.gravity_on = gravity_on; sim.G = grav_const;
-    sim.soft_min = soft_gas; sim.adaptive_soft = adaptive_soft;
+    sim.soft_min = 2.8 * soft_plummer[0]; sim.adaptive_soft = adaptive_soft;
+    for (int t = 0; t < 6; ++t) sim.soft_fixed[t] = 2.8 * soft_plummer[t];
     sim.output_potential = output_potential;
     sim.tidal_criterion = tidal_criterion;
     if (params.count("ErrTolIntAccuracy")) sim.eta_grav = atof(params["ErrTolIntAccuracy"].c_str());
@@ -322,19 +365,54 @@ int main(int argc, char** argv) {
     set_time_base(sim, dt_snapshot, dt_max);
     printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
            sim.individual_timesteps ? "individual" : "global", sim.dt_base);
-    sim.P.x = h5_read(gas_group, "Coordinates", 0);
-    sim.P.y = h5_read(gas_group, "Coordinates", 1);
-    sim.P.z = h5_read(gas_group, "Coordinates", 2);
-    sim.P.m = h5_read(gas_group, "Masses", -1);
-    sim.vx  = h5_read(gas_group, "Velocities", 0);
-    sim.vy  = h5_read(gas_group, "Velocities", 1);
-    sim.vz  = h5_read(gas_group, "Velocities", 2);
-    sim.u   = h5_read(gas_group, "InternalEnergy", -1);
-    const std::vector<double> ids_as_double = h5_read(gas_group, "ParticleIDs", -1);
-    H5Gclose(gas_group); H5Fclose(ic_file);
+
+    // Every particle type present, in ascending type order -- which is what gives the engine its
+    // gas-first index layout (Sim::n_gas). Masses fall back to the header MassTable when a group
+    // carries no Masses dataset; InternalEnergy exists for gas only.
+    double ic_mass_table[6] = {0,0,0,0,0,0};
+    {
+        hid_t header = H5Gopen2(ic_file, "Header", H5P_DEFAULT);
+        hid_t attr = H5Aopen(header, "MassTable", H5P_DEFAULT);
+        H5Aread(attr, H5T_NATIVE_DOUBLE, ic_mass_table);
+        H5Aclose(attr); H5Gclose(header);
+    }
+    std::vector<long long> particle_ids;
+    std::vector<uint8_t> loaded_types;
+    auto append = [](std::vector<double>& dst, const std::vector<double>& src) {
+        dst.insert(dst.end(), src.begin(), src.end());
+    };
+    for (int t = 0; t < 6; ++t) {
+        char group_name[16];
+        snprintf(group_name, sizeof group_name, "PartType%d", t);
+        if (H5Lexists(ic_file, group_name, H5P_DEFAULT) <= 0) continue;
+        hid_t group = H5Gopen2(ic_file, group_name, H5P_DEFAULT);
+        const std::vector<double> xs = h5_read(group, "Coordinates", 0);
+        const size_t n_type = xs.size();
+        append(sim.P.x, xs);
+        append(sim.P.y, h5_read(group, "Coordinates", 1));
+        append(sim.P.z, h5_read(group, "Coordinates", 2));
+        if (H5Lexists(group, "Masses", H5P_DEFAULT) > 0) {
+            append(sim.P.m, h5_read(group, "Masses", -1));
+        } else {
+            sim.P.m.insert(sim.P.m.end(), n_type, ic_mass_table[t]);
+        }
+        append(sim.vx, h5_read(group, "Velocities", 0));
+        append(sim.vy, h5_read(group, "Velocities", 1));
+        append(sim.vz, h5_read(group, "Velocities", 2));
+        if (t == 0) append(sim.u, h5_read(group, "InternalEnergy", -1));
+        else        sim.u.insert(sim.u.end(), n_type, 0.0);
+        const std::vector<double> ids_as_double = h5_read(group, "ParticleIDs", -1);
+        for (double id : ids_as_double) particle_ids.push_back((long long)id);
+        loaded_types.insert(loaded_types.end(), n_type, (uint8_t)t);
+        if (t == 0) sim.n_gas = n_type;
+        H5Gclose(group);
+        printf("shmem-GIZMO: loaded %zu particles of type %d\n", n_type, t);
+    }
+    H5Fclose(ic_file);
+    if (sim.size() == 0) { fprintf(stderr, "no particles in %s\n", icfile.c_str()); return 1; }
+    if (sim.n_gas == (size_t)-1) sim.n_gas = 0;          // no PartType0 group at all
+    if (sim.n_gas < sim.size()) sim.P.type = loaded_types;  // empty type list means "all gas"
     sim.P.soft.assign(sim.size(), 0.0);
-    std::vector<long long> particle_ids(sim.size());
-    for (size_t i = 0; i < sim.size(); ++i) particle_ids[i] = (long long)ids_as_double[i];
 
     (void)system(("mkdir -p " + outdir).c_str());
 
@@ -342,7 +420,7 @@ int main(int argc, char** argv) {
     // sum_j m_j W that the neighbour routine returns -- see compute_initial_state.
     compute_initial_state(sim);
     if (sim.output_potential) compute_potential(sim);
-    write_snapshot(sim, particle_ids, outdir, 0, 0.0);
+    write_snapshot(sim, particle_ids, outdir, 0, 0.0, box);
 
     // Time is tracked in the engine's INTEGER TICKS, not accumulated in floating point. Summing
     // dt every step leaves a residual at each snapshot boundary, and asking mfm_step to close a
@@ -390,13 +468,13 @@ int main(int argc, char** argv) {
                                   next_snapshot_time < time_max);
         if (at_snapshot) {
             if (sim.output_potential) compute_potential(sim);
-            write_snapshot(sim, particle_ids, outdir, snapshot_num++, time);
+            write_snapshot(sim, particle_ids, outdir, snapshot_num++, time, box);
             next_snapshot_ticks += snap_ticks;
             next_snapshot_time += dt_snapshot;
         }
     }
     if (sim.output_potential) compute_potential(sim);
-    write_snapshot(sim, particle_ids, outdir, snapshot_num, time);
+    write_snapshot(sim, particle_ids, outdir, snapshot_num, time, box);
     printf("done: t=%.6g in %d steps\n", time, n_steps);
     MPI_Finalize();
     return 0;

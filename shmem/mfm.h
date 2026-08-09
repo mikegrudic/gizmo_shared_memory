@@ -59,8 +59,23 @@ struct Sim {
     Particles P;                       // positions + masses + gravitational softening
     std::vector<double> vx, vy, vz;    // velocities
     std::vector<double> u;             // specific internal energy
+
+    // ---- particle types ----
+    // Gas-first layout: indices [0, n_gas) are gas (GIZMO type 0), everything after is
+    // collisionless. SIZE_MAX (the default) means "all gas", so engine-internal users that never
+    // set it keep the old behaviour unchanged. Hydro passes run over the gas prefix of the active
+    // list and hydro neighbour sums skip non-gas particles; gravity, kicks and drifts cover
+    // everyone.
+    size_t n_gas = (size_t)-1;
+    // Fixed softenings per GIZMO type, stored as the KERNEL EXTENT -- 2.8x the Plummer-equivalent
+    // value in the params file, the same convention as GIZMO's ForceSoftening table and the same
+    // length the spline kernels here take as h. Entry 0 is the constant-softening gas value; with
+    // adaptive_soft the gas ignores it (soft_min floors the kernel radius instead).
+    std::array<double, 6> soft_fixed{};
+    std::vector<uint32_t> active_gas;  // scratch: gas prefix of `active` when types are mixed
     double gamma = 5.0 / 3.0;
     int    dim   = 3;                  // 1/2/3; matches BOX_SPATIAL_DIMENSION in the suite configs
+
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;
     double cfl     = 0.25;
@@ -71,7 +86,8 @@ struct Sim {
     double theta      = 0.5;           // geometric opening angle (ErrTolTheta); bootstrap only
                                        // once the relative criterion below is active
     double err_tol_force_acc = 0.0;    // ErrTolForceAcc; 0 = geometric opening only
-    double soft_min   = 0.0;           // floor on the gas softening (SofteningGas)
+    double soft_min   = 0.0;           // floor on the gas softening, as a kernel extent
+                                       // (2.8 x Softening_Type0/SofteningGas)
     bool   adaptive_soft = true;       // ADAPTIVE_GRAVSOFT_FORGAS: soften on h, not a fixed length
     bool   output_potential = false;   // OUTPUT_POTENTIAL: write phi so energy/momentum checks work
     std::vector<double> phi;           // gravitational potential, filled only when writing output

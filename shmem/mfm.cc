@@ -158,6 +158,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
             ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
             double weight_sum = 0, dn_dh = 0, dphi_dh_sum = 0;
             for (uint32_t j : neighbours) {
+                if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double r = offset.norm();
                 weight_sum += kernel_w(r, sim.h[i], sim.dim);
@@ -213,6 +214,7 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
             const double csound_i = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
             double signal_speed = 2.0 * csound_i;   // floor: the i==j / no-neighbour case
             for (uint32_t j : neighbours) {
+                if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double separation = offset.norm();
                 const double weight = kernel_w(separation, sim.h[i], sim.dim);
@@ -242,6 +244,7 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
             PrimitiveState largest_rise{}, largest_drop{};
             double max_ngb_distance = 0.0;
             for (uint32_t j : neighbours) {
+                if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double weight = kernel_w(offset.norm(), sim.h[i], sim.dim);
                 max_ngb_distance = std::max(max_ngb_distance, offset.norm());
@@ -302,14 +305,25 @@ static void predict_half(Sim& sim, const std::vector<uint32_t>& active,
 // and hydrodynamic resolution the same everywhere, so a collapsing region does not end up with
 // pressure resolved on a scale the gravity has smoothed away (or the reverse). soft_min is the
 // floor from SofteningGas.
-static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
+// Softening is a property of every particle, active or not: the tree's mass distribution is
+// sourced by ALL of them, so this loop stays global even when the forces do not. Gas softens on
+// its own kernel radius under adaptive_soft (floored by soft_min) or sits at the fixed gas value;
+// collisionless types take their fixed kernel-extent softening from soft_fixed.
+static void update_softenings(Sim& sim) {
     const size_t n_part = sim.size();
     sim.P.soft.resize(n_part);
-    // Softening is a property of every particle, active or not: the tree's mass distribution is
-    // sourced by ALL of them, so this loop stays global even though the forces below do not.
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n_part; ++i)
-        sim.P.soft[i] = sim.adaptive_soft ? std::max(sim.h[i], sim.soft_min) : sim.soft_min;
+    for (size_t i = 0; i < n_part; ++i) {
+        if (i < sim.n_gas)
+            sim.P.soft[i] = sim.adaptive_soft ? std::max(sim.h[i], sim.soft_min) : sim.soft_min;
+        else
+            sim.P.soft[i] = sim.soft_fixed[sim.P.type.empty() ? 1 : sim.P.type[i]];
+    }
+}
+
+static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
+    const size_t n_part = sim.size();
+    update_softenings(sim);
 
     std::vector<double> ax, ay, az;
     // grouped walk: one traversal per batch of 8, measured 1.71x over the per-target walk.
@@ -372,6 +386,7 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
             ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
             for (uint32_t j : neighbours) {
                 if (j == i) continue;
+                if (j >= sim.n_gas) continue;   // fluxes are exchanged between gas pairs only
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double separation = offset.norm();
                 if (separation <= 0) continue;
@@ -548,12 +563,18 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
 
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
-    std::vector<uint32_t> all_particles(n_part);
-    for (size_t i = 0; i < n_part; ++i) all_particles[i] = (uint32_t)i;
-    sim.tree = build(sim.P);
+    const size_t n_gas = std::min(sim.n_gas, n_part);
+    std::vector<uint32_t> gas_list(n_gas);
+    for (size_t i = 0; i < n_gas; ++i) gas_list[i] = (uint32_t)i;
+    sim.tree = build(sim.P);                 // provisional: neighbour search for the h solve
     sim.tree_valid = true;
     sim.drift_since_build = 0.0;
-    solve_h_and_volumes(sim, sim.tree, all_particles);
+    solve_h_and_volumes(sim, sim.tree, gas_list);
+    update_softenings(sim);
+    // Rebuild so the node max-softenings (which gate the softening force-open in the walk) see
+    // the real per-particle softenings rather than the zeros the driver loaded with -- the t=0
+    // potential is computed from this tree.
+    sim.tree = build(sim.P);
 }
 
 void compute_potential(Sim& sim) {
@@ -665,8 +686,12 @@ static double desired_dt(const Sim& sim, size_t i) {
     // where L_particle is the EFFECTIVE CELL SIZE (4pi/3)^(1/3) h / Neff^(1/3) -- which is
     // algebraically just V_i^(1/dim), and V_i = ninv is already solved. Using the full kernel
     // radius h instead is ~5% off in 3D at Neff~40 but 25%+ too permissive in 2D.
-    double dt = 2.0 * sim.cfl * std::pow(sim.ninv[i], 1.0 / sim.dim)
-                / (sim.work.signal_speed[i] + 1e-300);
+    // Gas only: a collisionless particle has no signal speed and is limited by the gravity
+    // criteria below (plus dt_base / MaxSizeTimestep, exactly as in GIZMO).
+    const bool gas = (i < sim.n_gas);
+    double dt = gas ? 2.0 * sim.cfl * std::pow(sim.ninv[i], 1.0 / sim.dim)
+                      / (sim.work.signal_speed[i] + 1e-300)
+                    : 1e300;
     if (sim.gravity_on) {
         const double accel_mag = sim.a_grav[i].norm();
         if (accel_mag > 0) {
@@ -681,8 +706,9 @@ static double desired_dt(const Sim& sim, size_t i) {
             const double tnorm = sim.G * sim.tidal[i].frobenius_norm();
             if (tnorm > 0) {
                 double dt_tidal = 0.5 * std::sqrt(sim.eta_grav / (tnorm / std::sqrt(6.0)));
-                dt_tidal = std::min(dt_tidal,
-                                    std::sqrt(sim.eta_grav / (sim.G * sim.rho[i] + 1e-300)));
+                if (gas)                     // gas additionally floors at its self-gravity time
+                    dt_tidal = std::min(dt_tidal,
+                                        std::sqrt(sim.eta_grav / (sim.G * sim.rho[i] + 1e-300)));
                 dt = std::min(dt, dt_tidal);
             }
         }
@@ -772,6 +798,17 @@ double mfm_step(Sim& sim, double dt_max) {
     }
     const std::vector<uint32_t>& active = sim.active;
 
+    // Hydro passes take only the GAS particles; with the gas-first layout that is the ascending
+    // prefix of the (sorted) active list. All-gas sims (n_gas = SIZE_MAX) skip the copy entirely.
+    const std::vector<uint32_t>* hydro_actives = &active;
+    if (sim.n_gas < n_part) {
+        sim.active_gas.assign(active.begin(),
+                              std::lower_bound(active.begin(), active.end(),
+                                               (uint32_t)sim.n_gas));
+        hydro_actives = &sim.active_gas;
+    }
+    const std::vector<uint32_t>& active_gas = *hydro_actives;
+
     const bool profile = getenv("SHMEM_PROFILE") != nullptr;
     auto mark = std::chrono::steady_clock::now();
     auto lap = [&]() {
@@ -792,6 +829,10 @@ double mfm_step(Sim& sim, double dt_max) {
         // the region actually doing work
         typical_h = sim.h[active.empty() ? 0 : active[0]];
     }
+    // collisionless particles have no kernel radius; their softening is the resolution scale the
+    // rebuild pad should track instead
+    if (typical_h <= 0.0 && !sim.P.soft.empty())
+        typical_h = sim.P.soft[active.empty() ? 0 : active[0]];
     const bool must_rebuild = !sim.tree_valid || sim.tree.nnodes() == 0 ||
                               typical_h <= 0.0 ||
                               sim.drift_since_build > sim.tree_rebuild_pad_frac * typical_h;
@@ -811,12 +852,12 @@ double mfm_step(Sim& sim, double dt_max) {
     // pass per sync -- and this loop runs the same three passes as the global scheme, so any extra
     // one shows up directly as the individual-timestep scheme being SLOWER than global on a
     // uniform problem where it should merely match it.
-    solve_h_and_volumes(sim, tree, active);
+    solve_h_and_volumes(sim, tree, active_gas);
     const double t_dens = profile ? lap() : 0.0;
 
     // Gradients first: they need no dt, and their neighbour loop is where the signal speed
     // comes from.
-    gradients(sim, tree, active);
+    gradients(sim, tree, active_gas);
     const double t_grad = profile ? lap() : 0.0;
 
     // Gravity at the CURRENT positions, one walk per step. Done before dt so the acceleration
@@ -934,11 +975,11 @@ double mfm_step(Sim& sim, double dt_max) {
 
     const double t_bins = profile ? lap() : 0.0;
 
-    predict_half(sim, active, dt_of);
+    predict_half(sim, active_gas, dt_of);
 
     std::vector<double>& dmom_x = sim.dmom_x;  std::vector<double>& dmom_y = sim.dmom_y;
     std::vector<double>& dmom_z = sim.dmom_z;  std::vector<double>& denergy = sim.denergy;
-    fluxes(sim, tree, active, dt_of, dmom_x, dmom_y, dmom_z, denergy);
+    fluxes(sim, tree, active_gas, dt_of, dmom_x, dmom_y, dmom_z, denergy);
     const double t_flux = profile ? lap() : 0.0;
 
     // Conserved update. This runs over ALL particles, not just the active ones: an inactive
@@ -949,8 +990,8 @@ double mfm_step(Sim& sim, double dt_max) {
     // its OWN accumulated rate over its OWN timestep, which is what makes the scheme independent
     // of any per-pair history.
     #pragma omp parallel for schedule(static)
-    for (size_t k = 0; k < active.size(); ++k) {
-        const uint32_t i = active[k];
+    for (size_t k = 0; k < active_gas.size(); ++k) {
+        const uint32_t i = active_gas[k];
         const double dt_i = dt_of[i];
         const double mass = sim.P.m[i];
         const Vec3d vel_old{sim.vx[i], sim.vy[i], sim.vz[i]};
