@@ -325,6 +325,23 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     const size_t n_part = sim.size();
     update_softenings(sim);
 
+    // BATCH SPATIAL COHERENCE. accel_grouped walks once per batch of 8 targets and opens the
+    // UNION of what the batch needs, so a batch only pays off when its 8 targets are spatially
+    // close. The active list is INDEX-ordered, which is spatially coherent only when the IC
+    // happened to be written in a space-filling order -- lattices are, but plummer's IC is
+    // radius-sorted, so consecutive indices are 8 same-shell targets scattered across the whole
+    // sphere and the union walk opened most of the tree per batch: measured 5x slower per target
+    // than pytreegrav's reference walk at the same theta on the same machine. Re-emitting the
+    // actives in the tree's own Morton order makes every batch compact for ANY IC ordering, at
+    // one O(N) pass -- the same cost class as the active-set scan that runs every sync anyway.
+    std::vector<uint32_t>& targets = sim.grav_targets;
+    targets.clear();
+    targets.reserve(active.size());
+    for (size_t r = 0; r < n_part; ++r) {
+        const uint32_t i = tree.orderbuf[r];
+        if (sim.is_active(i)) targets.push_back(i);
+    }
+
     std::vector<double> ax, ay, az;
     // grouped walk: one traversal per batch of 8, measured 1.71x over the per-target walk.
     // The tidal tensor rides along in the same walk when the tidal timestep criterion wants it.
@@ -337,23 +354,23 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     std::vector<double> aold_active;
     const double* aold_ptr = nullptr;
     if (sim.err_tol_force_acc > 0 && sim.a_grav.size() == n_part) {
-        aold_active.resize(active.size());
+        aold_active.resize(targets.size());
         #pragma omp parallel for schedule(static)
-        for (size_t k = 0; k < active.size(); ++k)
-            aold_active[k] = sim.err_tol_force_acc * sim.a_grav[active[k]].norm() / sim.G;
+        for (size_t k = 0; k < targets.size(); ++k)
+            aold_active[k] = sim.err_tol_force_acc * sim.a_grav[targets[k]].norm() / sim.G;
         aold_ptr = aold_active.data();
     }
-    accel_grouped(tree, sim.P, active, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr);
+    accel_grouped(tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr);
     if (sim.tidal_criterion) {
         sim.tidal.resize(n_part);
         #pragma omp parallel for schedule(static)
-        for (size_t k = 0; k < active.size(); ++k) sim.tidal[active[k]] = tidal_active[k];
+        for (size_t k = 0; k < targets.size(); ++k) sim.tidal[targets[k]] = tidal_active[k];
     }
 
     sim.a_grav.resize(n_part);
     #pragma omp parallel for schedule(static)
-    for (size_t k = 0; k < active.size(); ++k)
-        sim.a_grav[active[k]] = Vec3d{ax[k], ay[k], az[k]};
+    for (size_t k = 0; k < targets.size(); ++k)
+        sim.a_grav[targets[k]] = Vec3d{ax[k], ay[k], az[k]};
 }
 
 // Flux exchange over unique pairs. Pair discovery from the SMALLER kernel side would miss

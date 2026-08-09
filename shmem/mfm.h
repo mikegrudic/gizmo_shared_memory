@@ -73,6 +73,8 @@ struct Sim {
     // adaptive_soft the gas ignores it (soft_min floors the kernel radius instead).
     std::array<double, 6> soft_fixed{};
     std::vector<uint32_t> active_gas;  // scratch: gas prefix of `active` when types are mixed
+    std::vector<uint32_t> grav_targets; // scratch: active list in tree Morton order (see
+                                        // compute_gravity -- batch walks need spatial coherence)
     double gamma = 5.0 / 3.0;
     int    dim   = 3;                  // 1/2/3; matches BOX_SPATIAL_DIMENSION in the suite configs
 
