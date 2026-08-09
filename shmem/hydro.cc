@@ -63,19 +63,30 @@ DensityResult density(const Tree& tree, const Particles& particles,
             double h = h_start.empty() ? h_default : h_start[t];
             double h_lo = 0.0, h_hi = 0.0;   // bisection bracket, grown as we learn
             int iter = 0;
+            // Density and neighbour count are accumulated INSIDE the solve rather than in a
+            // separate pass afterwards. On the iteration that converges, the neighbour set and
+            // every kernel weight already correspond to the accepted h, so a final traversal
+            // would recompute exactly what this loop just computed -- and a traversal per target
+            // per step is not free: with gravity off (sedov) these searches are the entire cost.
+            double rho = 0.0;
+            int n_inside = 0;
+            bool converged = false;
             for (; iter < 100; ++iter) {
                 neighbours.clear();
                 ngb_search(tree, particles, pos_target, h, neighbours, box);
                 double weight_sum = 0.0, dweight_dh = 0.0;
+                rho = 0.0; n_inside = 0;
                 for (uint32_t j : neighbours) {
                     if (!particles.is_gas(j)) continue;   // gas h counts GAS neighbours only
                     const double r = min_image(particles.pos(j) - pos_target, box).norm();
                     weight_sum += kernel_w(r, h, n_dims);
                     dweight_dh += kernel_dwdh(r, h, n_dims);
+                    rho += particles.m[j] * kernel_w(r, h, n_dims);
+                    if (r < h) ++n_inside;
                 }
                 const double n_eff = ball_vol(h, n_dims) * weight_sum;
                 const double residual = n_eff - des_ngb;
-                if (std::abs(residual) < 1e-4 * des_ngb) break;
+                if (std::abs(residual) < 1e-4 * des_ngb) { converged = true; break; }
                 if (residual > 0) h_hi = h; else h_lo = h;
 
                 // Newton on N_eff(h), guarded by the bracket. dN/dh is positive away from
@@ -90,15 +101,18 @@ DensityResult density(const Tree& tree, const Particles& particles,
                 }
                 h = h_next;
             }
-            // final density on the converged h
-            neighbours.clear();
-            ngb_search(tree, particles, pos_target, h, neighbours, box);
-            double rho = 0.0; int n_inside = 0;
-            for (uint32_t j : neighbours) {
-                if (!particles.is_gas(j)) continue;       // gas density counts GAS neighbours only
-                const double r = min_image(particles.pos(j) - pos_target, box).norm();
-                if (r < h) ++n_inside;
-                rho += particles.m[j] * kernel_w(r, h, n_dims);
+            // Only a solve that ran out of iterations needs a final pass: there h was updated
+            // after the last evaluation, so the accumulated rho belongs to the previous h.
+            if (!converged) {
+                neighbours.clear();
+                ngb_search(tree, particles, pos_target, h, neighbours, box);
+                rho = 0.0; n_inside = 0;
+                for (uint32_t j : neighbours) {
+                    if (!particles.is_gas(j)) continue;   // gas density counts GAS neighbours only
+                    const double r = min_image(particles.pos(j) - pos_target, box).norm();
+                    if (r < h) ++n_inside;
+                    rho += particles.m[j] * kernel_w(r, h, n_dims);
+                }
             }
             result.h[t] = h; result.rho[t] = rho;
             result.nngb[t] = n_inside; result.iters[t] = iter;
