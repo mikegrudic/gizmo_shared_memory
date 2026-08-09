@@ -1,6 +1,7 @@
 #include "mfm.h"
 #include <array>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -1186,6 +1187,10 @@ void set_time_base(Sim& sim, double interval, double max_step) {
     sim.clock_ticks = 0;
 }
 
+// Per-criterion timestep values, filled by desired_dt for diagnostics.
+struct DtParts { double cfl = 1e300, accel = 1e300, tidal = 1e300, selfgrav = 1e300; };
+static double desired_dt(const Sim& sim, size_t i, DtParts* parts = nullptr);
+
 void print_timebins(const Sim& sim, double systemstep, double time) {
     if (sim.bin.empty()) return;
     const int n_bins = Sim::MAX_BINS + 1;
@@ -1247,10 +1252,15 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
                 if (sim.bin[i] != deepest) continue;
                 ++shown;
                 const double cs = sound_speed(sim, i);
+                DtParts dp;
+                desired_dt(sim, i, &dp);
                 printf("      deep  i=%7zu h=%.4e rho=%.4e P=%.4e cs=%.3f vsig=%.3f "
                        "h/vsig=%.3e x=(%.3f,%.3f)\n", i, sim.h[i], sim.rho[i], sim.press[i], cs,
                        sim.work.signal_speed[i], sim.h[i]/(sim.work.signal_speed[i]+1e-300),
                        sim.P.x[i], sim.P.y[i]);
+                printf("            dt: cfl=%.3e accel=%.3e tidal=%.3e selfgrav=%.3e "
+                       "soft=%.3e |a|=%.3e\n", dp.cfl, dp.accel, dp.tidal, dp.selfgrav,
+                       sim.P.soft[i], sim.a_grav[i].norm());
             }
             shown = 0;
             for (size_t i = 0; i < sim.size() && shown < 2; ++i) {
@@ -1268,7 +1278,8 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
 }
 
 // Desired step for one particle, from the same criteria the global scheme uses.
-static double desired_dt(const Sim& sim, size_t i) {
+// `parts`, when non-null, receives the per-criterion values for diagnostics.
+static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
     // CFL exactly as GIZMO's (core/timestep.cc): CourantFac * L_particle / (0.5 * MaxSignalVel),
     // where L_particle is the EFFECTIVE CELL SIZE (4pi/3)^(1/3) h / Neff^(1/3) -- which is
     // algebraically just V_i^(1/dim), and V_i = ninv is already solved. Using the full kernel
@@ -1279,13 +1290,16 @@ static double desired_dt(const Sim& sim, size_t i) {
     double dt = gas ? 2.0 * sim.cfl * std::pow(sim.ninv[i], 1.0 / sim.dim)
                       / (sim.work.signal_speed[i] + 1e-300)
                     : 1e300;
+    if (parts) parts->cfl = dt;
     if (sim.gravity_on) {
         const double accel_mag = sim.a_grav[i].norm();
         if (accel_mag > 0) {
             // sqrt(2 eta (KERNEL_CORE_SIZE * eps) / |a|) with KERNEL_CORE_SIZE = 1/2 for the
             // cubic spline: GIZMO measures the softening scale by the kernel CORE, not the full
             // support radius. Omitting the 1/2 made this criterion sqrt(2) too permissive.
-            dt = std::min(dt, std::sqrt(sim.eta_grav * sim.P.soft[i] / accel_mag));
+            const double dt_accel = std::sqrt(sim.eta_grav * sim.P.soft[i] / accel_mag);
+            if (parts) parts->accel = dt_accel;
+            dt = std::min(dt, dt_accel);
         }
         if (sim.tidal_criterion && sim.tidal.size() == sim.size()) {
             // dt = 0.5 sqrt(eta / sqrt(||G T||_F^2 / 6)): recovers sqrt(eta) * t_dyn in a
@@ -1293,9 +1307,12 @@ static double desired_dt(const Sim& sim, size_t i) {
             const double tnorm = sim.G * sim.tidal[i].frobenius_norm();
             if (tnorm > 0) {
                 double dt_tidal = 0.5 * std::sqrt(sim.eta_grav / (tnorm / std::sqrt(6.0)));
-                if (gas)                     // gas additionally floors at its self-gravity time
-                    dt_tidal = std::min(dt_tidal,
-                                        std::sqrt(sim.eta_grav / (sim.G * sim.rho[i] + 1e-300)));
+                if (parts) parts->tidal = dt_tidal;
+                if (gas) {                   // gas additionally floors at its self-gravity time
+                    const double dt_sg = std::sqrt(sim.eta_grav / (sim.G * sim.rho[i] + 1e-300));
+                    if (parts) parts->selfgrav = dt_sg;
+                    dt_tidal = std::min(dt_tidal, dt_sg);
+                }
                 dt = std::min(dt, dt_tidal);
             }
         }
@@ -1481,12 +1498,41 @@ double mfm_step(Sim& sim, double dt_max) {
         for (const auto& [j, floor_bin] : sim.wake_requests)
             if (sim.bin[j] < floor_bin) sim.bin[j] = std::min(floor_bin, Sim::MAX_BINS);
         sim.wake_requests.clear();
-        // An EMPTY active set is not a quiet sync -- it is impossible in a consistent hierarchy
-        // (bin 0 aligns whenever anything does), so it means the clock has desynchronised. Left
-        // alone it is silent and catastrophic: no particle is kicked, yet the drift pass below
-        // still advances everyone, so the run continues with gravity effectively switched off.
-        // Fail loudly instead of producing plausible-looking ballistic output.
+        // An EMPTY active set has exactly one legitimate cause: accretion. Removing a particle
+        // can empty the bins that alone were aligned with the current clock (the swallowed cells
+        // near a sink are precisely the deepest-bin ones), leaving a tick no survivor syncs on.
+        // GIZMO never faces this because its next sync point is derived from the particles'
+        // own step-ends (core/run.cc find_timesteps / timebin bookkeeping); do the equivalent
+        // here and FAST-FORWARD the clock to the earliest tick any survivor is aligned to,
+        // integrating nothing in between -- there is nothing scheduled in between. Without
+        // removals an empty set still means the hierarchy has desynchronised, and that case
+        // stays fatal: left alone it silently turns gravity off for the rest of the run.
         if (active.empty()) {
+            if (sim.cells_accreted > 0 && n_part > 0) {
+                long long next_tick = LLONG_MAX;
+                #pragma omp parallel for schedule(static) reduction(min:next_tick)
+                for (size_t i = 0; i < n_part; ++i) {
+                    const long long ticks = sim.ticks_in_bin(sim.bin[i]);
+                    const long long t_i = (sim.clock_ticks / ticks + 1) * ticks;
+                    next_tick = std::min(next_tick, t_i);
+                }
+                // Never jump past the caller's boundary (snapshot time): close only the interval
+                // asked for and let the driver call again.
+                const long long cap = sim.ticks_floor(dt_max);
+                const long long jump = std::min(next_tick - sim.clock_ticks, cap);
+                if (jump >= 1) {
+                    const double dt_jump = sim.time_of_ticks(jump);
+                    fprintf(stderr, "shmem: accretion emptied the active bins at clock %lld; "
+                                    "fast-forwarding %lld ticks (%g) to the next scheduled "
+                                    "sync.\n", sim.clock_ticks, jump, dt_jump);
+                    sim.clock_ticks += jump;
+                    // The pruning pads must still cover the drift the skipped interval implies:
+                    // survivors WILL be drifted across it when next touched.
+                    sim.tree.t_since_build += dt_jump;
+                    ++sim.sync_point;
+                    return dt_jump;
+                }
+            }
             fprintf(stderr, "shmem: FATAL -- empty active set at clock %lld (dt_base=%g). The "
                             "timestep hierarchy has desynchronised; every particle would drift "
                             "with no gravity from here on.\n", sim.clock_ticks, sim.dt_base);
