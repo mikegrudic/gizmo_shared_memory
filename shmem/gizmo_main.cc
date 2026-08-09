@@ -52,7 +52,8 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
                          bool& output_potential, bool& tidal_criterion, bool& box_periodic,
-                         double& eos_adiabat, int& baro_variant, bool& baro_soundspeed) {
+                         double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
+                         bool& sink_formation) {
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -61,6 +62,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
     output_potential = false;
     tidal_criterion = false;
     box_periodic = false;
+    sink_formation = false;
     eos_adiabat = 0.0; baro_variant = -1; baro_soundspeed = false;
     // GIZMO_CONFIG (set by the pytest harness's GIZMO_PREBUILT path) names the staged config --
     // base + per-variant extra flags -- explicitly. The cwd/root fallbacks serve standalone runs;
@@ -97,6 +99,10 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             // Periodicity is a COMPILE flag in GIZMO, not a params entry: a params file may carry
             // BoxSize > 0 (plummer: 300, shu1977: 4.34) for a run that is nevertheless open.
             if (flag("BOX_PERIODIC"))             box_periodic = true;
+            // The STARFORGE defaults switch on the whole single-star sink package; the engine
+            // implements the formation criteria of that bundle (see sink_formation_pass).
+            if (flag("SINGLE_STAR_SINK_FORMATION") || flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
+                flag("SINGLE_STAR_SINK_DYNAMICS")) { sink_formation = true; tidal_criterion = true; }
             if (flag("EOS_GMC_BAROTROPIC_SOUNDSPEED")) baro_soundspeed = true;
             double adiabat_value;
             if (flag("EOS_ENFORCE_ADIABAT") &&
@@ -331,10 +337,10 @@ int main(int argc, char** argv) {
 
     int n_dims = 3; double gamma = 5.0/3.0;
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
-    bool tidal_criterion = false, box_periodic = false;
+    bool tidal_criterion = false, box_periodic = false, sink_formation = false;
     double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
-                 box_periodic, eos_adiabat, baro_variant, baro_soundspeed);
+                 box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation);
     // Units first: G falls back to the PHYSICAL constant in code units when the params file
     // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
     // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
@@ -401,6 +407,35 @@ int main(int argc, char** argv) {
     } else if (eos_adiabat > 0) {
         sim.eos_law = Sim::EosLaw::ENFORCE_ADIABAT;
         sim.eos_adiabat = eos_adiabat;
+    }
+    sim.mass_to_solar = unit_mass_cgs / 1.989e33;
+    sim.sink_formation = sink_formation;
+    if (sink_formation) {
+        // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
+        const double crit_nh = params.count("CritPhysDensity")
+                             ? atof(params["CritPhysDensity"].c_str()) : 0.0;
+        sim.crit_phys_density = (sim.nh_per_code_density > 0)
+                              ? crit_nh / sim.nh_per_code_density : 0.0;
+        // MaxSfrTimescale IS NOT A TIMESCALE. GIZMO registers two params at the same address
+        // (core/begrun.cc:1758 and 1771) -- the legacy `MaxSfrTimescale` and the one that is
+        // actually meant, `SfEffPerFreeFall`, a DIMENSIONLESS EFFICIENCY -- and then converts it
+        // at begrun.cc:572 into the free-fall time at the CRITICAL density over that efficiency:
+        //     All.MaxSfrTimescale = (1/eff) * sqrt(3 pi / (32 G rho_crit))
+        // Combined with tsfr = sqrt(rho_crit/rho) * All.MaxSfrTimescale (sfr_eff.cc:203) this is
+        // just tsfr = t_ff(LOCAL rho) / eff.
+        //
+        // Reading the legacy value as a timescale is what stopped this port ever forming a sink:
+        // shu1977.params carries SfEffPerFreeFall 1.0 AND MaxSfrTimescale 4000, so tsfr came out
+        // ~2757 instead of 3.8e-5 -- 7.3e7 too large. The time-averaged virial criterion (&2048)
+        // grows AlphaVirial_SF_TimeSmoothed from 0 by ~8*dt/tsfr per step, so that error meant
+        // ~4.5e10 steps to converge rather than ~600, and no cell could ever pass.
+        const double sf_eff = params.count("SfEffPerFreeFall")
+                            ? atof(params["SfEffPerFreeFall"].c_str()) : 1.0;
+        sim.max_sfr_timescale = (sf_eff > 0 && sim.crit_phys_density > 0 && sim.G > 0)
+            ? std::sqrt(3.0*M_PI / (32.0 * sim.G * sim.crit_phys_density)) / sf_eff : 0.0;
+        printf("shmem-GIZMO: sink formation ON  (PhysDensThresh = %.6g code = %.6g cm^-3, "
+               "SfEffPerFreeFall = %g, t_ff(rho_crit)/eff = %g)\n",
+               sim.crit_phys_density, crit_nh, sf_eff, sim.max_sfr_timescale);
     }
     if (!sim.eos_is_ideal())
         printf("shmem-GIZMO: EOS %s%s  (n_H per code rho = %.4g cm^-3, P_code per P_cgs = %.4g)\n",

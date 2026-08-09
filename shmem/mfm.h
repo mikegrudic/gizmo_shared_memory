@@ -129,6 +129,20 @@ struct Sim {
     std::vector<double> csnd;
     bool eos_is_ideal() const { return eos_law == EosLaw::IDEAL; }
 
+    // ---- sink particles (SINGLE_STAR_SINK_FORMATION) ----
+    // Formation is DETERMINISTIC: GIZMO multiplies the surviving rate by 1e20, so a cell that
+    // passes every criterion converts on the spot. The criteria are all veto-style, exactly as in
+    // galaxy_sf/sfr_eff.cc -- see project-shmem-sink-plan for the bit-by-bit mapping.
+    bool   sink_formation = false;     // SINGLE_STAR_SINK_FORMATION present in the config
+    double mass_to_solar = 1.0;        // code mass -> Msun (UnitMass_in_g / 1.989e33)
+    double crit_phys_density = 0.0;    // PhysDensThresh, code units (CritPhysDensity / n_H per rho)
+    double max_sfr_timescale = 0.0;    // MaxSfrTimescale, code units
+    // Rolling time average of 1/(1+alpha_vir), for the &2048 time-averaged virial criterion. A
+    // single instant of low alpha_vir in a turbulent flow is noise; the average is what GIZMO
+    // actually thresholds on.
+    std::vector<double> alpha_vir_smoothed;
+    long long sinks_formed = 0;        // diagnostic
+
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;
     double cfl     = 0.25;

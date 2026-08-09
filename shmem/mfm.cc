@@ -126,11 +126,11 @@ static inline void eos_apply(Sim& sim, size_t i) {
 }
 
 // Sound speed for particle i. The IDEAL branch recomputes from press/rho rather than reading a
-// stored value, and that is deliberate: this is called per NEIGHBOUR inside the gradient and flux
-// loops, which already have press[j] and rho[j] in cache, whereas csnd[j] would be a THIRD
-// scattered array touched per neighbour. An arithmetic sqrt is cheaper than the cache miss that
-// would avoid it. csnd is therefore only allocated and consulted when a density-driven EOS
-// actually makes it differ from gamma P/rho.
+// stored value, and that is deliberate: this is called per neighbour inside the gradient loop,
+// which already has press[j] and rho[j] in cache, whereas csnd[j] would be a THIRD scattered
+// array touched per neighbour. Reading it cost 28% of the whole sedov run (55.1 -> 70.8 s) --
+// an arithmetic sqrt is far cheaper than the cache miss that avoids it. csnd is therefore only
+// allocated and consulted when a density-driven EOS actually makes it differ from gamma P/rho.
 static inline double sound_speed(const Sim& sim, size_t i) {
     if (sim.eos_is_ideal()) return std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
     return sim.csnd[i];
@@ -817,6 +817,203 @@ static void rebuild_tree(Sim& sim) {
     ++sim.tree_builds;
 }
 
+// Negative definite? Sylvester's criterion on the leading principal minors -- for a symmetric 3x3
+// this is exact and needs no eigensolver (GIZMO calls gsl_eigen_symm here only because it already
+// links GSL).
+static inline bool sym3_negative_definite(const SymTensor3d& T) {
+    const double m1 = T[0][0];
+    const double m2 = T[0][0]*T[1][1] - T[0][1]*T[0][1];
+    const double m3 = T[0][0]*(T[1][1]*T[2][2] - T[1][2]*T[1][2])
+                    - T[0][1]*(T[0][1]*T[2][2] - T[1][2]*T[0][2])
+                    + T[0][2]*(T[0][1]*T[1][2] - T[1][1]*T[0][2]);
+    return (m1 < 0) && (m2 > 0) && (m3 < 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// SINK FORMATION. A literal port of GIZMO's SINGLE_STAR_SINK_FORMATION criteria
+// (galaxy_sf/sfr_eff.cc), which are all VETOES on a rate that is then multiplied by 1e20 -- so a
+// cell that survives every test converts deterministically, on the spot.
+//
+// Everything the criteria need is already computed by the step: the velocity gradient (divergence
+// and Frobenius norm), the tidal tensor from the gravity walk, the EOS sound speed, and the
+// neighbour list for the local-maximum test.
+
+// Swap two particles across EVERY per-particle array. Conversion has to move a cell out of the
+// gas prefix that Sim::n_gas marks, and the prefix must stay contiguous because the hydro passes
+// take it as a range.
+static void swap_particles(Sim& sim, size_t a, size_t b) {
+    if (a == b) return;
+    auto sw = [&](auto& v) { if (v.size() > std::max(a,b)) std::swap(v[a], v[b]); };
+    sw(sim.P.x); sw(sim.P.y); sw(sim.P.z); sw(sim.P.m); sw(sim.P.soft); sw(sim.P.zeta);
+    sw(sim.P.type);
+    sw(sim.vx); sw(sim.vy); sw(sim.vz); sw(sim.u);
+    sw(sim.h); sw(sim.ninv); sw(sim.rho); sw(sim.press); sw(sim.omega); sw(sim.csnd);
+    sw(sim.phi); sw(sim.a_grav); sw(sim.tidal); sw(sim.pending_half_kick);
+    sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
+    sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
+    sw(sim.work.moments_inv); sw(sim.work.signal_speed); sw(sim.work.div_vel);
+    for (auto& g : sim.work.gradient)  sw(g);
+    for (auto& p : sim.work.predicted) sw(p);
+}
+
+// Test every active gas cell and convert those that pass. Serial: formation is rare (shu1977
+// forms exactly one), and the conversion reorders the arrays, so it must not race the step.
+static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_gas,
+                                const std::vector<double>& dt_of) {
+    if (!sim.sink_formation || sim.crit_phys_density <= 0) return;
+    const size_t n_part = sim.size();
+    if (sim.alpha_vir_smoothed.size() != n_part) sim.alpha_vir_smoothed.assign(n_part, 0.0);
+    if (sim.P.type.size() != n_part) sim.P.type.assign(n_part, 0);
+
+    // SHMEM_SINK_DIAG=1 counts which veto stopped each candidate. Without it a run that forms no
+    // sink gives no signal at all about WHY -- and the criteria are a chain of eight, so guessing
+    // is exactly the wrong move.
+    static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
+    enum Veto { V_DENS=0, V_TSFR, V_DIVV, V_VIRIAL, V_JEANS, V_TIDAL, V_DENSMAX, V_NEARSINK,
+                V_PASS, V_NUM };
+    long long veto[V_NUM] = {0};
+    double rho_max_seen = 0.0, alpha_min_seen = 1e300;
+
+    std::vector<uint32_t> candidates;
+    for (size_t k = 0; k < active_gas.size(); ++k) {
+        const uint32_t i = active_gas[k];
+        if (i >= sim.n_gas) continue;
+        const double rho = sim.rho[i];
+        if (diag) rho_max_seen = std::max(rho_max_seen, rho);
+
+        // (0) density threshold. Also sets tsfr, the reference timescale the other criteria use.
+        if (!(rho > sim.crit_phys_density)) { sim.alpha_vir_smoothed[i] = 0.0; ++veto[V_DENS]; continue; }
+        const double tsfr = std::sqrt(sim.crit_phys_density / rho) * sim.max_sfr_timescale;
+        if (!(tsfr > 0)) { ++veto[V_TSFR]; continue; }
+
+        // velocity-gradient terms shared by the virial and convergent-flow criteria
+        const Vec3d& gx = sim.work.gradient[FIELD_VX][i];
+        const Vec3d& gy = sim.work.gradient[FIELD_VY][i];
+        const Vec3d& gz = sim.work.gradient[FIELD_VZ][i];
+        const double divv = gx[0] + gy[1] + gz[2];
+        double dv2abs = gx.norm_sq() + gy.norm_sq() + gz.norm_sq();
+
+        // (1)+(2048) virial parameter, time-averaged. dv2abs drops the divergence part when the
+        // flow is collapsing -- otherwise near-free-fall inflow counts against its own collapse --
+        // and gains the thermal support term. k_cs carries the single-star pi factor.
+        //
+        // ORDER MATTERS HERE, and it is GIZMO's order, not a tidier one. The virial block runs at
+        // sfr_eff.cc:244-282 and the convergent-flow veto only at :290 -- BEFORE this, the rolling
+        // average was skipped on any step with divv >= 0. The criteria look like order-independent
+        // vetoes, but this one carries STATE: AlphaVirial_SF_TimeSmoothed must be advanced on
+        // EVERY step the cell is above the density threshold. The pressure-supported core at the
+        // resolution limit oscillates, so divv is positive most steps; skipping the update froze
+        // the average near its initial 0 and left alpha_vir = 1/avg - 1 permanently enormous, and
+        // no sink could ever form no matter how long the run went.
+        const double particle_size = std::pow(sim.ninv[i], 1.0 / sim.dim);
+        double v_fast = sound_speed(sim, i);
+        if (sim.eos_law != Sim::EosLaw::IDEAL && sim.nh_per_code_density > 0) {
+            // opacity-limit relief: without it a run that resolves the first core bogs down and
+            // can never form the sink at all
+            if (rho * sim.nh_per_code_density > 1e13) v_fast = std::min(v_fast, 0.2);
+        }
+        const double k_cs = M_PI * v_fast / std::max(particle_size, 1e-300);
+        dv2abs -= divv * divv / 3.0;
+        dv2abs += 2.0 * k_cs * k_cs;
+        double alpha_vir = dv2abs / (8.0 * M_PI * sim.G * rho);
+        {
+            const double alpha_0 = 1.0 / (1.0 + alpha_vir);
+            const double dtau = std::exp(-std::min(std::max(8.0 * dt_of[i] / tsfr, 0.0), 20.0));
+            double& avg = sim.alpha_vir_smoothed[i];
+            avg = std::min(std::max(avg * dtau + alpha_0 * (1.0 - dtau), 1e-10), 1.0);
+            alpha_vir = 1.0 / avg - 1.0;
+        }
+        if (diag) alpha_min_seen = std::min(alpha_min_seen, alpha_vir);
+        if (alpha_vir > 1.0) { ++veto[V_VIRIAL]; continue; }
+
+        // (2) convergent flow. GIZMO sfr_eff.cc:290 -- after the virial block, for the reason
+        // spelled out above. The SINGLE_STAR path is simply "diverging flow, no SF".
+        if (divv >= 0) { ++veto[V_DIVV]; continue; }
+
+        // (64) Jeans mass, in solar masses, against the single-star threshold
+        if (sim.nh_per_code_density > 0) {
+            const double nH = rho * sim.nh_per_code_density;
+            const double MJ = 2.0 * std::pow(v_fast / 0.2, 3.0) / std::sqrt(nH / 760.0);
+            const double m_solar = sim.P.m[i] * sim.mass_to_solar;
+            const double MJ_crit = std::min(1e4, std::max(1e-3, 100.0 * m_solar));
+            if (MJ > MJ_crit) { ++veto[V_JEANS]; continue; }
+        }
+
+        // (32) Hill/tidal: the cell must dominate its own Hill sphere, i.e. the tidal tensor is
+        // negative definite once its own self-term is restored (the walk omits self-self).
+        if (sim.tidal_criterion && sim.tidal.size() == n_part) {
+            SymTensor3d T = sim.tidal[i];
+            const double h_i = std::max(sim.P.soft[i], 1e-300);
+            const double fac_self = -sim.P.m[i] * (2.8 / (h_i * h_i)) / h_i;
+            T[0][0] += fac_self; T[1][1] += fac_self; T[2][2] += fac_self;
+            const double trace = T[0][0] + T[1][1] + T[2][2];
+            if (trace >= 0) { ++veto[V_TIDAL]; continue; }                 // a positive trace forces a positive eigenvalue
+            if (!sym3_negative_definite(T)) { ++veto[V_TIDAL]; continue; }
+        }
+
+        // (4) local density maximum: no denser gas neighbour inside the kernel
+        {
+            bool denser_neighbour = false;
+            std::vector<uint32_t> ngb;
+            get_neighbours(sim, sim.tree, k, sim.P.pos(i), sim.h[i], ngb);
+            for (uint32_t j : ngb) {
+                if (j == i || j >= sim.n_gas) continue;
+                if (sim.rho[j] > rho) { denser_neighbour = true; break; }
+            }
+            if (denser_neighbour) { ++veto[V_DENSMAX]; continue; }
+        }
+
+        // (8) no existing sink close enough to have claimed this gas already
+        {
+            bool near_sink = false;
+            for (size_t sph = sim.n_gas; sph < n_part; ++sph) {
+                // a sink on a long bin can be carrying a stale position, and this loop reads it
+                // directly rather than through a search; serial here, so no lock is needed
+                drift_particle_to(sim, sph, sim.clock_ticks);
+                const double d = min_image(sim.P.pos(sph) - sim.P.pos(i), sim.box).norm();
+                if (d < sim.h[i] || d < std::max(sim.P.soft[sph], 0.0)) { near_sink = true; break; }
+            }
+            if (near_sink) { ++veto[V_NEARSINK]; continue; }
+        }
+
+        ++veto[V_PASS];
+        candidates.push_back(i);
+    }
+    if (diag && !active_gas.empty()) {
+        static long long calls = 0;
+        if ((calls++ % 200) == 0 || veto[V_PASS])
+            fprintf(stderr, "[sink-diag] nact_gas=%zu rho_max=%.4g (thresh %.4g, ratio %.3g) "
+                    "alpha_min=%.4g | dens=%lld tsfr=%lld divv=%lld virial=%lld jeans=%lld "
+                    "tidal=%lld densmax=%lld nearsink=%lld PASS=%lld\n",
+                    active_gas.size(), rho_max_seen, sim.crit_phys_density,
+                    rho_max_seen/sim.crit_phys_density,
+                    (alpha_min_seen>1e299 ? -1.0 : alpha_min_seen),
+                    veto[V_DENS], veto[V_TSFR], veto[V_DIVV], veto[V_VIRIAL], veto[V_JEANS],
+                    veto[V_TIDAL], veto[V_DENSMAX], veto[V_NEARSINK], veto[V_PASS]);
+    }
+
+    // Convert. Descending order so that swapping with the shrinking gas prefix cannot disturb a
+    // candidate that has not been handled yet.
+    std::sort(candidates.begin(), candidates.end(), std::greater<uint32_t>());
+    for (uint32_t i : candidates) {
+        if (i >= sim.n_gas) continue;
+        const size_t last_gas = sim.n_gas - 1;
+        swap_particles(sim, i, last_gas);
+        sim.n_gas = last_gas;
+        sim.P.type[last_gas] = 5;
+        sim.u[last_gas] = 0.0;
+        sim.P.soft[last_gas] = sim.soft_fixed[5] > 0 ? sim.soft_fixed[5] : sim.h[last_gas];
+        ++sim.sinks_formed;
+        printf("shmem-GIZMO: sink formed from cell %zu (m=%.6g, rho=%.6g); %lld total\n",
+               last_gas, sim.P.m[last_gas], sim.rho[last_gas], sim.sinks_formed);
+        fflush(stdout);
+    }
+    // Any conversion PERMUTES the particle arrays, so everything keyed by particle index is stale:
+    // the neighbour cache (keyed by position in the active list) and the tree, whose orderbuf and
+    // leaf_of still name the pre-swap indices. Both must go.
+    if (!candidates.empty()) { sim.ngb_cache.clear(); sim.tree_valid = false; }
+}
+
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
     sim.last_drift.assign(n_part, sim.clock_ticks);
@@ -1280,6 +1477,10 @@ double mfm_step(Sim& sim, double dt_max) {
         const Vec3d correction = (vel_new - vel_old) * (0.5 * dt);
         sim.P.x[i] -= correction[0]; sim.P.y[i] -= correction[1]; sim.P.z[i] -= correction[2];
     }
+
+    // Sink formation, once the cells' own updates for this step are complete. Serial and after
+    // the flux pass because it reorders the particle arrays.
+    sink_formation_pass(sim, active_gas, dt_of);
 
     // Pass 2: drift EVERY particle over the system interval dt. A long-binned particle is drifted
     // in several sub-steps rather than one long one; its velocity is constant between its own
