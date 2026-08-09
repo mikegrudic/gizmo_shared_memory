@@ -497,6 +497,10 @@ int main(int argc, char** argv) {
     // SHMEM_DENSE_DRIFT=1 restores the full O(N) drift sweep, for A/B against lazy drift.
     sim.sparse_drift = (getenv("SHMEM_DENSE_DRIFT") == nullptr);
     if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));
+    // SHMEM_TREE_PAD_FRAC: how far the tree may go stale before a rebuild. The gravity walk
+    // reads node centres-of-mass as they were AT BUILD TIME, so this directly controls a force
+    // error that the neighbour-search padding does not cover. 0 rebuilds every sync, for A/B.
+    if (const char* tp = getenv("SHMEM_TREE_PAD_FRAC")) sim.tree_rebuild_pad_frac = atof(tp);
     set_time_base(sim, dt_snapshot, dt_max);
     printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
            sim.individual_timesteps ? "individual" : "global", sim.dt_base);

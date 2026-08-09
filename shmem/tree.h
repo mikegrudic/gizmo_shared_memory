@@ -218,6 +218,11 @@ struct Tree {
     // is given velocities AND a jerk is wanted (Hermite); empty otherwise, so runs that never
     // ask for a jerk pay neither the memory nor the sweep.
     std::vector<double> vcom_x, vcom_y, vcom_z;
+    // Momentum accumulated into each node since the build -- GIZMO's Extnodes[].dp, maintained
+    // by force_kick_node (forcetree_update.cc:96-100) in the same parent climb that raises vmax.
+    // Without it vcom is only right at build time and every subsequent kick makes it staler; the
+    // node velocity a walk should use is vcom + dp/mass.
+    std::vector<double> dp_x, dp_y, dp_z;
     double t_since_build = 0.0;         // engine time elapsed since this tree was built
 
     size_t nnodes() const { return mass.size(); }   // valid after build() trims to nalloc
@@ -234,6 +239,18 @@ struct Tree {
     // construction >= all its children's, so once one covers it they all do. In steady state that
     // breaks at the first test, which is what keeps this affordable on an all-active step.
     void raise_vmax(int leaf_node, float speed);
+    // Accumulate a particle's momentum change into every ancestor node (GIZMO's force_kick_node).
+    // No-op unless the build produced vcom, so runs that never ask for a jerk pay nothing.
+    void kick_node(int leaf_node, const Vec3d& dp);
+    // Node centre-of-mass velocity, corrected for kicks since the build.
+    Vec3d node_vel(int node_id) const {
+        if (dp_x.empty() || mass[node_id] <= 0)
+            return Vec3d{vcom_x[node_id], vcom_y[node_id], vcom_z[node_id]};
+        const double inv_m = 1.0 / mass[node_id];
+        return Vec3d{vcom_x[node_id] + dp_x[node_id] * inv_m,
+                     vcom_y[node_id] + dp_y[node_id] * inv_m,
+                     vcom_z[node_id] + dp_z[node_id] * inv_m};
+    }
 };
 
 static const int LEAF_MAX = 16;        // particles per leaf; below this, direct summation is cheaper

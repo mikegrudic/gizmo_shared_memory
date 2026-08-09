@@ -191,6 +191,18 @@ static inline void atomic_max_nonneg(float* slot, float value) {
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { /* seen reloaded */ }
 }
 
+void Tree::kick_node(int leaf_node, const Vec3d& dp) {
+    if (dp_x.empty()) return;                    // no vcom built, nothing to keep current
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        #pragma omp atomic
+        dp_x[no] += dp[0];
+        #pragma omp atomic
+        dp_y[no] += dp[1];
+        #pragma omp atomic
+        dp_z[no] += dp[2];
+    }
+}
+
 void Tree::raise_vmax(int leaf_node, float speed) {
     uint32_t want; std::memcpy(&want, &speed, sizeof want);
     for (int no = leaf_node; no >= 0; no = parent[no]) {
@@ -257,6 +269,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
         if (want_vcom) {
             T.vcom_x.assign(cap, 0.0); T.vcom_y.assign(cap, 0.0); T.vcom_z.assign(cap, 0.0);
+            T.dp_x.assign(cap, 0.0);   T.dp_y.assign(cap, 0.0);   T.dp_z.assign(cap, 0.0);
         }
         T.leaf_of.assign(n, -1);
     }
@@ -268,7 +281,10 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
         T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
-        if (!T.vcom_x.empty()) { T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn); }
+        if (!T.vcom_x.empty()) {
+            T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn);
+            T.dp_x.resize(nn);   T.dp_y.resize(nn);   T.dp_z.resize(nn);
+        }
     }
     if(bt) { bt->recurse = now_ms()-t_a; } t_a = now_ms();
     setup_walk(T, T.root, -1);
@@ -535,9 +551,9 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                                 if (want_jerk) {
                                     // node source: its centre-of-mass velocity, GIZMO's
                                     // Extnodes[].vs (forcetree.cc:1945)
-                                    const double dvx=T.vcom_x[node]-tvx[i],
-                                                 dvy=T.vcom_y[node]-tvy[i],
-                                                 dvz=T.vcom_z[node]-tvz[i];
+                                    const Vec3d nv = T.node_vel(node);
+                                    const double dvx=nv[0]-tvx[i], dvy=nv[1]-tvy[i],
+                                                 dvz=nv[2]-tvz[i];
                                     const double vdotr = dvx*dx_ + dvy*dy_ + dvz*dz_;
                                     ojx[i] += g1*dvx - vdotr*g2*dx_;
                                     ojy[i] += g1*dvy - vdotr*g2*dy_;

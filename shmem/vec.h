@@ -35,6 +35,32 @@ static inline Vec3d min_image(Vec3d separation, double box) {
                  min_image(separation[2], box)};
 }
 
+// Rank-d inverse of the symmetric moments matrix E, returning false when the neighbour geometry is
+// degenerate; callers fall back to zero gradients there -- first order but safe, as GIZMO does.
+// In 1D/2D the dead rows/columns of E are identically zero (every particle offset vanishes there),
+// so the full 3x3 inverse does not exist: invert the live block and leave the rest zero, which
+// makes gradients and faces exactly in-plane.
+static inline bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dims) {
+    inverse = Mat3d{};                               // zeroed: also the failure/fallback state
+    if (n_dims == 1) {
+        if (std::abs(moments[0][0]) < 1e-300) return false;
+        inverse[0][0] = 1.0 / moments[0][0];
+        return true;
+    }
+    if (n_dims == 2) {
+        const double det = moments[0][0]*moments[1][1] - moments[0][1]*moments[0][1];
+        if (std::abs(det) < 1e-300) return false;
+        inverse[0][0] =  moments[1][1]/det; inverse[0][1] = -moments[0][1]/det;
+        inverse[1][0] = -moments[0][1]/det; inverse[1][1] =  moments[0][0]/det;
+        return true;
+    }
+    // 3D: hand the live 3x3 to the shared, unit-tested Mat3 inverse rather than a second copy.
+    const Mat3d full{{ {moments[0][0], moments[0][1], moments[0][2]},
+                       {moments[1][0], moments[1][1], moments[1][2]},
+                       {moments[2][0], moments[2][1], moments[2][2]} }};
+    return full.invert(inverse) != 0.0;              // invert() zeroes and returns 0 if singular
+}
+
 // Fold a POSITION back into the canonical cell [0, box). Distinct from min_image() above, which
 // folds a separation. Uses fmod rather than one add/subtract because a drift can cross more than
 // one box length in a single step: the square test advects at |v| ~ 1300 with dt ~ 1e-3, i.e. 1.3

@@ -160,6 +160,10 @@ struct Sim {
     // SINGLE_STAR_TIMESTEPPING: per-particle minimum approach / freefall time to the sink
     // population (gravity/forcetree.cc:2509-2510), refreshed for active particles each sync.
     // 1e300 = "no sink seen"; feeds the two-body sink criterion and the gas approach cap.
+    // Velocity at each particle's last node-kick accounting, so the momentum DELTA fed to
+    // Tree::kick_node is the change since the tree last saw it (GIZMO passes dp directly from
+    // do_the_kick; here the kicks are applied in bulk, so the delta is reconstructed).
+    std::vector<Vec3d> vel_at_last_kick;
     std::vector<double> min_sink_tapp;
     std::vector<double> min_sink_tff;
     // Sink-gas dt ceiling (wakeup + freefall + Courant caps, core/timestep.cc:1002-1026),

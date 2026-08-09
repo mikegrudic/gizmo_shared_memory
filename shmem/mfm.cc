@@ -28,31 +28,8 @@ static inline void get_neighbours(const Sim& sim, const Tree& tree, size_t k, co
     ngb_search(tree, sim.P, pos_i, radius, neighbours, sim.box, sim.lazy());
 }
 
-// Rank-d inverse of the symmetric moments matrix E, returning false when the neighbour geometry is
-// degenerate; callers fall back to zero gradients there -- first order but safe, as GIZMO does.
-// In 1D/2D the dead rows/columns of E are identically zero (every particle offset vanishes there),
-// so the full 3x3 inverse does not exist: invert the live block and leave the rest zero, which
-// makes gradients and faces exactly in-plane.
-static bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dims) {
-    inverse = Mat3d{};                               // zeroed: also the failure/fallback state
-    if (n_dims == 1) {
-        if (std::abs(moments[0][0]) < 1e-300) return false;
-        inverse[0][0] = 1.0 / moments[0][0];
-        return true;
-    }
-    if (n_dims == 2) {
-        const double det = moments[0][0]*moments[1][1] - moments[0][1]*moments[0][1];
-        if (std::abs(det) < 1e-300) return false;
-        inverse[0][0] =  moments[1][1]/det; inverse[0][1] = -moments[0][1]/det;
-        inverse[1][0] = -moments[0][1]/det; inverse[1][1] =  moments[0][0]/det;
-        return true;
-    }
-    // 3D: hand the live 3x3 to the shared, unit-tested Mat3 inverse rather than a second copy.
-    const Mat3d full{{ {moments[0][0], moments[0][1], moments[0][2]},
-                       {moments[1][0], moments[1][1], moments[1][2]},
-                       {moments[2][0], moments[2][1], moments[2][2]} }};
-    return full.invert(inverse) != 0.0;              // invert() zeroes and returns 0 if singular
-}
+// invert_moments now lives in vec.h: the h solve in hydro.cc needs it too, for the
+// face-closure correction.
 
 // ---------------------------------------------------------------------------------------------
 // EQUATION OF STATE. Sets pressure and sound speed for one particle, and -- for the laws where
@@ -815,6 +792,15 @@ static void rebuild_tree(Sim& sim) {
     // Per-node centre-of-mass velocities only when a Hermite jerk will ask for them.
     sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0);
     sim.tree.t_since_build = 0.0;
+    // vcom was just built from these velocities and the node dp accumulators are zero, so this
+    // is the baseline every later kick is measured against.
+    if (sim.hermite_mask != 0) {
+        const size_t n = sim.size();
+        sim.vel_at_last_kick.resize(n);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i)
+            sim.vel_at_last_kick[i] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]};
+    }
     sim.tree_valid = true;
     ++sim.tree_builds;
 }
@@ -853,7 +839,7 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.phi); sw(sim.a_grav); sw(sim.tidal); sw(sim.pending_half_kick);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
     sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.id);
-    sw(sim.min_sink_tapp); sw(sim.min_sink_tff); sw(sim.sink_dt_gas_cap);
+    sw(sim.min_sink_tapp); sw(sim.min_sink_tff); sw(sim.sink_dt_gas_cap); sw(sim.vel_at_last_kick);
     sw(sim.herm_valid); sw(sim.herm_tick); sw(sim.herm_pos); sw(sim.herm_vel);
     sw(sim.herm_acc); sw(sim.herm_jerk);
     sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
@@ -872,7 +858,7 @@ static void pop_particle(Sim& sim) {
     pop(sim.phi); pop(sim.a_grav); pop(sim.tidal); pop(sim.pending_half_kick);
     pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
     pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.id);
-    pop(sim.min_sink_tapp); pop(sim.min_sink_tff); pop(sim.sink_dt_gas_cap);
+    pop(sim.min_sink_tapp); pop(sim.min_sink_tff); pop(sim.sink_dt_gas_cap); pop(sim.vel_at_last_kick);
     pop(sim.herm_valid); pop(sim.herm_tick); pop(sim.herm_pos); pop(sim.herm_vel);
     pop(sim.herm_acc); pop(sim.herm_jerk);
     pop(sim.dmom_x); pop(sim.dmom_y); pop(sim.dmom_z); pop(sim.denergy);
@@ -924,6 +910,14 @@ static void sink_accretion_pass(Sim& sim) {
     long long acc_inside = 0, acc_rej_res = 0, acc_rej_unbound = 0, acc_rej_angmom = 0;
 
     for (size_t sph = sim.n_gas; sph < sim.size(); ++sph) {
+        // ACTIVE SINKS ONLY -- the reference accretes from calculate_non_standard_physics, which
+        // runs on the active set, so a sink's mass changes only at its own step boundaries.
+        // Accreting every sync instead (as this did) splits the operators differently from the
+        // kick: the sink's owed pending_half_kick was computed against its mass BEFORE the
+        // swallows and is then applied to the grown mass, so the momentum it receives no longer
+        // matches the reaction the gas was already given. The 4.1x wake-up cap is what bounds
+        // how long gas can wait to be eaten.
+        if (sim.individual_timesteps && !sim.is_active(sph)) continue;
         drift_particle_to(sim, sph, sim.clock_ticks);
         const double r_sink = sim.sink_radius.empty() ? 0.0 : sim.sink_radius[sph];
         if (!(r_sink > 0)) continue;
@@ -983,10 +977,23 @@ static void sink_accretion_pass(Sim& sim) {
             // SWALLOW. Mass and momentum conserved exactly; the sink keeps its position (GIZMO
             // does not recentre single-star sinks) and absorbs the pair's momentum. Safe to apply
             // now -- this mutates only the SINK, and no index moves until the removal phase.
+            //
+            // FINISH THE CELL'S KICK FIRST. Under KDK the stored velocity is half-kicked: the
+            // particle is still OWED pending_half_kick * a_grav, and every other particle has
+            // already been given its half of that same pairwise interaction. Destroying the cell
+            // with the debt outstanding deletes one side of a force pair, so the system leaks
+            // momentum once per swallow -- thousands of times over a run, and coherently, since
+            // a_grav near a sink points radially inward. The reference never sees this because
+            // its swallow runs in calculate_non_standard_physics, AFTER do_second_halfstep_kick,
+            // so the cell is fully synchronised before it is absorbed.
+            const double owed = sim.pending_half_kick.empty() ? 0.0 : sim.pending_half_kick[j];
+            const Vec3d v_j{sim.vx[j] + sim.a_grav[j][0] * owed,
+                            sim.vy[j] + sim.a_grav[j][1] * owed,
+                            sim.vz[j] + sim.a_grav[j][2] * owed};
             const double m_new = sim.P.m[sph] + sim.P.m[j];
-            sim.vx[sph] = (sim.P.m[sph]*sim.vx[sph] + sim.P.m[j]*sim.vx[j]) / m_new;
-            sim.vy[sph] = (sim.P.m[sph]*sim.vy[sph] + sim.P.m[j]*sim.vy[j]) / m_new;
-            sim.vz[sph] = (sim.P.m[sph]*sim.vz[sph] + sim.P.m[j]*sim.vz[j]) / m_new;
+            sim.vx[sph] = (sim.P.m[sph]*sim.vx[sph] + sim.P.m[j]*v_j[0]) / m_new;
+            sim.vy[sph] = (sim.P.m[sph]*sim.vy[sph] + sim.P.m[j]*v_j[1]) / m_new;
+            sim.vz[sph] = (sim.P.m[sph]*sim.vz[sph] + sim.P.m[j]*v_j[2]) / m_new;
             sim.P.m[sph] = m_new;
             // The mass/velocity jump invalidates any Hermite snapshot: the sink falls back to
             // KDK for one step and re-enters at its next sync (GIZMO's AccretedThisTimestep).
@@ -1117,7 +1124,14 @@ static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
                 const double cs = sound_speed(sim, j);
                 cs2_sum += m * cs * cs;
             }
-            const double dt_wake = 4.1 * sim.dt_of_bin(deepest_bin);
+            // 4.1x the shortest-step gas neighbour (core/timestep.cc:1002). SHMEM_SINK_WAKE_FAC
+            // overrides it: a sink on a longer bin than the gas around it is kicked by that gas
+            // on the gas's cadence but kicks back on its own, so the pair's momentum exchange
+            // does not balance across the bin boundary. Driving the factor to 1 tests whether
+            // that asymmetry is what injects momentum once a sink exists.
+            static const double wake_fac = getenv("SHMEM_SINK_WAKE_FAC")
+                                         ? atof(getenv("SHMEM_SINK_WAKE_FAC")) : 4.1;
+            const double dt_wake = wake_fac * sim.dt_of_bin(deepest_bin);
             // eps = max(kernel-core softening, nearest gas dr, sink radius, cell size);
             // L_sink = the volume-equivalent size of the kernel the search settled on
             const double L_sink = 1.61199 * radius / std::cbrt((double)n_gas_found);
@@ -2193,9 +2207,15 @@ double mfm_step(Sim& sim, double dt_max) {
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
             const int leaf = sim.tree.leaf_of[i];
-            if (leaf >= 0)
-                sim.tree.raise_vmax(
-                    leaf, (float)Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}.norm());
+            if (leaf < 0) continue;
+            const Vec3d v_now{sim.vx[i], sim.vy[i], sim.vz[i]};
+            sim.tree.raise_vmax(leaf, (float)v_now.norm());
+            // ... and the node MOMENTUM, the other half of force_kick_node: node_vel() reads
+            // vcom + dp/mass, so the jerk sees where a node's mass is actually going rather
+            // than where it was going at build time.
+            if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == n_part)
+                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i]);
+            if (sim.vel_at_last_kick.size() == n_part) sim.vel_at_last_kick[i] = v_now;
         }
     }
     // Motion since the build is bounded per node by Tree::vmax * this elapsed time; see the prune
