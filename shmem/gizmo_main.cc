@@ -54,26 +54,75 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
     adaptive_soft = false;
     output_potential = false;
     tidal_criterion = false;
-    for (const char* path : {"Config.sh", "../../Config.sh"}) {
+    // GIZMO_CONFIG (set by the pytest harness's GIZMO_PREBUILT path) names the staged config --
+    // base + per-variant extra flags -- explicitly. The cwd/root fallbacks serve standalone runs;
+    // under pytest the cwd copy is the pristine base WITHOUT the variant flags, which is exactly
+    // why the explicit path must win when present.
+    const char* env_config = getenv("GIZMO_CONFIG");
+    const char* search_paths[3] = {env_config, "Config.sh", "../../Config.sh"};
+    const char** paths_begin = env_config ? search_paths : search_paths + 1;
+    const char** paths_end   = env_config ? search_paths + 1 : search_paths + 3;
+    for (const char** p = paths_begin; p != paths_end; ++p) {
+        const char* path = *p;
         FILE* file = fopen(path, "r");
         if (!file) continue;
+        printf("shmem-GIZMO: config %s\n", path);
+        std::vector<std::string> ignored;
         char line[512];
         while (fgets(line, sizeof line, file)) {
-            if (line[0] == '#') continue;
-            if (strncmp(line, "SELFGRAVITY_OFF", 15) == 0) gravity_on = false;
-            if (strncmp(line, "ADAPTIVE_GRAVSOFT_FORGAS", 24) == 0) adaptive_soft = true;
-            if (strncmp(line, "OUTPUT_POTENTIAL", 16) == 0) output_potential = true;
-            if (strncmp(line, "TIDAL_TIMESTEP_CRITERION", 24) == 0) tidal_criterion = true;
+            if (line[0] == '#' || line[0] == '\n') continue;
+            bool known = false;
+            auto flag = [&](const char* name) {
+                const size_t n = strlen(name);
+                // match the whole token, so OUTPUT_POTENTIAL does not also swallow a future
+                // OUTPUT_POTENTIAL_FOO
+                if (strncmp(line, name, n) != 0) return false;
+                const char c = line[n];
+                if (c != '\0' && c != '\n' && c != '=' && c != ' ' && c != '\t') return false;
+                known = true;
+                return true;
+            };
+            if (flag("SELFGRAVITY_OFF"))          gravity_on = false;
+            if (flag("ADAPTIVE_GRAVSOFT_FORGAS")) adaptive_soft = true;
+            if (flag("OUTPUT_POTENTIAL"))         output_potential = true;
+            if (flag("TIDAL_TIMESTEP_CRITERION")) tidal_criterion = true;
             int dims_from_config;
-            if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
+            if (flag("BOX_SPATIAL_DIMENSION") &&
+                sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
                 n_dims = dims_from_config;
             double numerator, denominator;
-            if (sscanf(line, "EOS_GAMMA=(%lf/%lf)", &numerator, &denominator) == 2)
-                gamma = numerator / denominator;
-            else if (sscanf(line, "EOS_GAMMA=(%lf)", &numerator) == 1) gamma = numerator;
-            else if (sscanf(line, "EOS_GAMMA=%lf", &numerator) == 1) gamma = numerator;
+            if (flag("EOS_GAMMA")) {
+                if (sscanf(line, "EOS_GAMMA=(%lf/%lf)", &numerator, &denominator) == 2)
+                    gamma = numerator / denominator;
+                else if (sscanf(line, "EOS_GAMMA=(%lf)", &numerator) == 1) gamma = numerator;
+                else if (sscanf(line, "EOS_GAMMA=%lf", &numerator) == 1) gamma = numerator;
+            }
+            // ...except the ones this engine satisfies unconditionally, which would otherwise
+            // make the warning pure noise: MFM is what the engine IS, output is always double,
+            // and DEVELOPER_MODE only exposes extra params (already read by name).
+            for (const char* benign : {"HYDRO_MESHLESS_FINITE_MASS", "OUTPUT_IN_DOUBLEPRECISION",
+                                       "DEVELOPER_MODE"})
+                flag(benign);
+            // Flags this engine has no implementation for. Reported rather than ignored in
+            // silence: a suite variant exists precisely to exercise the feature its flag names,
+            // so running it as if the flag were absent makes the variant a duplicate of baseline
+            // that PASSES -- which is how plummer/tidal and evrard/tidal_adaptive went green
+            // without ever enabling the criterion they are named after.
+            if (!known) {
+                std::string name(line);
+                const size_t comment = name.find('#');       // "FLAG   # why" -- keep just FLAG
+                if (comment != std::string::npos) name.resize(comment);
+                while (!name.empty() && (name.back() == '\n' || name.back() == '\r' ||
+                                         name.back() == ' ' || name.back() == '\t')) name.pop_back();
+                if (!name.empty()) ignored.push_back(name);
+            }
         }
         fclose(file);
+        if (!ignored.empty()) {
+            printf("shmem-GIZMO: WARNING -- %zu config flag(s) NOT implemented by this engine "
+                   "and ignored:\n", ignored.size());
+            for (const auto& name : ignored) printf("shmem-GIZMO:     %s\n", name.c_str());
+        }
         break;                                   // first Config.sh found wins (cwd over root)
     }
 }
