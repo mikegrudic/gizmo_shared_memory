@@ -10,36 +10,7 @@ static double now_ms(){using c=std::chrono::steady_clock;
 
 namespace shmem {
 
-// (1/r) d(phi)/dr for cubic-spline softening -- GIZMO's kernel_gravity(mode=1), mesh/kernel.h.
-// Multiply by the offset vector to get the acceleration.
-//
-// The decisive property is that this is EXACTLY Newtonian for r >= h. Plummer softening,
-// 1/(r^2+eps^2)^{3/2}, never is: it sits at 0.35 of Newtonian at r=eps, 0.72 at 2eps and 0.86 at
-// 3eps, so with adaptive softening (eps = h) it under-counts gravity across a whole neighbourhood
-// rather than just below the resolution limit. In Evrard that suppressed the central density by
-// about 2x against the reference solution -- and a PRESSURELESS free-fall test cannot see it,
-// because there the softening length is tiny next to the cloud and the error never bites.
-static inline double spline_force_over_r(double r, double h) {
-    const double h_inv = 1.0 / h;
-    const double h_inv3 = h_inv * h_inv * h_inv;
-    const double u = r * h_inv;
-    if (u >= 1.0) return 1.0 / (r * r * r);          // Newtonian outside the softening
-    if (u < 0.5) return h_inv3 * (10.666666666666667 + u*u*(32.0*u - 38.4));
-    return h_inv3 * (21.333333333333332 - 48.0*u + 38.4*u*u - 10.666666666666667*u*u*u
-                     - 0.06666666666666667/(u*u*u));
-}
-
-// phi(r) for the same cubic spline -- GIZMO's kernel_gravity(mode=-1). Exactly -1/r beyond h, so
-// the potential and the force below come from one consistent kernel.
-static inline double spline_potential(double r, double h) {
-    const double h_inv = 1.0 / h;
-    const double u = r * h_inv;
-    if (u >= 1.0) return -1.0 / r;
-    if (u < 0.5)
-        return h_inv * (-2.8 + u*u*(5.333333333333333 + u*u*(6.4*u - 9.6)));
-    return h_inv * (-3.2 + 0.06666666666666667/u
-                    + u*u*(10.666666666666667 + u*(-16.0 + u*(9.6 - 2.1333333333333333*u))));
-}
+// spline_force_over_r and spline_potential live in tree.h, beside grav_tidal_factor.
 
 static inline void kick(const Vec3d& offset, double mass, double softening, Vec3d& accel) {
     const double r = offset.norm();
@@ -165,7 +136,12 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     // moments, so the total moment work is O(N) instead of O(N * depth) -- the old version re-scanned
     // the full particle range at every level, which at depth ~15 was most of the recursion cost.
     // The per-node velocity bound (Tree::vmax) accumulates the same way, in the same sweep.
+    // The per-node centre-of-mass VELOCITY (Tree::vcom) rides in the same sweep. It is GIZMO's
+    // Extnodes[].vs, and it is what a node interaction contributes to the JERK
+    // (forcetree.cc:1945, dv = Extnodes[no].vs - vel); leaves use the particle's own velocity
+    // (forcetree.cc:1641). Only built when velocities are supplied.
     double M = 0, sx = 0, sy = 0, sz_ = 0, smax = 0, vmax = 0;
+    double pvx = 0, pvy = 0, pvz = 0;               // mass-weighted momentum, for vcom
     if (T.first[me] < 0 || nk == 0) {
         for (int i = lo; i < hi; ++i) {
             uint32_t p = order[i];
@@ -176,6 +152,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
                 const double v = std::sqrt(vel[0][p]*vel[0][p] + vel[1][p]*vel[1][p] +
                                            vel[2][p]*vel[2][p]);
                 if (v > vmax) vmax = v;
+                pvx += m * vel[0][p]; pvy += m * vel[1][p]; pvz += m * vel[2][p];
             }
             T.leaf_of[p] = me;
         }
@@ -186,11 +163,17 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
             M += m; sx += m * T.cx[k]; sy += m * T.cy[k]; sz_ += m * T.cz[k];
             if (T.soft[k] > smax) smax = T.soft[k];
             if (T.vmax[k] > vmax) vmax = T.vmax[k];
+            if (vel && !T.vcom_x.empty()) {
+                pvx += m * T.vcom_x[k]; pvy += m * T.vcom_y[k]; pvz += m * T.vcom_z[k];
+            }
         }
     }
     if (M > 0) { sx /= M; sy /= M; sz_ /= M; }
     T.mass[me] = M; T.cx[me] = sx; T.cy[me] = sy; T.cz[me] = sz_; T.soft[me] = smax;
     T.vmax[me] = (float)vmax;
+    if (vel && !T.vcom_x.empty() && M > 0) {
+        T.vcom_x[me] = pvx / M; T.vcom_y[me] = pvy / M; T.vcom_z[me] = pvz / M;
+    }
     double dx = sx - cxi, dy = sy - cyi, dz = sz_ - czi;
     T.delta[me] = std::sqrt(dx*dx + dy*dy + dz*dz);
     return me;
@@ -229,7 +212,8 @@ void setup_walk(Tree& T, int node, int next_sibling) {
     }
 }
 
-Tree build(const Particles& P, BuildTimes* bt, const double* const* vel) {
+Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool want_vcom) {
+    if (!vel) want_vcom = false;                  // no velocities, no centre-of-mass velocity
     double t_a = now_ms(), t_start = t_a;
     const size_t n = P.size();
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
@@ -271,6 +255,9 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel) {
         T.mass.resize(cap); T.size.resize(cap); T.delta.resize(cap); T.soft.resize(cap);
         T.first.resize(cap); T.next.resize(cap); T.plo.resize(cap); T.phi.resize(cap);
         T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
+        if (want_vcom) {
+            T.vcom_x.assign(cap, 0.0); T.vcom_y.assign(cap, 0.0); T.vcom_z.assign(cap, 0.0);
+        }
         T.leaf_of.assign(n, -1);
     }
     #pragma omp parallel
@@ -281,6 +268,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel) {
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
         T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
+        if (!T.vcom_x.empty()) { T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn); }
     }
     if(bt) { bt->recurse = now_ms()-t_a; } t_a = now_ms();
     setup_walk(T, T.root, -1);
@@ -405,11 +393,16 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az,
-                   std::vector<SymTensor3d>* tidal, const double* aold, const LazyDrift* lazy) {
+                   std::vector<SymTensor3d>* tidal, const double* aold, const LazyDrift* lazy,
+                   std::vector<Vec3d>* jerk, const double* const* vel) {
     const size_t nt = targets.size();
     ax.assign(nt, 0.0); ay.assign(nt, 0.0); az.assign(nt, 0.0);
     const bool want_tidal = (tidal != nullptr);
+    // A jerk needs source velocities: the tree's per-node vcom for multipoles and `vel` for
+    // leaves. Without either the request is silently a no-op rather than a wrong answer.
+    const bool want_jerk = (jerk != nullptr) && (vel != nullptr) && !T.vcom_x.empty();
     if (want_tidal) tidal->assign(nt, SymTensor3d{0,0,0,0,0,0});
+    if (jerk) jerk->assign(nt, Vec3d{0,0,0});
     const double theta2 = theta * theta;
     const int nb = (int)((nt + batch - 1) / batch);
 
@@ -439,6 +432,7 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
         double tx[512], ty[512], tz[512], te[512], oax[512], oay[512], oaz[512];
         double tmass[512], tzeta[512]; bool tgas[512];
         double ott[6][512];
+        double tvx[512], tvy[512], tvz[512], ojx[512], ojy[512], ojz[512];
         if (want_tidal) for (int c = 0; c < 6; ++c) for (int i = 0; i < (int)(hi-lo); ++i) ott[c][i] = 0;
         for (int i = 0; i < nb_; ++i) {
             uint32_t p = targets[lo + i];
@@ -446,6 +440,10 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             te[i]=P.soft.empty()?0.0:P.soft[p];
             tmass[i]=P.m[p]; tzeta[i]=have_zeta?P.zeta[p]:0.0; tgas[i]=P.is_gas(p);
             oax[i]=0; oay[i]=0; oaz[i]=0;
+            if (want_jerk) {
+                tvx[i]=vel[0][p]; tvy[i]=vel[1][p]; tvz[i]=vel[2][p];
+                ojx[i]=0; ojy[i]=0; ojz[i]=0;
+            }
         }
         const WNode* __restrict W = T.wn.data();
         int node = T.root;
@@ -479,9 +477,12 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                                 r, qm, te[i], qs, tzeta[i], qzeta,
                                 tmass[i], tgas[i] && qgas);
                             oax[i] += dx_*fac; oay[i] += dy_*fac; oaz[i] += dz_*fac;
-                            if (want_tidal) {
+                            if (want_tidal || want_jerk) {
                                 // base (zeta-free) force factor and the mode-2 factor, with the
-                                // same gas-gas averaging rule as the force itself
+                                // same gas-gas averaging rule as the force itself. Shared by the
+                                // tidal tensor and the jerk -- computing them once is exactly why
+                                // the reference accumulates the jerk here rather than in a
+                                // separate pass.
                                 double g1, g2;
                                 if (tgas[i] && qgas) {
                                     const double et = std::max(te[i],1e-300), es = std::max(qs,1e-300);
@@ -492,12 +493,23 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                                     g1 = qm*spline_force_over_r(r,e);
                                     g2 = qm*grav_tidal_factor(r,e);
                                 }
-                                ott[0][i] += -g1 + dx_*dx_*g2;   // xx
-                                ott[1][i] += -g1 + dy_*dy_*g2;   // yy
-                                ott[2][i] += -g1 + dz_*dz_*g2;   // zz
-                                ott[3][i] += dx_*dy_*g2;         // xy
-                                ott[4][i] += dy_*dz_*g2;         // yz
-                                ott[5][i] += dx_*dz_*g2;         // xz
+                                if (want_tidal) {
+                                    ott[0][i] += -g1 + dx_*dx_*g2;   // xx
+                                    ott[1][i] += -g1 + dy_*dy_*g2;   // yy
+                                    ott[2][i] += -g1 + dz_*dz_*g2;   // zz
+                                    ott[3][i] += dx_*dy_*g2;         // xy
+                                    ott[4][i] += dy_*dz_*g2;         // yz
+                                    ott[5][i] += dx_*dz_*g2;         // xz
+                                }
+                                if (want_jerk) {
+                                    // leaf source: its own velocity (forcetree.cc:1641)
+                                    const double dvx=vel[0][q]-tvx[i], dvy=vel[1][q]-tvy[i],
+                                                 dvz=vel[2][q]-tvz[i];
+                                    const double vdotr = dvx*dx_ + dvy*dy_ + dvz*dz_;
+                                    ojx[i] += g1*dvx - vdotr*g2*dx_;
+                                    ojy[i] += g1*dvy - vdotr*g2*dy_;
+                                    ojz[i] += g1*dvz - vdotr*g2*dz_;
+                                }
                             }
                         }
                     }
@@ -505,19 +517,32 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                     for (int i = 0; i < nb_; ++i) {
                         double e = std::max(te[i], (double)w.soft);
                         kick(w.cx-tx[i], w.cy-ty[i], w.cz-tz[i], w.mass, e, oax[i], oay[i], oaz[i]);
-                        if (want_tidal) {
+                        if (want_tidal || want_jerk) {
                             const double dx_=w.cx-tx[i], dy_=w.cy-ty[i], dz_=w.cz-tz[i];
                             const double r2 = dx_*dx_+dy_*dy_+dz_*dz_;
                             if (r2 > 0) {
                                 const double r = std::sqrt(r2), es = std::max(e,1e-300);
                                 const double g1 = w.mass*spline_force_over_r(r,es);
                                 const double g2 = w.mass*grav_tidal_factor(r,es);
-                                ott[0][i] += -g1 + dx_*dx_*g2;
-                                ott[1][i] += -g1 + dy_*dy_*g2;
-                                ott[2][i] += -g1 + dz_*dz_*g2;
-                                ott[3][i] += dx_*dy_*g2;
-                                ott[4][i] += dy_*dz_*g2;
-                                ott[5][i] += dx_*dz_*g2;
+                                if (want_tidal) {
+                                    ott[0][i] += -g1 + dx_*dx_*g2;
+                                    ott[1][i] += -g1 + dy_*dy_*g2;
+                                    ott[2][i] += -g1 + dz_*dz_*g2;
+                                    ott[3][i] += dx_*dy_*g2;
+                                    ott[4][i] += dy_*dz_*g2;
+                                    ott[5][i] += dx_*dz_*g2;
+                                }
+                                if (want_jerk) {
+                                    // node source: its centre-of-mass velocity, GIZMO's
+                                    // Extnodes[].vs (forcetree.cc:1945)
+                                    const double dvx=T.vcom_x[node]-tvx[i],
+                                                 dvy=T.vcom_y[node]-tvy[i],
+                                                 dvz=T.vcom_z[node]-tvz[i];
+                                    const double vdotr = dvx*dx_ + dvy*dy_ + dvz*dz_;
+                                    ojx[i] += g1*dvx - vdotr*g2*dx_;
+                                    ojy[i] += g1*dvy - vdotr*g2*dy_;
+                                    ojz[i] += g1*dvz - vdotr*g2*dz_;
+                                }
                             }
                         }
                     }
@@ -528,6 +553,8 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             }
         }
         for (int i = 0; i < nb_; ++i) { ax[lo+i]=G*oax[i]; ay[lo+i]=G*oay[i]; az[lo+i]=G*oaz[i]; }
+        if (want_jerk) for (int i = 0; i < nb_; ++i)
+            (*jerk)[lo+i] = Vec3d{G*ojx[i], G*ojy[i], G*ojz[i]};
         if (want_tidal) for (int i = 0; i < nb_; ++i) {
             SymTensor3d& tt = (*tidal)[lo+i];
             tt[0][0]=ott[0][i]; tt[1][1]=ott[1][i]; tt[2][2]=ott[2][i];

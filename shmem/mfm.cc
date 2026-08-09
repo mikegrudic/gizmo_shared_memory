@@ -812,7 +812,8 @@ void sync_all_positions(Sim& sim) {
 static void rebuild_tree(Sim& sim) {
     sync_all_positions(sim);
     const double* vel[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
-    sim.tree = build(sim.P, nullptr, vel);
+    // Per-node centre-of-mass velocities only when a Hermite jerk will ask for them.
+    sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0);
     sim.tree.t_since_build = 0.0;
     sim.tree_valid = true;
     ++sim.tree_builds;
@@ -852,6 +853,9 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.phi); sw(sim.a_grav); sw(sim.tidal); sw(sim.pending_half_kick);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
     sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.id);
+    sw(sim.min_sink_tapp); sw(sim.min_sink_tff); sw(sim.sink_dt_gas_cap);
+    sw(sim.herm_valid); sw(sim.herm_tick); sw(sim.herm_pos); sw(sim.herm_vel);
+    sw(sim.herm_acc); sw(sim.herm_jerk);
     sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
     sw(sim.work.moments_inv); sw(sim.work.signal_speed); sw(sim.work.div_vel);
     for (auto& g : sim.work.gradient)  sw(g);
@@ -868,6 +872,9 @@ static void pop_particle(Sim& sim) {
     pop(sim.phi); pop(sim.a_grav); pop(sim.tidal); pop(sim.pending_half_kick);
     pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
     pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.id);
+    pop(sim.min_sink_tapp); pop(sim.min_sink_tff); pop(sim.sink_dt_gas_cap);
+    pop(sim.herm_valid); pop(sim.herm_tick); pop(sim.herm_pos); pop(sim.herm_vel);
+    pop(sim.herm_acc); pop(sim.herm_jerk);
     pop(sim.dmom_x); pop(sim.dmom_y); pop(sim.dmom_z); pop(sim.denergy);
     pop(sim.work.moments_inv); pop(sim.work.signal_speed); pop(sim.work.div_vel);
     for (auto& g : sim.work.gradient)  pop(g);
@@ -911,6 +918,10 @@ static void sink_accretion_pass(Sim& sim) {
     std::vector<uint32_t> doomed;              // gas indices to remove, ascending
     std::vector<char> claimed(sim.n_gas, 0);   // a cell may only be swallowed once
     std::vector<uint32_t> ngb;
+    // Cells that reach the physical tests already inside the sink radius, and which test turns
+    // them away. Gas that keeps failing here is gas piling up on the sink -- the pileup that
+    // then goes self-gravitating and spawns a spurious second sink.
+    long long acc_inside = 0, acc_rej_res = 0, acc_rej_unbound = 0, acc_rej_angmom = 0;
 
     for (size_t sph = sim.n_gas; sph < sim.size(); ++sph) {
         drift_particle_to(sim, sph, sim.clock_ticks);
@@ -924,8 +935,11 @@ static void sink_accretion_pass(Sim& sim) {
             const Vec3d dx = min_image(sim.P.pos(j) - pos_s, sim.box);
             const double r = dx.norm();
             if (!(r > 0) || r > r_sink) continue;                // inside the fixed sink radius
+            if (diag) ++acc_inside;                              // reached the physical tests
             // the cell must be smaller than the sink it falls into (sink.cc:127)
-            if (std::pow(sim.ninv[j], 1.0/sim.dim) > r_sink * 1.396263) continue;
+            if (std::pow(sim.ninv[j], 1.0/sim.dim) > r_sink * 1.396263) {
+                if (diag) ++acc_rej_res; continue;
+            }
 
             const Vec3d dv{sim.vx[j] - sim.vx[sph], sim.vy[j] - sim.vy[sph],
                            sim.vz[j] - sim.vz[sph]};
@@ -934,15 +948,37 @@ static void sink_accretion_pass(Sim& sim) {
             // where GIZMO uses 3P/rho rather than 2u (sink.cc:116)
             const double cs_sq = (std::abs(sim.gamma - 1.0) < 0.1)
                                ? 3.0 * sim.press[j] / sim.rho[j] : 2.0 * sim.u[j];
-            // enclosed mass: the two bodies plus an isothermal-sphere gas interior (sink.cc:97)
-            const double m_eff = sim.P.m[sph] + sim.P.m[j] + 4.0*M_PI * r*r*r * sim.rho[j];
-            const double vesc_sq = 2.0 * sim.G * m_eff / r;
+            // Escape speed, sink_vesc (sink.cc:85-103). Two pieces that are easy to get wrong:
+            //   * m_eff carries an isothermal-sphere gas interior, 4 pi r^3 rho -- the Shu-type
+            //     self-gravity of the enclosed gas. It is gated on SINGLE_STAR_SINK_DYNAMICS
+            //     (sink.cc:92), NOT on COOLING, so it is always on for a STARFORGE run.
+            //   * the potential is SPLINE-SOFTENED on the sink's softening (sink.cc:103), so
+            //     inside that radius vesc is below Keplerian. Using a bare 1/r there overstates
+            //     vesc and swallows cells the reference does not.
+            const double m_eff = sim.P.m[sph] + sim.P.m[j]
+                               + 4.0*M_PI * r*r*r * sim.rho[j];
+            const double soft_s = std::max(sim.P.soft[sph], 1e-300);
+            double vesc_sq = 2.0 * sim.G * m_eff * std::abs(spline_potential(r, soft_s));
+            // The extra opacity-limited boost is the separately COOLING-gated one at
+            // sink.cc:128: re-estimate vesc from the enclosed gas alone when the cell sits at
+            // the bottom of a quasi-hydrostatic Larson core.
+            if (sim.opacity_limit_physics && sim.nh_per_code_density > 0) {
+                const double nH = sim.rho[j] * sim.nh_per_code_density;
+                if (nH > 1e13 && cs_sq > 0.01 * vrel_sq) {
+                    const double m_gas = 4.0*M_PI * r*r*r * sim.rho[j];
+                    vesc_sq = std::max(2.0 * sim.G * m_gas / r, vesc_sq);
+                }
+            }
             if (!(vesc_sq > 0)) continue;
-            if ((vrel_sq + cs_sq) / vesc_sq >= 1.0) continue;                    // unbound
+            if ((vrel_sq + cs_sq) / vesc_sq >= 1.0) {            // unbound
+                if (diag) ++acc_rej_unbound; continue;
+            }
             // Bate (1995): angular momentum small enough to actually reach the sink
             const double rv = dot(dx, dv);
             const double spec_mom_sq = r*r*vrel_sq - rv*rv;
-            if (spec_mom_sq >= sim.G * (sim.P.m[sph] + sim.P.m[j]) * r_sink) continue;
+            if (spec_mom_sq >= sim.G * (sim.P.m[sph] + sim.P.m[j]) * r_sink) {
+                if (diag) ++acc_rej_angmom; continue;
+            }
 
             // SWALLOW. Mass and momentum conserved exactly; the sink keeps its position (GIZMO
             // does not recentre single-star sinks) and absorbs the pair's momentum. Safe to apply
@@ -952,12 +988,22 @@ static void sink_accretion_pass(Sim& sim) {
             sim.vy[sph] = (sim.P.m[sph]*sim.vy[sph] + sim.P.m[j]*sim.vy[j]) / m_new;
             sim.vz[sph] = (sim.P.m[sph]*sim.vz[sph] + sim.P.m[j]*sim.vz[j]) / m_new;
             sim.P.m[sph] = m_new;
+            // The mass/velocity jump invalidates any Hermite snapshot: the sink falls back to
+            // KDK for one step and re-enters at its next sync (GIZMO's AccretedThisTimestep).
+            if (sph < sim.herm_valid.size()) sim.herm_valid[sph] = 0;
             claimed[j] = 1; doomed.push_back(j); ++sim.cells_accreted;
             if (diag)
                 fprintf(stderr, "[sink-eat] sink=%zu ate cell=%u r/r_sink=%.3g vrel/vesc=%.3g "
                         "M=%.6g\n", sph, j, r/r_sink,
                         std::sqrt((vrel_sq+cs_sq)/vesc_sq), m_new);
         }
+    }
+    if (diag && acc_inside > 0) {
+        static long long acalls = 0;
+        if ((acalls++ % 200) == 0 || (acc_inside > (long long)doomed.size() * 4 + 8))
+            fprintf(stderr, "[sink-acc] inside_r_sink=%lld eaten=%zu | rejected res=%lld "
+                    "unbound=%lld angmom=%lld\n", acc_inside, doomed.size(), acc_rej_res,
+                    acc_rej_unbound, acc_rej_angmom);
     }
     if (doomed.empty()) return;
     // Accretion is the one operation that moves mass BETWEEN particle types, so it is the one
@@ -979,6 +1025,314 @@ static void sink_accretion_pass(Sim& sim) {
     }
 }
 
+// SINGLE_STAR_TIMESTEPPING: per-particle minimum approach and freefall times to the SINK
+// population, the inputs to the two-body timestep criterion (gravity/forcetree.cc:1685-1699
+// leaf branch, :2012-2022 node branch; results stored at :2509-2510). GIZMO folds this into
+// the gravity walk with per-node sink summaries because its sink count can be large; here the
+// sinks are few (one in shu1977, hundreds in plummer_binaries), so a direct minimum over all
+// of them is cheaper than threading state through the walk AND exact where the node branch
+// approximates. Only ACTIVE particles are refreshed -- same cadence as GIZMO, which updates
+// P.Min_Sink_* when the particle does a gravity walk. Values persist for inactive particles.
+static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
+    const size_t n_part = sim.size();
+    if (sim.n_gas >= n_part) return;             // no non-gas particles at all
+    // the sinks: type-5 members of the non-gas suffix (a halo-only sim has none)
+    std::vector<uint32_t> sinks;
+    for (size_t j = sim.n_gas; j < n_part; ++j)
+        if (sim.P.type.empty() || sim.P.type[j] == 5) sinks.push_back((uint32_t)j);
+    if (sinks.empty()) return;
+    if (sim.min_sink_tapp.size() != n_part) sim.min_sink_tapp.assign(n_part, 1e300);
+    if (sim.min_sink_tff.size()  != n_part) sim.min_sink_tff.assign(n_part, 1e300);
+    // Distances must be measured at NOW: an inactive sink can be carrying a stale position
+    // under lazy drift. Few sinks, so serial catch-up is free.
+    if (sim.sparse_drift)
+        for (uint32_t j : sinks) drift_particle_to(sim, j, sim.clock_ticks);
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < active.size(); ++k) {
+        const uint32_t i = active[k];
+        double best_ta2 = 1e300, best_tff4 = 1e300;
+        const Vec3d pos_i = sim.P.pos(i);
+        const Vec3d vel_i{sim.vx[i], sim.vy[i], sim.vz[i]};
+        for (uint32_t j : sinks) {
+            if (j == i) continue;
+            const Vec3d dx = min_image(sim.P.pos(j) - pos_i, sim.box);
+            // softened separation: the larger of the two kernel-extent softenings, converted
+            // to its Plummer equivalent (KERNEL_FAC_FROM_FORCESOFT_TO_PLUMMER = 1/2.8), added
+            // in quadrature -- forcetree.cc:1686-1688
+            const double eps = std::max(sim.P.soft[j], sim.P.soft[i]) / 2.8;
+            const double r2s = dx.norm_sq() + eps * eps;
+            const Vec3d dv = Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]} - vel_i;
+            const double ta2 = r2s / (dv.norm_sq() + 1e-300);
+            const double mt = sim.P.m[j] + sim.P.m[i];
+            const double tff4 = r2s * r2s * r2s / (mt * mt);
+            if (ta2  < best_ta2)  best_ta2  = ta2;
+            if (tff4 < best_tff4) best_tff4 = tff4;
+        }
+        // t_approach = r_soft/|dv|; t_ff = sqrt(r_soft^3 / (G Mtot)) -- forcetree.cc:2509-2510
+        sim.min_sink_tapp[i] = std::sqrt(best_ta2);
+        sim.min_sink_tff[i]  = std::sqrt(std::sqrt(best_tff4) / sim.G);
+    }
+
+    // SINK-GAS coupling (core/timestep.cc:1002-1026). A sink parked in dense collapsing gas must
+    // not sit bins above the cells it is about to swallow. The reference collects these in the
+    // sink's density loop (hydro/density.cc:404: min gas TimeBin, nearest gas distance;
+    // sinks/sink_environment.cc:212: kernel-mean relative gas velocity); here an expanding
+    // neighbour search around each ACTIVE sink plays that role. Three caps, combined into one
+    // per-sink dt ceiling used by desired_dt:
+    //   * wakeup:  dt <= 1.01 * 4.1 * dt(shortest-step gas neighbour)
+    //   * freefall: dt <= 1.01 * sqrt(2 eta eps^3 / (G M_sink))
+    //   * Courant:  dt <= 1.01 * CourantFac * L_sink / v_sig(surrounding gas)
+    if (sim.n_gas > 0 && sim.n_gas < n_part) {
+        if (sim.sink_dt_gas_cap.size() != n_part) sim.sink_dt_gas_cap.assign(n_part, 1e300);
+        static thread_local std::vector<uint32_t> ngb;
+        for (uint32_t s : sinks) {
+            if (!sim.is_active(s)) continue;
+            const Vec3d pos_s = sim.P.pos(s);
+            // expanding search: start at the sink's own scales, double until enough gas found
+            double radius = std::max({sim.P.soft[s],
+                                      sim.sink_radius.empty() ? 0.0 : sim.sink_radius[s],
+                                      1e-30});
+            size_t n_gas_found = 0;
+            for (int tries = 0; tries < 40; ++tries) {
+                ngb.clear();
+                ngb_search(sim.tree, sim.P, pos_s, radius, ngb, sim.box, sim.lazy());
+                n_gas_found = 0;
+                for (uint32_t j : ngb) if (j < sim.n_gas) ++n_gas_found;
+                if (n_gas_found >= 32) break;
+                radius *= 2.0;
+            }
+            if (n_gas_found == 0) { sim.sink_dt_gas_cap[s] = 1e300; continue; }
+            int deepest_bin = 0;
+            double dr_nearest = 1e300, m_sum = 0.0, cs2_sum = 0.0;
+            Vec3d mv_rel{0, 0, 0};
+            const Vec3d vel_s{sim.vx[s], sim.vy[s], sim.vz[s]};
+            for (uint32_t j : ngb) {
+                if (j >= sim.n_gas) continue;
+                const double r = min_image(sim.P.pos(j) - pos_s, sim.box).norm();
+                dr_nearest = std::min(dr_nearest, r);
+                deepest_bin = std::max(deepest_bin, sim.bin[j]);
+                const double m = sim.P.m[j];
+                m_sum += m;
+                mv_rel += (Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]} - vel_s) * m;
+                const double cs = sound_speed(sim, j);
+                cs2_sum += m * cs * cs;
+            }
+            const double dt_wake = 4.1 * sim.dt_of_bin(deepest_bin);
+            // eps = max(kernel-core softening, nearest gas dr, sink radius, cell size);
+            // L_sink = the volume-equivalent size of the kernel the search settled on
+            const double L_sink = 1.61199 * radius / std::cbrt((double)n_gas_found);
+            double eps = std::max(0.5 * sim.P.soft[s], dr_nearest);
+            if (!sim.sink_radius.empty()) eps = std::max(eps, sim.sink_radius[s]);
+            eps = std::max(eps, L_sink);
+            const double dt_ff = std::sqrt(2.0 * sim.eta_grav * eps * eps * eps
+                                           / (sim.G * sim.P.m[s] + 1e-300));
+            const double vsig = std::sqrt((mv_rel / m_sum).norm_sq() + cs2_sum / m_sum);
+            const double dt_cour = sim.cfl * L_sink / (vsig + 1e-300);
+            sim.sink_dt_gas_cap[s] =
+                1.01 * std::min({dt_wake, dt_ff, dt_cour});
+        }
+    }
+}
+
+// ---- HERMITE_INTEGRATION: 4th-order predict-evaluate-correct for sinks ----------------------
+
+static inline bool hermite_type_ok(const Sim& sim, size_t i) {
+    return sim.hermite_mask != 0 && !sim.P.type.empty() &&
+           (sim.hermite_mask & (1 << sim.P.type[i]));
+}
+
+// eligible_for_hermite (core/kicks.cc:104): a freshly-formed sink integrates with plain KDK
+// for its first couple of steps while its neighbourhood settles. The AccretedThisTimestep
+// fallback of the reference is mechanical here: a swallow invalidates the snapshot, which
+// forces one KDK step before Hermite re-entry.
+static inline bool hermite_eligible(const Sim& sim, size_t i, double dt) {
+    if (!hermite_type_ok(sim, i)) return false;
+    if (i < sim.sink_tform.size() && sim.sink_tform[i] > 0 &&
+        sim.sink_tform[i] >= sim.time_now() - 2.0 * dt) return false;
+    return true;
+}
+
+// acc and jerk on a test state (x, v), direct-summed over every other particle with the same
+// softened pair kernel as the tree walk (max-softening rule -- Hermite targets are sinks,
+// never a gas-gas pair). The jerk term is forcetree.cc:2266,
+//     jerk += g1 * dv - (dv . dr) * g2 * dr,
+// with g1/g2 the first/second kernel derivatives. The reference computes this inside the
+// gravity walk, approximating distant sources by node centre-of-mass velocities; direct
+// summation is exact where that approximates, and the sink counts here (one to a few hundred)
+// make it affordable. Sources are lazily caught up so distances are measured at NOW; their
+// stored leapfrog velocities stand in for GIZMO's predicted velocities -- the difference is
+// half a kick, and it enters only the jerk's own error term.
+// Acceleration AND jerk for a set of targets, from one tree traversal -- the reference's
+// COMPUTE_JERK_IN_GRAVTREE (forcetree.cc:2266), where the jerk rides along in the walk that is
+// already computing the force and reuses its kernel factors. The targets must already hold the
+// state to evaluate at (positions in P, velocities in sim.vx/vy/vz), exactly as
+// do_hermite_prediction writes its prediction into P before the HermiteOnlyFlag=2 walk.
+//
+// This replaced a direct summation over every particle. That version was correct and simpler,
+// but it cost O(N_target * N_total) per sync against the walk's O(N_target log N) -- ~10x on
+// 512 particles and unusable for a run with real gas counts, since every sink would sum over
+// every cell twice per step.
+static void hermite_eval_group(Sim& sim, const std::vector<uint32_t>& targets,
+                               std::vector<double>& ax, std::vector<double>& ay,
+                               std::vector<double>& az, std::vector<Vec3d>& jerk) {
+    const double* vel_arrays[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
+    const LazyDrift ld = lazy_drift_hook(sim);
+    accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az,
+                  nullptr, nullptr, sim.lazy_drift_on ? &ld : nullptr, &jerk, vel_arrays);
+}
+
+// Runs immediately after the gravity kick loop. KDK ran for EVERYONE, exactly as in GIZMO,
+// where do_hermite_prediction/correction (run.cc:173-177) OVERWRITE the kick results for
+// eligible particles -- robustness on eligibility loss (a swallow, a fresh sink) comes free
+// because the KDK trajectory is always there underneath. One difference in bookkeeping: after
+// our kick loop a particle's stored velocity is half-kicked INTO its next step
+// (pending_half_kick). The true velocity at the sync is recovered by undoing that half-kick
+// with the same acceleration the kick used, and the half-kick is re-applied to whatever
+// velocity Hermite settles on -- so the sink can drop back to KDK at any sync with its
+// leapfrog state intact, and the redo cancels exactly at the next sync's undo.
+// SHMEM_HERMITE_DIAG counters: how often the elapsed Hermite interval differs from the step
+// that was assigned when the snapshot was taken. Reported once at exit.
+static long long hermite_h_mismatch = 0, hermite_h_match = 0;
+static double hermite_h_mismatch_max = 0.0;
+static const bool hermite_diag = getenv("SHMEM_HERMITE_DIAG") != nullptr;
+
+void hermite_report() {
+    if (!hermite_diag) return;
+    const long long tot = hermite_h_match + hermite_h_mismatch;
+    if (tot > 0)
+        fprintf(stderr, "[hermite-h] steps=%lld  interval != assigned dt in %lld (%.3f%%), "
+                "max rel deviation %.4g\n", tot, hermite_h_mismatch,
+                100.0 * (double)hermite_h_mismatch / (double)tot, hermite_h_mismatch_max);
+}
+
+static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
+                         const std::vector<double>& dt_of) {
+    if (sim.hermite_mask == 0 || sim.P.type.empty()) return;
+    const size_t n_part = sim.size();
+    if (sim.herm_valid.size() != n_part) {
+        sim.herm_valid.assign(n_part, 0);
+        sim.herm_tick.assign(n_part, 0);
+        sim.herm_pos.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_vel.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_acc.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_jerk.assign(n_part, Vec3d{0, 0, 0});
+    }
+    std::vector<uint32_t> targets;
+    for (size_t k = 0; k < active.size(); ++k) {
+        const uint32_t i = active[k];
+        if (i >= sim.n_gas && hermite_type_ok(sim, i)) targets.push_back(i);
+    }
+    if (targets.empty()) return;
+
+    // PHASED, exactly as the reference orders it (run.cc:173-177): predict EVERYONE, then
+    // evaluate, then correct -- with a barrier between each. A fused per-target loop races on
+    // binary partners: one thread evaluates its sink's jerk while the other is mid-overwrite of
+    // the partner's position and velocity, and the pair sees an inconsistent mixture of pre-
+    // and post-correction states. The phasing also means every evaluation sees its partner at
+    // the PREDICTED state, which is what the corrector's error analysis assumes.
+    const size_t nt = targets.size();
+    std::vector<Vec3d> vel_true(nt);
+    std::vector<uint8_t> stepping(nt, 0), eligible(nt, 0);
+
+    // Phase A: undo the forward half-kick; write PREDICTED pos/vel for the stepping targets so
+    // the walk sees every pair member at the same moment (GIZMO's do_hermite_prediction).
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < nt; ++k) {
+        const uint32_t i = targets[k];
+        const double dt_new = dt_of[i];
+        const Vec3d half_kick = sim.a_grav[i] * (0.5 * dt_new);
+        vel_true[k] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]} - half_kick;
+        eligible[k] = hermite_eligible(sim, i, dt_new) ? 1 : 0;
+        // The interval is what the CLOCK says elapsed since the snapshot, never a stored dt.
+        const double h_elapsed = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
+        // SHMEM_HERMITE_DIAG quantifies how often the elapsed interval differs from the step
+        // that was ASSIGNED when the snapshot was taken -- i.e. how badly the earlier
+        // store-a-dt version was wrong. Zero mismatches would mean that bug was inert here.
+        if (hermite_diag && sim.herm_valid[i] && h_elapsed > 0) {
+            const double assigned = dt_of[i];
+            const double rel = std::abs(h_elapsed - assigned) / h_elapsed;
+            if (rel > 1e-9) {
+                #pragma omp atomic
+                ++hermite_h_mismatch;
+                #pragma omp critical(shmem_hermite_diag)
+                if (rel > hermite_h_mismatch_max) hermite_h_mismatch_max = rel;
+            } else {
+                #pragma omp atomic
+                ++hermite_h_match;
+            }
+        }
+        if (sim.herm_valid[i] && eligible[k] && h_elapsed > 0) {
+            stepping[k] = 1;
+            const double h = h_elapsed;
+            const Vec3d x0 = sim.herm_pos[i], v0 = sim.herm_vel[i];
+            const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
+            // predictor (kicks.cc:147-148)
+            Vec3d xp = x0 + (v0 + (a0 + j0 * (h / 3.0)) * (h / 2.0)) * h;
+            const Vec3d vp = v0 + (a0 + j0 * (h / 2.0)) * h;
+            if (sim.box > 0) xp = fold_into_box(xp, sim.box);
+            sim.P.x[i] = xp[0]; sim.P.y[i] = xp[1]; sim.P.z[i] = xp[2];
+            sim.vx[i] = vp[0];  sim.vy[i] = vp[1];  sim.vz[i] = vp[2];
+            sim.last_drift[i] = sim.clock_ticks;
+        } else {
+            // not stepping, but the walk below is over ALL targets: leave it at its true state
+            sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
+        }
+    }
+    // Phase B: ONE walk over the whole target set at the predicted states -- the reference's
+    // HermiteOnlyFlag=2 gravity_tree() call (run.cc:174-176).
+    std::vector<uint32_t> stepping_targets;
+    for (size_t k = 0; k < nt; ++k) if (stepping[k]) stepping_targets.push_back(targets[k]);
+    std::vector<double> ax, ay, az;
+    std::vector<Vec3d> jk;
+    if (!stepping_targets.empty())
+        hermite_eval_group(sim, stepping_targets, ax, ay, az, jk);
+    // Phase C: correct (kicks.cc:166-167).
+    {
+        size_t s = 0;
+        for (size_t k = 0; k < nt; ++k) {
+            if (!stepping[k]) continue;
+            const uint32_t i = targets[k];
+            const double h = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
+            const Vec3d v0 = sim.herm_vel[i], x0 = sim.herm_pos[i];
+            const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
+            const Vec3d a1{ax[s], ay[s], az[s]}, j1 = jk[s];
+            ++s;
+            vel_true[k] = v0 + (a0 + a1) * (h * 0.5) + (j0 - j1) * (h * h / 12.0);
+            Vec3d pos_c = x0 + (vel_true[k] + v0) * (h * 0.5) + (a0 - a1) * (h * h / 12.0);
+            if (sim.box > 0) pos_c = fold_into_box(pos_c, sim.box);
+            sim.P.x[i] = pos_c[0]; sim.P.y[i] = pos_c[1]; sim.P.z[i] = pos_c[2];
+            sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
+        }
+    }
+    // Phase D: one more walk, at the settled mutually-consistent states, to open the next
+    // interval -- the reference's start-of-next-step walk (run.cc:94).
+    std::vector<uint32_t> eligible_targets;
+    for (size_t k = 0; k < nt; ++k) if (eligible[k]) eligible_targets.push_back(targets[k]);
+    if (!eligible_targets.empty()) {
+        hermite_eval_group(sim, eligible_targets, ax, ay, az, jk);
+        size_t s = 0;
+        for (size_t k = 0; k < nt; ++k) {
+            const uint32_t i = targets[k];
+            if (!eligible[k]) { sim.herm_valid[i] = 0; continue; }
+            sim.herm_pos[i] = sim.P.pos(i);  sim.herm_vel[i] = vel_true[k];
+            sim.herm_acc[i] = Vec3d{ax[s], ay[s], az[s]};
+            sim.herm_jerk[i] = jk[s];
+            ++s;
+            sim.herm_tick[i] = sim.clock_ticks;  sim.herm_valid[i] = 1;
+        }
+    } else {
+        for (size_t k = 0; k < nt; ++k) sim.herm_valid[targets[k]] = 0;
+    }
+    // Phase E: hand the leapfrog state back (pending_half_kick is already 0.5*dt_new): stored
+    // velocity is half-kicked into the next step, for the drift prediction and any KDK fallback.
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < nt; ++k) {
+        const uint32_t i = targets[k];
+        const Vec3d vel_store = vel_true[k] + sim.a_grav[i] * (0.5 * dt_of[i]);
+        sim.vx[i] = vel_store[0]; sim.vy[i] = vel_store[1]; sim.vz[i] = vel_store[2];
+    }
+}
+
 // Test every active gas cell and convert those that pass. Serial: formation is rare (shu1977
 // forms exactly one), and the conversion reorders the arrays, so it must not race the step.
 static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_gas,
@@ -993,9 +1347,19 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
     // is exactly the wrong move.
     static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
     enum Veto { V_DENS=0, V_TSFR, V_DIVV, V_VIRIAL, V_JEANS, V_TIDAL, V_DENSMAX, V_NEARSINK,
-                V_PASS, V_NUM };
+                V_SINKTIME, V_PASS, V_NUM };
     long long veto[V_NUM] = {0};
     double rho_max_seen = 0.0, alpha_min_seen = 1e300;
+    // criterion-16 inputs actually seen this sync: the smallest sink infall time among cells
+    // that reached the test, and the tsfr it was compared against. 1e300 here means the
+    // min_sink_* arrays are not carrying live values -- which is invisible from the veto count.
+    double tsink_min_seen = 1e300, tsfr_at_min = 0.0;
+    long long crit16_unavailable = 0;
+    // Independent of whether any cell reaches criterion 16: is sink_timestep_pass actually
+    // filling these arrays for gas? A 1e300 here means the criterion is dead on arrival.
+    double tff_min_all = 1e300;
+    if (diag && sim.min_sink_tff.size() == n_part)
+        for (uint32_t g : active_gas) tff_min_all = std::min(tff_min_all, sim.min_sink_tff[g]);
 
     std::vector<uint32_t> candidates;
     for (size_t k = 0; k < active_gas.size(); ++k) {
@@ -1100,6 +1464,32 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
                 if (d < sim.h[i] || d < std::max(sim.P.soft[sph], 0.0)) { near_sink = true; break; }
             }
             if (near_sink) { ++veto[V_NEARSINK]; continue; }
+            // ... and the opacity-limit floor: closer to a sink than the size of a Larson core
+            // means the core belongs to that protostar. Guarded exactly as the reference guards
+            // it -- #if (defined(COOLING) || defined(EOS_GMC_BAROTROPIC)) at sfr_eff.cc:347.
+            // NOT implied by SINGLE_STAR_STARFORGE_DEFAULTS: COOLING is defined in the HYBRID
+            // block (precompiler_logic.h:316), not the STARFORGE one (359-453), so an
+            // EOS_ENFORCE_ADIABAT run like shu1977 must not apply this at all.
+            if (sim.opacity_limit_physics && sim.length_to_au > 0) {
+                double d_min = 1e300;
+                for (size_t sph = sim.n_gas; sph < n_part; ++sph)
+                    d_min = std::min(d_min,
+                                     min_image(sim.P.pos(sph) - sim.P.pos(i), sim.box).norm());
+                if (d_min * sim.length_to_au < 0.1) { ++veto[V_NEARSINK]; continue; }
+            }
+        }
+
+        // (16) the cell must collapse on its OWN faster than it falls into the nearest sink
+        // (sfr_eff.cc:352-354). Without this, gas sitting inside an existing sink's accretion
+        // radius -- which is being eaten, just not this instant -- can pass every other test and
+        // spawn a second sink on top of the first. shu1977 formed three that way once the sink
+        // took Hermite-length steps and stopped clearing its neighbourhood every sync.
+        if (!sim.min_sink_tapp.empty() && sim.min_sink_tapp.size() == n_part) {
+            const double t_sink = std::min(sim.min_sink_tapp[i], sim.min_sink_tff[i]);
+            if (diag && t_sink < tsink_min_seen) { tsink_min_seen = t_sink; tsfr_at_min = tsfr; }
+            if (t_sink < tsfr) { ++veto[V_SINKTIME]; continue; }
+        } else if (diag) {
+            ++crit16_unavailable;
         }
 
         ++veto[V_PASS];
@@ -1110,12 +1500,15 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         if ((calls++ % 200) == 0 || veto[V_PASS])
             fprintf(stderr, "[sink-diag] nact_gas=%zu rho_max=%.4g (thresh %.4g, ratio %.3g) "
                     "alpha_min=%.4g | dens=%lld tsfr=%lld divv=%lld virial=%lld jeans=%lld "
-                    "tidal=%lld densmax=%lld nearsink=%lld PASS=%lld\n",
+                    "tidal=%lld densmax=%lld nearsink=%lld sinktime=%lld PASS=%lld "
+                    "| t_sink_min=%.4g vs tsfr=%.4g unavail=%lld tff_min_all=%.4g\n",
                     active_gas.size(), rho_max_seen, sim.crit_phys_density,
                     rho_max_seen/sim.crit_phys_density,
                     (alpha_min_seen>1e299 ? -1.0 : alpha_min_seen),
                     veto[V_DENS], veto[V_TSFR], veto[V_DIVV], veto[V_VIRIAL], veto[V_JEANS],
-                    veto[V_TIDAL], veto[V_DENSMAX], veto[V_NEARSINK], veto[V_PASS]);
+                    veto[V_TIDAL], veto[V_DENSMAX], veto[V_NEARSINK], veto[V_SINKTIME],
+                    veto[V_PASS], tsink_min_seen, tsfr_at_min, crit16_unavailable,
+                    tff_min_all);
     }
 
     // Convert. Descending order so that swapping with the shrinking gas prefix cannot disturb a
@@ -1135,21 +1528,62 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         // raised as n^(1/5) once the gas is opacity-limited.
         if (sim.sink_radius.size() != sim.size()) sim.sink_radius.resize(sim.size(), 0.0);
         double cs_sink = 0.2 / std::max(sim.vel_to_kms, 1e-300);
-        if (sim.nh_per_code_density > 0) {
+        // cs ~ n^(1/5) once opacity-limited -- but ONLY with COOLING or a GMC barotrope
+        // (sfr_eff.cc:604). An EOS_ENFORCE_ADIABAT run has neither, and applying it there
+        // shrinks the Jeans term for no reason.
+        if (sim.opacity_limit_physics && sim.nh_per_code_density > 0) {
             const double nH = sim.rho[last_gas] * sim.nh_per_code_density;
             if (nH > 1e10) cs_sink *= std::pow(nH / 1e10, 0.2);
         }
+        // The FLOOR is the sink's own force-softening kernel radius -- ForceSoftening_KernelRadius
+        // of the (already type-5) particle, sfr_eff.cc:608 -- NOT the progenitor cell's SPH
+        // smoothing length. Flooring on h made the accretion radius 1.78x the reference's on
+        // shu1977 (1.83e-5 vs 1.02e-5), which opens an annulus between the near-sink formation
+        // veto (max(h_gas, ForceSoftening[5])) and the accretion radius: gas there is nominally
+        // the sink's to eat, is exempt from the veto, and piles up.
+        const double soft_floor = sim.P.soft[last_gas] > 0 ? sim.P.soft[last_gas]
+                                                           : sim.h[last_gas];
         sim.sink_radius[last_gas] = std::max(0.79 * sim.P.m[last_gas] * sim.G / (cs_sink*cs_sink),
-                                             sim.h[last_gas]);
-        printf("shmem-GIZMO: sink radius = %.6g (h was %.6g)\n",
-               sim.sink_radius[last_gas], sim.h[last_gas]);
+                                             soft_floor);
+        printf("shmem-GIZMO: sink radius = %.6g (jeans term %.6g, softening floor %.6g)\n",
+               sim.sink_radius[last_gas],
+               0.79 * sim.P.m[last_gas] * sim.G / (cs_sink*cs_sink), soft_floor);
         if (sim.sink_tform.size() != sim.size()) sim.sink_tform.resize(sim.size(), 0.0);
         if (sim.sink_m0.size()    != sim.size()) sim.sink_m0.resize(sim.size(), 0.0);
         sim.sink_tform[last_gas] = sim.time_now();
         sim.sink_m0[last_gas]    = sim.P.m[last_gas];
+        // A brand-new sink starts on the DEEPEST occupied bin (core/timestep.cc:1023-1027):
+        // its first accretion happens immediately and must be resolved. Deepening is always a
+        // legal bin move, so this needs no alignment check.
+        if (sim.individual_timesteps) {
+            int deepest = 0;
+            for (size_t q = 0; q < sim.size(); ++q) deepest = std::max(deepest, (int)sim.bin[q]);
+            sim.bin[last_gas] = std::max((int)sim.bin[last_gas], deepest);
+        }
         ++sim.sinks_formed;
         printf("shmem-GIZMO: sink formed from cell %zu (m=%.6g, rho=%.6g); %lld total\n",
                last_gas, sim.P.m[last_gas], sim.rho[last_gas], sim.sinks_formed);
+        // Why did the sink-proximity criteria let this through? Print the quantities they test,
+        // so a spurious second sink is diagnosable from the run log rather than by re-deriving
+        // it from a snapshot afterwards.
+        if (sim.sinks_formed > 1) {
+            double d_near = 1e300; size_t which = 0;
+            for (size_t s2 = sim.n_gas; s2 < sim.size(); ++s2) {
+                if (s2 == last_gas) continue;
+                const double d = min_image(sim.P.pos(s2) - sim.P.pos(last_gas), sim.box).norm();
+                if (d < d_near) { d_near = d; which = s2; }
+            }
+            const double tapp = (sim.min_sink_tapp.size() == sim.size())
+                              ? sim.min_sink_tapp[last_gas] : -1.0;
+            const double tff  = (sim.min_sink_tff.size() == sim.size())
+                              ? sim.min_sink_tff[last_gas]  : -1.0;
+            fprintf(stderr, "[sink-why] d_nearest=%.4g (veto radius max(h=%.4g, soft=%.4g)) "
+                    "r_sink_of_neighbour=%.4g | min_sink_tapp=%.4g min_sink_tff=%.4g "
+                    "arrays_sized=%d\n",
+                    d_near, sim.h[last_gas], sim.P.soft[which],
+                    sim.sink_radius.empty() ? -1.0 : sim.sink_radius[which], tapp, tff,
+                    (int)(sim.min_sink_tapp.size() == sim.size()));
+        }
         fflush(stdout);
     }
     // Any conversion PERMUTES the particle arrays, so everything keyed by particle index is stale:
@@ -1195,7 +1629,10 @@ void set_time_base(Sim& sim, double interval, double max_step) {
 }
 
 // Per-criterion timestep values, filled by desired_dt for diagnostics.
-struct DtParts { double cfl = 1e300, accel = 1e300, tidal = 1e300, selfgrav = 1e300; };
+struct DtParts {
+    double cfl = 1e300, accel = 1e300, tidal = 1e300, selfgrav = 1e300, sink2body = 1e300,
+           sinkgas = 1e300;
+};
 static double desired_dt(const Sim& sim, size_t i, DtParts* parts = nullptr);
 
 void print_timebins(const Sim& sim, double systemstep, double time) {
@@ -1272,8 +1709,8 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
                        sim.work.signal_speed[i], sim.h[i]/(sim.work.signal_speed[i]+1e-300),
                        sim.P.x[i], sim.P.y[i]);
                 printf("            dt: cfl=%.3e accel=%.3e tidal=%.3e selfgrav=%.3e "
-                       "soft=%.3e |a|=%.3e\n", dp.cfl, dp.accel, dp.tidal, dp.selfgrav,
-                       sim.P.soft[i], sim.a_grav[i].norm());
+                       "sink=%.3e soft=%.3e |a|=%.3e\n", dp.cfl, dp.accel, dp.tidal,
+                       dp.selfgrav, dp.sink2body, sim.P.soft[i], sim.a_grav[i].norm());
             }
             shown = 0;
             for (size_t i = 0; i < sim.size() && shown < 2; ++i) {
@@ -1328,6 +1765,41 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                 }
                 dt = std::min(dt, dt_tidal);
             }
+        }
+        // SINGLE_STAR_TIMESTEPPING (core/timestep.cc:451-486). For a SINK, the two-body
+        // criterion: the harmonic mean of the approach and freefall times to the nearest-in-
+        // time other sink, so binaries advance in lock-step through pericentre. For GAS, the
+        // FB_TIMESTEPLIMIT approach-time cap (timestep.cc:483; the reference test builds
+        // define SINGLE_STAR_FB_TIMESTEPLIMIT via the STARFORGE feedback bundle).
+        if (sim.min_sink_tapp.size() == sim.size() && sim.min_sink_tapp[i] < 1e299) {
+            if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5) {
+                double dt_2body = std::sqrt(2.0 * sim.eta_grav) * 0.3
+                    / (1.0 / sim.min_sink_tapp[i] + 1.0 / sim.min_sink_tff[i]);
+                // Hermite tolerates a longer 2-body step (timestep.cc:456): the 0.3 safety
+                // factor is a leapfrog need, not a Hermite one.
+                if (hermite_eligible(sim, i, dt)) dt_2body /= 0.3;
+                if (parts) parts->sink2body = dt_2body;
+                dt = std::min(dt, dt_2body);
+            } else if (gas) {
+                // (sink-gas caps for the sink itself are applied below, outside this
+                // other-sinks-exist guard: a LONE sink still needs its gas coupling)
+                const double dt_app = 0.5 * sim.cfl * sim.min_sink_tapp[i];
+                if (parts) parts->sink2body = dt_app;
+                dt = std::min(dt, dt_app);
+            }
+        }
+        // Hermite earns a longer step overall -- timestep.cc:477, "gives 10^-6 energy error
+        // per orbit for a 0.9 eccentricity binary". Applied before the sink-gas ceiling, as
+        // in the reference's ordering.
+        if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5 &&
+            hermite_eligible(sim, i, dt)) dt *= 1.4;
+        // Sink-gas ceiling (wakeup/freefall/Courant vs the surrounding gas). Deliberately
+        // OUTSIDE the min_sink_tapp guard: a lone sink -- shu1977 -- sees no other sink and
+        // skips the block above, but must still not sit bins above the gas it is swallowing.
+        if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5 &&
+            sim.sink_dt_gas_cap.size() == sim.size()) {
+            if (parts) parts->sinkgas = sim.sink_dt_gas_cap[i];
+            dt = std::min(dt, sim.sink_dt_gas_cap[i]);
         }
     }
     return dt;
@@ -1493,6 +1965,10 @@ double mfm_step(Sim& sim, double dt_max) {
     if (sim.gravity_on) compute_gravity(sim, tree, active);
     const double t_grav = profile ? lap() : 0.0;
 
+    // Refresh the sink approach/freefall minima for the actives before dt is chosen -- same
+    // ordering as GIZMO, where these ride along in the gravity walk that precedes get_timestep.
+    if (sim.gravity_on) sink_timestep_pass(sim, active);
+
     // ---- timestep ----
     std::vector<double>& dt_of = sim.dt_of;      // reused: allocating N doubles per sync is not free
     dt_of.resize(n_part);
@@ -1628,6 +2104,10 @@ double mfm_step(Sim& sim, double dt_max) {
         // The predicted primitives carry velocity, so re-predict after the kick rather than
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
         // scale and adds no jump across a face).
+
+        // Hermite overwrite for eligible sinks, on top of the kicks just applied -- the same
+        // ordering as GIZMO's run loop (kicks, then prediction/correction, run.cc:167-177).
+        hermite_pass(sim, active, dt_of);
     }
 
     const double t_bins = profile ? lap() : 0.0;

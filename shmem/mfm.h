@@ -136,6 +136,10 @@ struct Sim {
     bool   sink_formation = false;     // SINGLE_STAR_SINK_FORMATION present in the config
     double mass_to_solar = 1.0;        // code mass -> Msun (UnitMass_in_g / 1.989e33)
     double vel_to_kms = 1.0;           // code velocity -> km/s (UnitVelocity_in_cm_per_s / 1e5)
+    // code length -> AU, for the 0.1 AU Larson-core floor on sink formation (sfr_eff.cc:348)
+    double length_to_au = 0.0;
+    // COOLING || EOS_GMC_BAROTROPIC -- the reference's guard on that floor (sfr_eff.cc:347).
+    bool opacity_limit_physics = false;
     double crit_phys_density = 0.0;    // PhysDensThresh, code units (CritPhysDensity / n_H per rho)
     double max_sfr_timescale = 0.0;    // MaxSfrTimescale, code units
     // Rolling time average of 1/(1+alpha_vir), for the &2048 time-averaged virial criterion. A
@@ -153,6 +157,28 @@ struct Sim {
     // (In the legacy global-timestep A/B mode time_now() is 0, so tform reads 0 there.)
     std::vector<double> sink_tform;
     std::vector<double> sink_m0;
+    // SINGLE_STAR_TIMESTEPPING: per-particle minimum approach / freefall time to the sink
+    // population (gravity/forcetree.cc:2509-2510), refreshed for active particles each sync.
+    // 1e300 = "no sink seen"; feeds the two-body sink criterion and the gas approach cap.
+    std::vector<double> min_sink_tapp;
+    std::vector<double> min_sink_tff;
+    // Sink-gas dt ceiling (wakeup + freefall + Courant caps, core/timestep.cc:1002-1026),
+    // refreshed per active sink from a gas-neighbour scan. 1e300 = no gas nearby.
+    std::vector<double> sink_dt_gas_cap;
+    // HERMITE_INTEGRATION (core/kicks.cc:104-177): 4th-order predict-evaluate-correct for the
+    // types in hermite_mask (STARFORGE default: 32 = sinks). herm_* is the snapshot of the
+    // TRUE dynamical state at the particle's last sync; herm_dt the step it opens. A snapshot
+    // is invalidated by accretion (GIZMO's AccretedThisTimestep fallback) and rebuilt at the
+    // next sync, so KDK always remains valid underneath.
+    int hermite_mask = 0;
+    std::vector<uint8_t>   herm_valid;
+    // The TICK the snapshot was taken at, not the step length that was expected to follow.
+    // GIZMO derives the Hermite interval from integer times (kicks.cc:134-138,
+    // tstart = Ti_begstep, tend = tstart + ti_step); storing a dt instead is wrong whenever the
+    // step actually taken differs from the one assigned -- which happens on every snapshot
+    // boundary (dt_of is min(bin step, dt_cap)) and on every Saitoh-Makino wake-up.
+    std::vector<long long> herm_tick;
+    std::vector<Vec3d>     herm_pos, herm_vel, herm_acc, herm_jerk;
     // Particle IDs live HERE rather than beside the driver: sink formation swaps particles and
     // accretion deletes them, so anything parallel to the particle arrays has to be permuted with
     // them or the snapshot silently mislabels every particle after the first event.
@@ -310,6 +336,7 @@ void sync_all_positions(Sim& sim);
 //   <          the longest-step bin that is active, i.e. what sets the system step
 //   cumulative particles in this bin and every shorter one -- the count actually being integrated
 //              at that level and below
+void hermite_report();
 void print_timebins(const Sim& sim, double systemstep, double time);
 
 // Diagnostics used by the tests.

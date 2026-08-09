@@ -49,6 +49,36 @@ struct Particles {                 // SoA: the walk reads x/y/z/m for many parti
     bool is_gas(size_t i) const { return type.empty() || type[i] == 0; }
 };
 
+// (1/r) d(phi)/dr for cubic-spline softening -- GIZMO's kernel_gravity(mode=1), mesh/kernel.h.
+// Multiply by the offset vector to get the acceleration. Exactly Newtonian for r >= h, which
+// Plummer softening never is (0.35 of Newtonian at r=eps, 0.72 at 2eps, 0.86 at 3eps): with
+// adaptive softening that under-counts gravity across a whole neighbourhood rather than only
+// below the resolution limit, and in Evrard it suppressed the central density ~2x. Sits beside
+// grav_tidal_factor because the two are always used together -- force, tidal tensor and jerk
+// all come from the same pair of kernel derivatives.
+static inline double spline_force_over_r(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double h_inv3 = h_inv * h_inv * h_inv;
+    const double u = r * h_inv;
+    if (u >= 1.0) return 1.0 / (r * r * r);          // Newtonian outside the softening
+    if (u < 0.5) return h_inv3 * (10.666666666666667 + u*u*(32.0*u - 38.4));
+    return h_inv3 * (21.333333333333332 - 48.0*u + 38.4*u*u - 10.666666666666667*u*u*u
+                     - 0.06666666666666667/(u*u*u));
+}
+
+// phi(r) for the same cubic spline -- GIZMO's kernel_gravity(mode=-1). Exactly -1/r beyond h, so
+// the potential and the force come from one consistent kernel. Used by the potential walk and by
+// the sink escape speed (sink_vesc, sinks/sink.cc:103), which is softened on the same kernel.
+static inline double spline_potential(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double u = r * h_inv;
+    if (u >= 1.0) return -1.0 / r;
+    if (u < 0.5)
+        return h_inv * (-2.8 + u*u*(5.333333333333333 + u*u*(6.4*u - 9.6)));
+    return h_inv * (-3.2 + 0.06666666666666667/u
+                    + u*u*(10.666666666666667 + u*(-16.0 + u*(9.6 - 2.1333333333333333*u))));
+}
+
 // Second-derivative (tidal) factor of the cubic-spline softening kernel -- GIZMO's
 // kernel_gravity(mode=2). The pair's contribution to the tidal tensor is
 //   T_kl += -g1 * delta_kl + g2 * dp_k dp_l,
@@ -184,6 +214,10 @@ struct Tree {
     std::vector<int>   parent;          // parent node index, -1 at the root; for the kick climb
     std::vector<int>   leaf_of;         // per PARTICLE, the leaf holding it -- GIZMO's Father[]
     std::vector<float> vmax;            // max |v| over the node's particles, since the build
+    // Centre-of-mass velocity per node -- GIZMO's Extnodes[].vs. Only populated when the build
+    // is given velocities AND a jerk is wanted (Hermite); empty otherwise, so runs that never
+    // ask for a jerk pay neither the memory nor the sweep.
+    std::vector<double> vcom_x, vcom_y, vcom_z;
     double t_since_build = 0.0;         // engine time elapsed since this tree was built
 
     size_t nnodes() const { return mass.size(); }   // valid after build() trims to nalloc
@@ -223,7 +257,8 @@ struct BuildTimes { double bbox=0, keys=0, sort=0, recurse=0, links=0, pack=0, t
 // `vel`, when non-null, points at three per-particle velocity arrays (vx, vy, vz) and switches on
 // the per-node vmax bound above. Passed rather than stored on Particles because the engine keeps
 // velocities in its own arrays; gravity-only users of the tree pass nothing and pay nothing.
-Tree build(const Particles& P, BuildTimes* bt = nullptr, const double* const* vel = nullptr);
+Tree build(const Particles& P, BuildTimes* bt = nullptr, const double* const* vel = nullptr,
+           bool want_vcom = false);
 
 // Accelerations for the listed targets, Barnes-Hut with opening angle theta.
 // `targets` is the ACTIVE list -- the whole point is that it is usually tiny compared to P.
@@ -255,11 +290,24 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 // `tidal`, when non-null, receives the tidal tensor (second derivatives of the potential, WITHOUT
 // the G factor -- same convention as ax/ay/az) per target, accumulated in the same walk. Built
 // from the BASE pair force factor, without the zeta corrections, as GIZMO does.
+// `jerk`, when non-null, receives da/dt per target in the SAME walk -- GIZMO's
+// COMPUTE_JERK_IN_GRAVTREE (forcetree.cc:2266):
+//     jerk += g1 * dv - (dv . dr) * g2 * dr
+// with g1/g2 the same first/second kernel-derivative factors the tidal tensor already needs, so
+// the extra cost is a few FLOPs per interaction rather than a second traversal. dv is the source
+// velocity minus the target's: the particle's own for a leaf (forcetree.cc:1641), the node's
+// centre-of-mass velocity for a multipole (forcetree.cc:1945, Extnodes[].vs -- Tree::vcom here).
+// Requires a tree built with want_vcom. `vel` is the engine's live {vx,vy,vz}; it supplies both
+// the sources' and the targets' velocities, so a Hermite predictor step simply writes its
+// predicted state into the particle arrays before calling (as the reference's
+// do_hermite_prediction does) and the walk picks it up.
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch /* = 8 */, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az,
                    std::vector<SymTensor3d>* tidal = nullptr, const double* aold = nullptr,
-                   const LazyDrift* lazy = nullptr);
+                   const LazyDrift* lazy = nullptr,
+                   std::vector<Vec3d>* jerk = nullptr,
+                   const double* const* vel = nullptr);
 
 // Gravitational potential at each target, spline-softened to match accel(). Separate from the
 // force walk because it is only wanted for diagnostics -- but it is the diagnostic that matters

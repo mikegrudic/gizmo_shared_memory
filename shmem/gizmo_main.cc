@@ -53,7 +53,9 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
                          bool& output_potential, bool& tidal_criterion, bool& box_periodic,
                          double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
-                         bool& sink_formation) {
+                         bool& sink_formation, int& hermite_mask, bool& cooling_on) {
+    bool hermite_disabled = false;
+    cooling_on = false;
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -63,6 +65,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
     tidal_criterion = false;
     box_periodic = false;
     sink_formation = false;
+    hermite_mask = 0;
     eos_adiabat = 0.0; baro_variant = -1; baro_soundspeed = false;
     // GIZMO_CONFIG (set by the pytest harness's GIZMO_PREBUILT path) names the staged config --
     // base + per-variant extra flags -- explicitly. The cwd/root fallbacks serve standalone runs;
@@ -106,9 +109,23 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             // STARFORGE params set to ~0 precisely BECAUSE the softening is meant to be adaptive.
             // Missing this both unsoftens close gas-gas forces and drives the acceleration
             // timestep sqrt(eta*soft/|a|) orders of magnitude below the CFL step.
+            // OUTPUT_POTENTIAL is also defined inside the STARFORGE defaults block
+            // (precompiler_logic.h:361), and the tests read Potential from the snapshots.
             if (flag("SINGLE_STAR_SINK_FORMATION") || flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
                 flag("SINGLE_STAR_SINK_DYNAMICS"))
-                { sink_formation = true; tidal_criterion = true; adaptive_soft = true; }
+                { sink_formation = true; tidal_criterion = true; adaptive_soft = true;
+                  output_potential = true; }
+            // HERMITE_INTEGRATION 32 rides in the STARFORGE bundle (precompiler_logic.h:369)
+            // unless PMGRID or DISABLE_HERMITE_INTEGRATION -- the latter is exactly what the
+            // plummer_binaries "kdk" pytest variant appends, so the variants become a true
+            // KDK-vs-Hermite A/B of this engine.
+            if (flag("SINGLE_STAR_STARFORGE_DEFAULTS") && hermite_mask == 0) hermite_mask = 32;
+            int hermite_value;
+            if (flag("HERMITE_INTEGRATION") &&
+                sscanf(line, "HERMITE_INTEGRATION=%d", &hermite_value) == 1)
+                hermite_mask = hermite_value;
+            if (flag("DISABLE_HERMITE_INTEGRATION") || flag("PMGRID")) hermite_disabled = true;
+            if (flag("COOLING")) cooling_on = true;
             if (flag("EOS_GMC_BAROTROPIC_SOUNDSPEED")) baro_soundspeed = true;
             double adiabat_value;
             if (flag("EOS_ENFORCE_ADIABAT") &&
@@ -157,6 +174,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
         }
         break;                                   // first Config.sh found wins (cwd over root)
     }
+    if (hermite_disabled) hermite_mask = 0;
 }
 
 // Read one dataset as doubles. `column` selects a component of an Nx3 dataset; pass -1 for a
@@ -357,8 +375,10 @@ int main(int argc, char** argv) {
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
     bool tidal_criterion = false, box_periodic = false, sink_formation = false;
     double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
+    int hermite_mask = 0; bool cooling_on = false;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
-                 box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation);
+                 box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation,
+                 hermite_mask, cooling_on);
     // Units first: G falls back to the PHYSICAL constant in code units when the params file
     // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
     // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
@@ -410,6 +430,9 @@ int main(int argc, char** argv) {
     for (int t = 0; t < 6; ++t) sim.soft_fixed[t] = 2.8 * soft_plummer[t];
     sim.output_potential = output_potential;
     sim.tidal_criterion = tidal_criterion;
+    sim.hermite_mask = hermite_mask;
+    if (hermite_mask)
+        printf("shmem-GIZMO: hermite integration on for type mask %d\n", hermite_mask);
 
     // ---- EOS ----
     // The barotropic constants are tabulated against n_H in cm^-3 and return cgs pressure, so
@@ -428,6 +451,8 @@ int main(int argc, char** argv) {
     }
     sim.mass_to_solar = unit_mass_cgs / 1.989e33;
     sim.vel_to_kms = unit_vel_cgs / 1.0e5;
+    sim.length_to_au = unit_length_cgs / 1.495978707e13;
+    sim.opacity_limit_physics = cooling_on || (baro_variant >= 0);
     sim.sink_formation = sink_formation;
     if (sink_formation) {
         // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
@@ -589,6 +614,7 @@ int main(int argc, char** argv) {
     sync_all_positions(sim);
     write_snapshot(sim, particle_ids, outdir, snapshot_num, time, box);
     printf("done: t=%.6g in %d steps\n", time, n_steps);
+    hermite_report();
     MPI_Finalize();
     return 0;
 }
