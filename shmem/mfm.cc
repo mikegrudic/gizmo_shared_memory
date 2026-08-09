@@ -36,32 +36,63 @@ static bool invert_moments(const SymTensor3d& moments, Mat3d& inverse, int n_dim
     return (a*b <= 0) ? 0.0 : (std::abs(a) < std::abs(b) ? a : b);
 }
 
-// Per-particle slope limiter, Hopkins (2015) appendix B.
+// Per-particle gradient limiter -- a literal port of GIZMO's local_slopelimiter
+// (hydro/gradients.cc), decided once per particle against the whole neighbourhood.
 //
-// Scale the gradient so that extrapolating it a distance SLOPE_REACH*h -- a fraction of the kernel
-// radius, i.e. roughly to where the faces are -- overshoots neither the largest rise nor the
-// largest drop actually present in the neighbour set.
+// The constants matter more than the structure. GIZMO limits the extrapolation over a reach of
+// A_LIMITER * h_lim with A_LIMITER = 0.25 -- an earlier draft here used 0.5, which permits only
+// HALF the slope for the same neighbour excursions. That clips gradients at shocks, a clipped
+// gradient smears the shock over more kernel lengths, and in a collapse problem the smeared
+// accretion shock PRE-HEATS the inflow: evrard's core entropy came out 3-11% high and its central
+// density 12-15% low against the reference run with every gravity detail already matched.
 //
-// The point is that this is decided ONCE per particle against the whole neighbourhood, rather than
-// per face against that one pair's jump. A per-face minmod against half the pair jump is far more
-// restrictive: in smooth flow, neighbouring pairs with a small jump clamp the slope even where the
-// field is perfectly linear, so it clips smooth extrema. That is invisible in a shock tube, where
-// clipping is what you want anyway, and fatal in a rotating flow, where the clipped slope bleeds
-// angular momentum every step and the vortex spins down.
-//
-// SHOOT_TOLERANCE lets the reconstruction exceed the neighbour range by a fraction of the WIDER of
-// the two excursions, which keeps a genuine smooth extremum (where rise and drop are both real and
-// the true profile is curved) from being flattened to first order.
-static constexpr double SLOPE_REACH     = 0.5;
-static constexpr double SHOOT_TOLERANCE = 0.25;
+// `stol` allows overshoot beyond the smaller excursion (capped at the larger); GIZMO uses 0 with
+// gravity on and 0.1 for pure hydro. Positivity preservation (density, pressure) additionally
+// caps the slope so the value stays positive over the farthest neighbour distance d_max.
+static constexpr double A_LIMITER = 0.25;
 static inline void limit_slope(Vec3d& gradient, double largest_rise, double largest_drop,
-                               double h) {
+                               double h_lim, double stol, bool pos_preserve,
+                               double d_max, double val_cen) {
     const double slope = gradient.norm();
     if (slope <= 0) return;
-    const double rise = std::abs(largest_rise), drop = std::abs(largest_drop);
-    const double allowed = std::min(rise, drop) + SHOOT_TOLERANCE * std::max(rise, drop);
-    const double factor = allowed / (SLOPE_REACH * h * slope);
+    double abs_max = std::abs(largest_rise), abs_min = std::abs(largest_drop);
+    if (abs_max < abs_min) std::swap(abs_max, abs_min);
+    const double allowed = std::min(abs_min + stol * abs_max, abs_max);
+    double factor = allowed / (A_LIMITER * h_lim * slope);
+    if (pos_preserve && d_max > 0) {
+        const double val_min_ngb = val_cen + largest_drop;      // actual minimum neighbour value
+        const double fmin = std::min(val_cen, std::max(0.0,
+                              std::min(0.5 * (val_cen + val_min_ngb), val_cen - allowed)));
+        factor = std::min(((val_cen - fmin) / d_max) / slope, factor);
+    }
     if (factor < 1.0) gradient *= factor;
+}
+
+// Pairwise face limiter -- a literal port of GIZMO's reconstruct_face_states (hydro/reimann.h).
+// The face value may OVERSHOOT the pair range by FAC_MINMAX of the jump but must stay within
+// FAC_MEDDEV of the jump around the midpoint; a value about to cross zero is reinterpreted as a
+// logarithmic extrapolation instead, which preserves the sign. Strictly looser than a hard clamp
+// into [min,max] on the outer edge and tighter around the midpoint -- the combination keeps
+// shocks SHARP (GIZMO's comments: 1.0 unstable, 0.75 creeps, 0.5 works).
+static constexpr double FAC_MINMAX = 0.5, FAC_MEDDEV = 0.375;
+static inline void limit_face_pair(double Q_i, double Q_j, double& face_i, double& face_j) {
+    if (Q_i == Q_j) { face_i = face_j = Q_i; return; }
+    const double Qmed = 0.5 * (Q_i + Q_j);
+    const double Qmax = std::max(Q_i, Q_j), Qmin = std::min(Q_i, Q_j);
+    double fac = FAC_MINMAX * (Qmax - Qmin);
+    double Qmax_eff = Qmax + fac, Qmin_eff = Qmin - fac;
+    if (Qmax < 0 && Qmax_eff > 0) Qmax_eff = Qmax * Qmax / (Qmax - (Qmax_eff - Qmax));
+    if (Qmin > 0 && Qmin_eff < 0) Qmin_eff = Qmin * Qmin / (Qmin + (Qmin - Qmin_eff));
+    fac = FAC_MEDDEV * (Qmax - Qmin);
+    const double Qmed_max = std::min(Qmed + fac, Qmax_eff);
+    const double Qmed_min = std::max(Qmed - fac, Qmin_eff);
+    if (Q_i < Q_j) {
+        face_i = std::min(std::max(face_i, Qmin_eff), Qmed_max);
+        face_j = std::min(std::max(face_j, Qmed_min), Qmax_eff);
+    } else {
+        face_i = std::min(std::max(face_i, Qmed_min), Qmax_eff);
+        face_j = std::min(std::max(face_j, Qmin_eff), Qmed_max);
+    }
 }
 
 // Contact-wave speed and pressure from the Riemann fan -- the only two quantities the Lagrangian
@@ -98,6 +129,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     const size_t n_part = sim.size();
     sim.h.resize(n_part); sim.ninv.resize(n_part);
     sim.rho.resize(n_part); sim.press.resize(n_part);
+    sim.omega.resize(n_part, 1.0);
 
     std::vector<double> h_guess(active.size());
     const bool have_guess = !sim.h.empty();
@@ -108,6 +140,13 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
         density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim);
     for (size_t k = 0; k < active.size(); ++k) sim.h[active[k]] = solved.h[k];
 
+    // Adaptive-softening correction coefficients (GIZMO's AGS_zeta, gravity/ags_rkern.cc), rebuilt
+    // here because this loop already owns exactly the neighbour set they integrate over. Refreshed
+    // for ACTIVE particles only; inactive ones keep the value from their own last update, same as
+    // every other AGS quantity.
+    const bool want_zeta = sim.gravity_on && sim.adaptive_soft && sim.dim == 3;
+    if (want_zeta && sim.P.zeta.size() != n_part) sim.P.zeta.assign(n_part, 0.0);
+
     #pragma omp parallel
     {
         std::vector<uint32_t> neighbours;
@@ -117,14 +156,37 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
             const Vec3d pos_i = sim.P.pos(i);
             neighbours.clear();
             ngb_search(tree, sim.P, pos_i, sim.h[i], neighbours, sim.box);
-            double weight_sum = 0;
+            double weight_sum = 0, dn_dh = 0, dphi_dh_sum = 0;
             for (uint32_t j : neighbours) {
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
-                weight_sum += kernel_w(offset.norm(), sim.h[i], sim.dim);
+                const double r = offset.norm();
+                weight_sum += kernel_w(r, sim.h[i], sim.dim);
+                // both sums INCLUDE the self term (r = 0), as GIZMO's do
+                dn_dh += kernel_dwdh(r, sim.h[i], sim.dim);
+                if (want_zeta) dphi_dh_sum += sim.P.m[j] * grav_dphi_dh(r, sim.h[i]);
             }
             sim.ninv[i]  = 1.0 / weight_sum;             // V_i: MFM volume from partition of unity
             sim.rho[i]   = sim.P.m[i] * weight_sum;      // rho_i = m_i / V_i
             sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
+            {
+                // grad-h factor, GIZMO's DrkernNgbFactor: guards against pathological dn/dh as
+                // GIZMO does (the -0.9 test), else 1
+                const double omega_pre = sim.h[i] / (sim.dim * weight_sum) * dn_dh;
+                sim.omega[i] = (omega_pre > -0.9) ? 1.0 / (1.0 + omega_pre) : 1.0;
+            }
+
+            if (want_zeta) {
+                // zeta_i = m_i^2 * Omega_i^-1 * [ 0.5 * (sum m_j dphi/dh) * h / (NDIMS m_i n_i) ],
+                // with Omega the usual grad-h factor 1 + (h / NDIMS n) dn/dh, guarded as GIZMO
+                // guards it. Zero when the softening floor is binding: then eps is CONSTANT and
+                // there is no dPhi/dh term to correct for.
+                double zeta = 0.0;
+                if (sim.h[i] > sim.soft_min && weight_sum > 0) {
+                    zeta = 0.5 * sim.P.m[i] * sim.omega[i] * dphi_dh_sum * sim.h[i]
+                           / (3.0 * weight_sum);
+                }
+                sim.P.zeta[i] = zeta;
+            }
         }
     }
 }
@@ -178,9 +240,11 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
             std::array<Vec3d, NUM_FIELDS> weighted_diff_sum{};
             // widest rise and fall seen across the neighbour set, for the slope limiter below
             PrimitiveState largest_rise{}, largest_drop{};
+            double max_ngb_distance = 0.0;
             for (uint32_t j : neighbours) {
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double weight = kernel_w(offset.norm(), sim.h[i], sim.dim);
+                max_ngb_distance = std::max(max_ngb_distance, offset.norm());
                 const PrimitiveState field_j{sim.rho[j], sim.vx[j], sim.vy[j], sim.vz[j],
                                              sim.press[j]};
                 for (int f = 0; f < NUM_FIELDS; ++f) {
@@ -190,9 +254,17 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                     largest_drop[f] = std::min(largest_drop[f], diff);
                 }
             }
+            // GIZMO's per-field limiter settings (hydro/gradients.cc): reach h_lim is the larger
+            // of the kernel radius and the farthest neighbour; overshoot tolerance 0.1 for pure
+            // hydro, 0 with gravity on; density and pressure positivity-preserved.
+            const double h_lim = std::max(sim.h[i], max_ngb_distance);
+            const double stol = sim.gravity_on ? 0.0 : 0.1;
             for (int f = 0; f < NUM_FIELDS; ++f) {
                 Vec3d gradient = moments_inv.matvec(weighted_diff_sum[f]);
-                limit_slope(gradient, largest_rise[f], largest_drop[f], sim.h[i]);
+                const bool pos_preserve = (f == FIELD_DENSITY || f == FIELD_PRESSURE);
+                limit_slope(gradient, largest_rise[f], largest_drop[f], h_lim,
+                            (f == FIELD_DENSITY) ? 0.0 : stol, pos_preserve,
+                            max_ngb_distance, field_i[f]);
                 work.gradient[f][i] = gradient;
             }
         }
@@ -239,8 +311,29 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
         sim.P.soft[i] = sim.adaptive_soft ? std::max(sim.h[i], sim.soft_min) : sim.soft_min;
 
     std::vector<double> ax, ay, az;
-    // grouped walk: one traversal per batch of 8, measured 1.71x over the per-target walk
-    accel_grouped(tree, sim.P, active, sim.theta, sim.G, 8, ax, ay, az);
+    // grouped walk: one traversal per batch of 8, measured 1.71x over the per-target walk.
+    // The tidal tensor rides along in the same walk when the tidal timestep criterion wants it.
+    std::vector<SymTensor3d>* tidal_out = nullptr;
+    std::vector<SymTensor3d> tidal_active;
+    if (sim.tidal_criterion) { tidal_out = &tidal_active; }
+    // Relative opening criterion needs |a| from each target's PREVIOUS force evaluation
+    // (GIZMO's OldAcc, in the same no-G units the walk accumulates). Zero -- including the whole
+    // first step -- falls back to the geometric test inside open_node.
+    std::vector<double> aold_active;
+    const double* aold_ptr = nullptr;
+    if (sim.err_tol_force_acc > 0 && sim.a_grav.size() == n_part) {
+        aold_active.resize(active.size());
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k)
+            aold_active[k] = sim.err_tol_force_acc * sim.a_grav[active[k]].norm() / sim.G;
+        aold_ptr = aold_active.data();
+    }
+    accel_grouped(tree, sim.P, active, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr);
+    if (sim.tidal_criterion) {
+        sim.tidal.resize(n_part);
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k) sim.tidal[active[k]] = tidal_active[k];
+    }
 
     sim.a_grav.resize(n_part);
     #pragma omp parallel for schedule(static)
@@ -304,19 +397,16 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 auto extrapolate = [&](int field, size_t side, double sign)->double {
                     return sign * dot(work.gradient[field][side], to_midpoint);
                 };
-                // Pairwise safety net only. The gradient was already limited per particle against
-                // its whole neighbourhood (see limit_slope), so all this has to do is stop a face
-                // value from leaving the range spanned by the two endpoints -- which is what keeps
-                // the Riemann problem well posed. Clamping to that range is markedly less
-                // diffusive than the older minmod against half the jump, which limited the SLOPE
-                // itself on every face and so kept re-clipping smooth flow.
+                // Pairwise face limiter, ported from GIZMO's reconstruct_face_states: overshoot
+                // beyond the pair range allowed up to half the jump, deviation from the midpoint
+                // capped at 0.375 of it, signs preserved. See limit_face_pair for why this beats
+                // a hard clamp into [min,max] at shocks.
                 PrimitiveState left{}, right{};
                 for (int f = 0; f < NUM_FIELDS; ++f) {
                     const auto& predicted = work.predicted[f];
-                    const double lo = std::min(predicted[i], predicted[j]);
-                    const double hi = std::max(predicted[i], predicted[j]);
-                    left[f]  = std::min(hi, std::max(lo, predicted[i] + extrapolate(f, i, +1.0)));
-                    right[f] = std::min(hi, std::max(lo, predicted[j] + extrapolate(f, j, -1.0)));
+                    left[f]  = predicted[i] + extrapolate(f, i, +1.0);
+                    right[f] = predicted[j] + extrapolate(f, j, -1.0);
+                    limit_face_pair(predicted[i], predicted[j], left[f], right[f]);
                 }
                 if (left[FIELD_DENSITY]  <= 0 || right[FIELD_DENSITY]  <= 0 ||
                     left[FIELD_PRESSURE] <= 0 || right[FIELD_PRESSURE] <= 0) {  // limiter emergency
@@ -342,6 +432,16 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 // Lagrangian flux: zero mass flux; P* acts across the face, which moves at
                 // v_frame + S* nhat in the lab. Momentum goes from i to j along +nhat.
                 //
+                // ENTROPIC-EOS FACE CORRECTION (GIZMO hydro_core_meshless.h, MFM + ideal gas,
+                // default-on). When the contact wave is slow against the local sound speed the
+                // pair is not a shock, and the Riemann energy flux P* A S* is pure NUMERICAL
+                // dissipation; GIZMO replaces the energy exchange with the adiabatic
+                // (grad-h-corrected) PdV form in that regime, which is what keeps smooth
+                // compressive flow -- a collapse infall -- from generating spurious entropy.
+                // The one-sided dtoi/dtoj checks refuse the swap when it would push heat the
+                // wrong way between unequal-entropy sides. Constants per GIZMO: eps_big 0.6 /
+                // eps_small 1e-2 with gravity, 0.5 / 1e-3 without.
+                //
                 // These are RATES -- dP/dt and dE/dt -- deliberately NOT multiplied by any dt here.
                 // Each particle integrates its own accumulated rate over its OWN timestep at kick
                 // time, which is what removes the need to know how long a given PAIR has been
@@ -351,7 +451,57 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 // the wrong interval.
                 const double face_speed_lab = dot(face_vel, normal) + contact_speed;
                 const Vec3d momentum_flux = normal * (contact_pressure * face_area);
-                const double energy_flux = contact_pressure * face_speed_lab * face_area;
+                double energy_flux = contact_pressure * face_speed_lab * face_area;
+                {
+                    const double eps_big   = sim.gravity_on ? 0.6  : 0.5;
+                    const double eps_small = sim.gravity_on ? 1e-2 : 1e-3;
+                    const double cs_i = std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+                    const double cs_j = std::sqrt(sim.gamma * sim.press[j] / sim.rho[j]);
+                    const double sm_over_c = std::abs(contact_speed) / std::min(cs_i, cs_j);
+                    if (sm_over_c < eps_big) {
+                        // vdotr from the same predicted velocities the reconstruction used;
+                        // dv.dp is orientation-free
+                        const Vec3d dv{work.predicted[FIELD_VX][i] - work.predicted[FIELD_VX][j],
+                                       work.predicted[FIELD_VY][i] - work.predicted[FIELD_VY][j],
+                                       work.predicted[FIELD_VZ][i] - work.predicted[FIELD_VZ][j]};
+                        const double vdotr_phys = -dot(dv, offset) / separation;
+                        const double pdv_fac = contact_pressure * vdotr_phys;
+                        const double pdv_i = kernel_dwdr(separation, sim.h[i], sim.dim)
+                                             * sim.ninv[i]*sim.ninv[i] * sim.omega[i] * pdv_fac;
+                        const double pdv_j = kernel_dwdr(separation, sim.h[j], sim.dim)
+                                             * sim.ninv[j]*sim.ninv[j] * sim.omega[j] * pdv_fac;
+                        const double adiabatic_flux =
+                            contact_pressure * face_area * dot(face_vel, normal)
+                            - 0.5 * (pdv_i - pdv_j);
+                        bool use_entropic = true;
+                        if (sm_over_c > eps_small) {
+                            // one-sided sanity: never let the swap move heat against the entropy
+                            // gradient (mapped from GIZMO's dtoi/dtoj tests into this sign
+                            // convention, where energy_flux flows i -> j along +nhat)
+                            const double pa = contact_pressure * face_area;
+                            if (sim.press[i]/sim.rho[i] != sim.press[j]/sim.rho[j]) {
+                                if (sim.press[i]/sim.rho[i] > sim.press[j]/sim.rho[j]) {
+                                    const double vj_n = work.predicted[FIELD_VX][j]*normal[0]
+                                                      + work.predicted[FIELD_VY][j]*normal[1]
+                                                      + work.predicted[FIELD_VZ][j]*normal[2];
+                                    const double dtoj = energy_flux - pa * vj_n;
+                                    if (dtoj > 0) use_entropic = false;
+                                    else if (dtoj < 0 && dtoj > adiabatic_flux - pa * vj_n)
+                                        use_entropic = false;
+                                } else {
+                                    const double vi_n = work.predicted[FIELD_VX][i]*normal[0]
+                                                      + work.predicted[FIELD_VY][i]*normal[1]
+                                                      + work.predicted[FIELD_VZ][i]*normal[2];
+                                    const double dtoi = -energy_flux + pa * vi_n;
+                                    if (dtoi > 0) use_entropic = false;
+                                    else if (dtoi < 0 && dtoi > -adiabatic_flux + pa * vi_n)
+                                        use_entropic = false;
+                                }
+                            }
+                        }
+                        if (use_entropic) energy_flux = adiabatic_flux;
+                    }
+                }
                 #pragma omp atomic
                 dmom_x[i] -= momentum_flux[0];
                 #pragma omp atomic
@@ -510,11 +660,31 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
 
 // Desired step for one particle, from the same criteria the global scheme uses.
 static double desired_dt(const Sim& sim, size_t i) {
-    double dt = sim.cfl * sim.h[i] / (sim.work.signal_speed[i] + 1e-300);
+    // CFL exactly as GIZMO's (core/timestep.cc): CourantFac * L_particle / (0.5 * MaxSignalVel),
+    // where L_particle is the EFFECTIVE CELL SIZE (4pi/3)^(1/3) h / Neff^(1/3) -- which is
+    // algebraically just V_i^(1/dim), and V_i = ninv is already solved. Using the full kernel
+    // radius h instead is ~5% off in 3D at Neff~40 but 25%+ too permissive in 2D.
+    double dt = 2.0 * sim.cfl * std::pow(sim.ninv[i], 1.0 / sim.dim)
+                / (sim.work.signal_speed[i] + 1e-300);
     if (sim.gravity_on) {
         const double accel_mag = sim.a_grav[i].norm();
-        if (accel_mag > 0)
-            dt = std::min(dt, std::sqrt(2.0 * sim.eta_grav * sim.P.soft[i] / accel_mag));
+        if (accel_mag > 0) {
+            // sqrt(2 eta (KERNEL_CORE_SIZE * eps) / |a|) with KERNEL_CORE_SIZE = 1/2 for the
+            // cubic spline: GIZMO measures the softening scale by the kernel CORE, not the full
+            // support radius. Omitting the 1/2 made this criterion sqrt(2) too permissive.
+            dt = std::min(dt, std::sqrt(sim.eta_grav * sim.P.soft[i] / accel_mag));
+        }
+        if (sim.tidal_criterion && sim.tidal.size() == sim.size()) {
+            // dt = 0.5 sqrt(eta / sqrt(||G T||_F^2 / 6)): recovers sqrt(eta) * t_dyn in a
+            // Keplerian potential. Gas additionally floors at its own self-gravity timescale.
+            const double tnorm = sim.G * sim.tidal[i].frobenius_norm();
+            if (tnorm > 0) {
+                double dt_tidal = 0.5 * std::sqrt(sim.eta_grav / (tnorm / std::sqrt(6.0)));
+                dt_tidal = std::min(dt_tidal,
+                                    std::sqrt(sim.eta_grav / (sim.G * sim.rho[i] + 1e-300)));
+                dt = std::min(dt, dt_tidal);
+            }
+        }
     }
     return dt;
 }
@@ -794,6 +964,7 @@ double mfm_step(Sim& sim, double dt_max) {
         Vec3d pos_new = sim.P.pos(i) + shift;
         if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
         sim.P.x[i] = pos_new[0]; sim.P.y[i] = pos_new[1]; sim.P.z[i] = pos_new[2];
+
     }
     // Accumulated displacement is what Tree::pad must cover for the reused tree to stay exact.
     sim.drift_since_build += std::sqrt(max_shift_sq);

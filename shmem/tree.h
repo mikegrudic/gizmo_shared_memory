@@ -35,10 +35,75 @@ namespace shmem {
 
 struct Particles {                 // SoA: the walk reads x/y/z/m for many particles at once
     std::vector<double> x, y, z, m, soft;
+    // Adaptive-softening force-correction coefficients (Price & Monaghan 2007; GIZMO's AGS_zeta).
+    // Empty means "no corrections": the walks only read it when non-empty, so gravity-only users
+    // of the tree never pay for it.
+    std::vector<double> zeta;
+    // Particle type, GIZMO numbering (0 = gas; sinks/stars/DM > 0). Empty means "all gas".
+    // The gravity walks need it because the PAIR RULE depends on the types (see
+    // pair_force_over_r): kernel-averaging and the zeta terms apply to gas-gas pairs only.
+    std::vector<uint8_t> type;
     size_t size() const { return m.size(); }
 
     Vec3d pos(size_t i) const { return Vec3d{x[i], y[i], z[i]}; }
+    bool is_gas(size_t i) const { return type.empty() || type[i] == 0; }
 };
+
+// Second-derivative (tidal) factor of the cubic-spline softening kernel -- GIZMO's
+// kernel_gravity(mode=2). The pair's contribution to the tidal tensor is
+//   T_kl += -g1 * delta_kl + g2 * dp_k dp_l,
+// with g1 the force-over-r factor and g2 this one; beyond the softening it is the Newtonian
+// 3/r^5, so a point mass gives the exact -m/r^3 delta + 3m rr/r^5.
+static inline double grav_tidal_factor(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double u = r * h_inv;
+    if (u >= 1.0) return 3.0 / (r * r * r * r * r);
+    const double h_inv5 = h_inv * h_inv * h_inv * h_inv * h_inv;
+    double wk;
+    if (u < 0.5) wk = 76.8 - 96.0*u;
+    else         wk = -0.2/(u*u*u*u*u) + 48.0/u - 76.8 + 32.0*u;
+    return wk * h_inv5;
+}
+
+// Node-opening decision, following GIZMO's forcetree.cc with the RELATIVE (acceleration)
+// criterion. `aold` is ErrTolForceAcc * |a_prev|/G for the target (0 when no previous force
+// exists, e.g. the first step) and `theta_sq` the geometric fallback used in that bootstrap case.
+// Tested in GIZMO's order:
+//   1. softening overlap: open when the node could contain anything within either side's
+//      softening -- this is also what guarantees kernel-overlapping pairs are always resolved
+//      down to actual particles, so the zeta corrections never need a node form;
+//   2. relative criterion  M L^2 > r^4 aold  (geometric  L_open^2 > theta^2 r^2  when aold = 0);
+//   3. inside-node: per-axis |dx| < 0.6 L.
+// `l_open` should be the conservative opening radius (size + COM offset) used by the geometric
+// test; `len` the raw side length.
+static inline bool open_node(double r_sq, double len, double l_open, double node_mass,
+                             double node_maxsoft, double soft_target,
+                             double aold, double theta_sq,
+                             double adx, double ady, double adz) {
+    const double grow_t = soft_target + 0.6 * len, grow_n = node_maxsoft + 0.6 * len;
+    if (r_sq < grow_t * grow_t || r_sq < grow_n * grow_n) return true;
+    if (aold > 0.0) {
+        if (node_mass * len * len > r_sq * r_sq * aold) return true;
+    } else {
+        if (l_open * l_open >= theta_sq * r_sq) return true;
+    }
+    return adx < 0.6 * len && ady < 0.6 * len && adz < 0.6 * len;
+}
+
+// d(phi)/dh of the cubic-spline softening kernel at fixed r -- GIZMO's kernel_gravity(mode=0).
+// This is what the zeta terms integrate over the neighbourhood: with ADAPTIVE softening the
+// potential depends on h, h depends on the particle arrangement, and energy conservation requires
+// the force to pick up the corresponding dPhi/dh * dh/dr terms. Zero for r >= h, since there the
+// potential is exactly -1/r and has no h dependence at all.
+static inline double grav_dphi_dh(double r, double h) {
+    const double h_inv = 1.0 / h;
+    const double u = r * h_inv;
+    if (u >= 1.0) return 0.0;
+    double wk;
+    if (u < 0.5) wk = 2.8 + 16.0*u*u*(-1.0 + 3.0*u*u*(1.0 - 0.8*u));
+    else         wk = 3.2 + 32.0*u*u*(-1.0 + u*(2.0 - 1.5*u + 0.4*u*u));
+    return wk * h_inv * h_inv;
+}
 
 // ---- Morton (Z-order) key: interleave the low 21 bits of each coordinate ----
 static inline uint64_t spread3(uint64_t v) {
@@ -64,10 +129,11 @@ struct alignas(64) WNode {
     double s;            //  8  size + delta: the conservative opening radius
     double mass;         //  8
     float  soft;         //  4  max softening in the node
+    float  len;          //  4  raw side length, for the relative opening + inside-node tests
     int    first;        //  4  first child, or -1 for a leaf
     int    next;         //  4  where to go when not opened
     int    plo, phi;     //  8  leaf particle range
-};                       // = 64 bytes exactly
+};                       // = 64 bytes exactly (the len field fills what used to be padding)
 
 struct Tree {
     // node arrays, indexed by node id; leaves store a particle range instead of children
@@ -115,9 +181,12 @@ Tree build(const Particles& P, BuildTimes* bt = nullptr);
 
 // Accelerations for the listed targets, Barnes-Hut with opening angle theta.
 // `targets` is the ACTIVE list -- the whole point is that it is usually tiny compared to P.
+// `aold`, when non-null, points at ErrTolForceAcc * |a_prev|/G per TARGET (parallel to
+// `targets`), switching the walk from the geometric to GIZMO's relative opening criterion;
+// entries of 0 fall back to the geometric test (the first-force bootstrap).
 void accel(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
            double theta, double G, std::vector<double>& ax, std::vector<double>& ay,
-           std::vector<double>& az);
+           std::vector<double>& az, const double* aold = nullptr);
 
 // Same walk, but reading the SoA node arrays instead of the packed WNode. Kept ONLY as a controlled
 // comparison: run against accel() in the same process, interleaved, so background load hits both
@@ -137,16 +206,20 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 // optimum is ~8 and is NOT problem-specific: measured 1.71x at B=8 on the real post-sink active set
 // and 1.68x at B=32 on a 10x larger one (flat between), falling to 0.36x by B=128 as the box
 // dilutes. pytreegrav independently arrived at ~8. Treat it as a default, not a tunable.
+// `tidal`, when non-null, receives the tidal tensor (second derivatives of the potential, WITHOUT
+// the G factor -- same convention as ax/ay/az) per target, accumulated in the same walk. Built
+// from the BASE pair force factor, without the zeta corrections, as GIZMO does.
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch /* = 8 */, std::vector<double>& ax,
-                   std::vector<double>& ay, std::vector<double>& az);
+                   std::vector<double>& ay, std::vector<double>& az,
+                   std::vector<SymTensor3d>* tidal = nullptr, const double* aold = nullptr);
 
 // Gravitational potential at each target, spline-softened to match accel(). Separate from the
 // force walk because it is only wanted for diagnostics -- but it is the diagnostic that matters
 // for a self-gravitating run, since kinetic + internal alone is not a conserved quantity and can
 // look perfectly steady while the integrator quietly mis-applies gravity.
 void potential(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
-               double theta, double G, std::vector<double>& phi);
+               double theta, double G, std::vector<double>& phi, const double* aold = nullptr);
 
 // Direct O(N*M) summation, for validating the tree.
 void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, double G,

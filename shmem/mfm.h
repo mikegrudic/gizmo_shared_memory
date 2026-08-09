@@ -66,12 +66,16 @@ struct Sim {
     // ---- self-gravity (off unless gravity_on; SELFGRAVITY_OFF in the suite configs) ----
     bool   gravity_on = false;
     double G          = 1.0;           // GravityConstantInternal
-    double theta      = 0.5;           // Barnes-Hut opening angle
+    double theta      = 0.5;           // geometric opening angle (ErrTolTheta); bootstrap only
+                                       // once the relative criterion below is active
+    double err_tol_force_acc = 0.0;    // ErrTolForceAcc; 0 = geometric opening only
     double soft_min   = 0.0;           // floor on the gas softening (SofteningGas)
     bool   adaptive_soft = true;       // ADAPTIVE_GRAVSOFT_FORGAS: soften on h, not a fixed length
     bool   output_potential = false;   // OUTPUT_POTENTIAL: write phi so energy/momentum checks work
     std::vector<double> phi;           // gravitational potential, filled only when writing output
-    double eta_grav   = 0.025;         // accuracy of the dt = sqrt(2 eta eps / |a|) criterion
+    double eta_grav   = 0.025;         // ErrTolIntAccuracy; enters dt_grav and dt_tidal below
+    bool   tidal_criterion = false;    // TIDAL_TIMESTEP_CRITERION: dt from the tidal tensor
+    std::vector<SymTensor3d> tidal;    // d2phi/dxdx per particle (no G factor), from the walk
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
     // Half-kick owed by each particle from the close of ITS OWN previous step. Must be per
     // particle: with a spread of timebins the closing half-kick a particle owes is half of its own
@@ -111,6 +115,9 @@ struct Sim {
     // derived per step; under individual timesteps only the ACTIVE entries are refreshed and the
     // rest keep their values from each particle's own last update
     std::vector<double> h, ninv, rho, press;
+    // grad-h ("Omega") factor 1/(1 + h/(NDIMS n) dn/dh), needed by the entropic-EOS face
+    // correction (GIZMO's DrkernNgbFactor) and the zeta terms
+    std::vector<double> omega;
     Work work;
 
     // ---- persistent tree ----

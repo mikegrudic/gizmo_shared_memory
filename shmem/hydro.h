@@ -43,6 +43,15 @@ static inline double kernel_w(double r, double h, int dim = 3) {
     double u = 1.0 - q;
     return norm * 2.0 * u * u * u;
 }
+static inline double kernel_dwdr(double r, double h, int dim = 3) {   // dW/dr at fixed h
+    double q = r / h;
+    if (q >= 1.0) return 0.0;
+    const double norm = kernel_norm(h, dim);
+    double fp;
+    if (q < 0.5) fp = -12.0*q + 18.0*q*q;
+    else { double u = 1.0 - q; fp = -6.0*u*u; }
+    return norm * fp / h;
+}
 static inline double kernel_dwdh(double r, double h, int dim = 3) {   // dW/dh at fixed r
     double q = r / h;
     if (q >= 1.0) return 0.0;

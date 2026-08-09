@@ -46,13 +46,14 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
-                         bool& output_potential) {
+                         bool& output_potential, bool& tidal_criterion) {
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
     gravity_on = true;
     adaptive_soft = false;
     output_potential = false;
+    tidal_criterion = false;
     for (const char* path : {"Config.sh", "../../Config.sh"}) {
         FILE* file = fopen(path, "r");
         if (!file) continue;
@@ -62,6 +63,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             if (strncmp(line, "SELFGRAVITY_OFF", 15) == 0) gravity_on = false;
             if (strncmp(line, "ADAPTIVE_GRAVSOFT_FORGAS", 24) == 0) adaptive_soft = true;
             if (strncmp(line, "OUTPUT_POTENTIAL", 16) == 0) output_potential = true;
+            if (strncmp(line, "TIDAL_TIMESTEP_CRITERION", 24) == 0) tidal_criterion = true;
             int dims_from_config;
             if (sscanf(line, "BOX_SPATIAL_DIMENSION=%d", &dims_from_config) == 1)
                 n_dims = dims_from_config;
@@ -238,7 +240,8 @@ int main(int argc, char** argv) {
 
     int n_dims = 3; double gamma = 5.0/3.0;
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
-    parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential);
+    bool tidal_criterion = false;
+    parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion);
     const double grav_const = params.count("GravityConstantInternal")
                             ? atof(params["GravityConstantInternal"].c_str()) : 1.0;
     const double soft_gas = params.count("SofteningGas")
@@ -260,6 +263,10 @@ int main(int argc, char** argv) {
     sim.gravity_on = gravity_on; sim.G = grav_const;
     sim.soft_min = soft_gas; sim.adaptive_soft = adaptive_soft;
     sim.output_potential = output_potential;
+    sim.tidal_criterion = tidal_criterion;
+    if (params.count("ErrTolIntAccuracy")) sim.eta_grav = atof(params["ErrTolIntAccuracy"].c_str());
+    if (params.count("ErrTolTheta"))    sim.theta = atof(params["ErrTolTheta"].c_str());
+    if (params.count("ErrTolForceAcc")) sim.err_tol_force_acc = atof(params["ErrTolForceAcc"].c_str());
     // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
     if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));

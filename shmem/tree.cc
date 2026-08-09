@@ -1,4 +1,5 @@
 #include "tree.h"
+#include "hydro.h"    // kernel_dwdr, for the adaptive-softening zeta correction
 #include <chrono>
 #include <cstdio>
 #include <parallel/algorithm>
@@ -43,6 +44,43 @@ static inline void kick(const Vec3d& offset, double mass, double softening, Vec3
     const double r = offset.norm();
     if (r <= 0) return;
     accel += offset * (mass * spline_force_over_r(r, std::max(softening, 1e-300)));
+}
+
+// Scalar force factor for a PARTICLE-PARTICLE pair, target <- source. The pair rule depends on
+// the TYPES, exactly as in GIZMO's forcetree.cc with adaptive softening enabled:
+//
+//  * GAS-GAS: the pair kernel is the AVERAGE of the two softened kernels,
+//    0.5*(g(r;eps_t) + g(r;eps_s)), not the kernel of max(eps)
+//    (ADAPTIVE_GRAVSOFT_SYMMETRIZE_FORCE_BY_AVERAGING, on by default with AGS) -- plus the
+//    Price & Monaghan (2007) zeta correction, -(zeta_t W'(r;eps_t) + zeta_s W'(r;eps_s)) /
+//    (m_TARGET r), each term only inside its own kernel support. The zeta terms are DERIVED for
+//    the averaged kernel; pairing them with a max-softening kernel would mis-cancel. Dividing by
+//    the mass of the particle whose acceleration is being summed is what keeps the pair's
+//    correction antisymmetric -- m_t a_t = -m_s a_s -- so momentum survives the correction.
+//
+//  * ANY OTHER PAIR (gas-sink, sink-sink, gas-DM, ...): the kernel of the LARGER softening, no
+//    zeta. GIZMO restricts averaging to types sharing the AGS kernel structure, and under
+//    SINGLE_STAR_SINK_DYNAMICS explicitly excludes sink pairs from it ("can create very noisy
+//    interactions between tiny sink particles and diffuse gas"). Zeta terms are FORGAS gas-gas
+//    only.
+//
+// For r beyond both softenings every branch is exactly Newtonian. Node/monopole interactions get
+// the max-softening rule and no zeta: a node has no single zeta (GIZMO sets zeta=0 for
+// pseudo-particles), and any pair close enough for corrections to matter is inside a kernel
+// radius, which the opening criterion resolves down to actual particles anyway.
+static inline double pair_force_over_r(double r, double mass_source,
+                                       double eps_target, double eps_source,
+                                       double zeta_target, double zeta_source,
+                                       double mass_target, bool gas_gas) {
+    if (!gas_gas)
+        return mass_source * spline_force_over_r(r, std::max(std::max(eps_target, eps_source), 1e-300));
+    const double et = std::max(eps_target, 1e-300), es = std::max(eps_source, 1e-300);
+    double fac = 0.5 * mass_source * (spline_force_over_r(r, et) + spline_force_over_r(r, es));
+    if (mass_target > 0) {
+        if (zeta_target != 0.0 && r < et) fac -= (zeta_target / mass_target) * kernel_dwdr(r, et, 3) / r;
+        if (zeta_source != 0.0 && r < es) fac -= (zeta_source / mass_target) * kernel_dwdr(r, es, 3) / r;
+    }
+    return fac;
 }
 
 // Component form, for the grouped walk ONLY. That loop keeps its batch in SoA scratch buffers on
@@ -222,7 +260,7 @@ Tree build(const Particles& P, BuildTimes* bt) {
         WNode& w = T.wn[i];
         w.cx = T.cx[i]; w.cy = T.cy[i]; w.cz = T.cz[i];
         w.s  = T.size[i] + T.delta[i];
-        w.mass = T.mass[i]; w.soft = (float)T.soft[i];
+        w.mass = T.mass[i]; w.soft = (float)T.soft[i]; w.len = (float)T.size[i];
         w.first = T.first[i]; w.next = T.next[i];
         w.plo = T.plo[i]; w.phi = T.phi[i];
     }
@@ -232,7 +270,7 @@ Tree build(const Particles& P, BuildTimes* bt) {
 
 void accel(const Tree& tree, const Particles& particles, const std::vector<uint32_t>& targets,
            double theta, double G, std::vector<double>& ax, std::vector<double>& ay,
-           std::vector<double>& az) {
+           std::vector<double>& az, const double* aold) {
     const size_t n_targets = targets.size();
     ax.assign(n_targets, 0.0); ay.assign(n_targets, 0.0); az.assign(n_targets, 0.0);
     const double theta_sq = theta * theta;
@@ -244,6 +282,10 @@ void accel(const Tree& tree, const Particles& particles, const std::vector<uint3
         const uint32_t target = targets[t];
         const Vec3d pos_target = particles.pos(target);
         const double soft_target = particles.soft.empty() ? 0.0 : particles.soft[target];
+        const double mass_target = particles.m[target];
+        const double zeta_target = particles.zeta.empty() ? 0.0 : particles.zeta[target];
+        const bool gas_target = particles.is_gas(target);
+        const double aold_t = aold ? aold[t] : 0.0;
         Vec3d accel{0, 0, 0};
 
         const WNode* __restrict nodes = tree.wn.data();
@@ -252,14 +294,22 @@ void accel(const Tree& tree, const Particles& particles, const std::vector<uint3
             const WNode& node = nodes[node_id];           // ONE cache line per visit
             const Vec3d to_com = Vec3d{node.cx, node.cy, node.cz} - pos_target;
             const double r_sq = to_com.norm_sq();
-            if (node.first < 0 || node.s * node.s < theta_sq * r_sq) {
+            if (node.first < 0 ||
+                !open_node(r_sq, node.len, node.s, node.mass, node.soft, soft_target,
+                           aold_t, theta_sq,
+                           std::abs(to_com[0]), std::abs(to_com[1]), std::abs(to_com[2]))) {
                 if (node.first < 0) {                     // leaf: direct sum over its particles
                     for (int slot = node.plo; slot < node.phi; ++slot) {
                         const uint32_t j = tree.orderbuf[slot];
                         if (j == target) continue;
-                        const double soft = std::max(
-                            soft_target, particles.soft.empty() ? 0.0 : particles.soft[j]);
-                        kick(particles.pos(j) - pos_target, particles.m[j], soft, accel);
+                        const Vec3d offset = particles.pos(j) - pos_target;
+                        const double r = offset.norm();
+                        if (r <= 0) continue;
+                        accel += offset * pair_force_over_r(
+                            r, particles.m[j], soft_target,
+                            particles.soft.empty() ? 0.0 : particles.soft[j],
+                            zeta_target, particles.zeta.empty() ? 0.0 : particles.zeta[j],
+                            mass_target, gas_target && particles.is_gas(j));
                     }
                 } else {                                  // far enough: use the monopole
                     const double soft = std::max(soft_target, (double)node.soft);
@@ -318,9 +368,12 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch, std::vector<double>& ax,
-                   std::vector<double>& ay, std::vector<double>& az) {
+                   std::vector<double>& ay, std::vector<double>& az,
+                   std::vector<SymTensor3d>* tidal, const double* aold) {
     const size_t nt = targets.size();
     ax.assign(nt, 0.0); ay.assign(nt, 0.0); az.assign(nt, 0.0);
+    const bool want_tidal = (tidal != nullptr);
+    if (want_tidal) tidal->assign(nt, SymTensor3d{0,0,0,0,0,0});
     const double theta2 = theta * theta;
     const int nb = (int)((nt + batch - 1) / batch);
 
@@ -336,16 +389,26 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             bz0=std::min(bz0,P.z[p]); bz1=std::max(bz1,P.z[p]);
             if (!P.soft.empty()) emax = std::max(emax, P.soft[p]);
         }
+        // Batch opening uses the CONSERVATIVE reduction of every per-member test: nearest bbox
+        // point for r, the largest softening, and the SMALLEST aold (an aold of 0 anywhere in the
+        // batch forces the geometric test, which opens at least as much).
+        double aold_min = aold ? 1e300 : 0.0;
+        if (aold) for (size_t i = lo; i < hi; ++i) aold_min = std::min(aold_min, aold[i]);
         // Gather the batch into contiguous local buffers. Without this the inner loop gathers
         // P.x[targets[i]] for every node, replacing one node fetch per target with `batch` scattered
         // particle fetches -- measured 3-10x SLOWER than the per-target walk. Contiguous buffers keep
         // the batch in L1 and let the inner loop vectorise, which is the whole point of grouping.
         const int nb_ = (int)(hi - lo);
+        const bool have_zeta = !P.zeta.empty();
         double tx[512], ty[512], tz[512], te[512], oax[512], oay[512], oaz[512];
+        double tmass[512], tzeta[512]; bool tgas[512];
+        double ott[6][512];
+        if (want_tidal) for (int c = 0; c < 6; ++c) for (int i = 0; i < (int)(hi-lo); ++i) ott[c][i] = 0;
         for (int i = 0; i < nb_; ++i) {
             uint32_t p = targets[lo + i];
             tx[i]=P.x[p]; ty[i]=P.y[p]; tz[i]=P.z[p];
             te[i]=P.soft.empty()?0.0:P.soft[p];
+            tmass[i]=P.m[p]; tzeta[i]=have_zeta?P.zeta[p]:0.0; tgas[i]=P.is_gas(p);
             oax[i]=0; oay[i]=0; oaz[i]=0;
         }
         const WNode* __restrict W = T.wn.data();
@@ -356,22 +419,67 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             double dy = std::max(0.0, std::max(by0 - w.cy, w.cy - by1));
             double dz = std::max(0.0, std::max(bz0 - w.cz, w.cz - bz1));
             double rmin2 = dx*dx + dy*dy + dz*dz;
-            if (w.first < 0 || w.s * w.s < theta2 * rmin2) {
+            if (w.first < 0 ||
+                !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min, theta2,
+                           dx, dy, dz)) {
                 if (w.first < 0) {
                     for (int k = w.plo; k < w.phi; ++k) {
                         uint32_t q = T.orderbuf[k];
                         double qx=P.x[q], qy=P.y[q], qz=P.z[q], qm=P.m[q];
                         double qs = P.soft.empty()?0.0:P.soft[q];
+                        double qzeta = have_zeta?P.zeta[q]:0.0;
+                        const bool qgas = P.is_gas(q);
                         for (int i = 0; i < nb_; ++i) {
                             if (targets[lo+i] == q) continue;
-                            double e = std::max(te[i], qs);
-                            kick(qx-tx[i], qy-ty[i], qz-tz[i], qm, e, oax[i], oay[i], oaz[i]);
+                            const double dx_=qx-tx[i], dy_=qy-ty[i], dz_=qz-tz[i];
+                            const double r2 = dx_*dx_ + dy_*dy_ + dz_*dz_;
+                            if (r2 <= 0) continue;
+                            const double r = std::sqrt(r2);
+                            const double fac = pair_force_over_r(
+                                r, qm, te[i], qs, tzeta[i], qzeta,
+                                tmass[i], tgas[i] && qgas);
+                            oax[i] += dx_*fac; oay[i] += dy_*fac; oaz[i] += dz_*fac;
+                            if (want_tidal) {
+                                // base (zeta-free) force factor and the mode-2 factor, with the
+                                // same gas-gas averaging rule as the force itself
+                                double g1, g2;
+                                if (tgas[i] && qgas) {
+                                    const double et = std::max(te[i],1e-300), es = std::max(qs,1e-300);
+                                    g1 = 0.5*qm*(spline_force_over_r(r,et)+spline_force_over_r(r,es));
+                                    g2 = 0.5*qm*(grav_tidal_factor(r,et)+grav_tidal_factor(r,es));
+                                } else {
+                                    const double e = std::max(std::max(te[i],qs),1e-300);
+                                    g1 = qm*spline_force_over_r(r,e);
+                                    g2 = qm*grav_tidal_factor(r,e);
+                                }
+                                ott[0][i] += -g1 + dx_*dx_*g2;   // xx
+                                ott[1][i] += -g1 + dy_*dy_*g2;   // yy
+                                ott[2][i] += -g1 + dz_*dz_*g2;   // zz
+                                ott[3][i] += dx_*dy_*g2;         // xy
+                                ott[4][i] += dy_*dz_*g2;         // yz
+                                ott[5][i] += dx_*dz_*g2;         // xz
+                            }
                         }
                     }
                 } else {
                     for (int i = 0; i < nb_; ++i) {
                         double e = std::max(te[i], (double)w.soft);
                         kick(w.cx-tx[i], w.cy-ty[i], w.cz-tz[i], w.mass, e, oax[i], oay[i], oaz[i]);
+                        if (want_tidal) {
+                            const double dx_=w.cx-tx[i], dy_=w.cy-ty[i], dz_=w.cz-tz[i];
+                            const double r2 = dx_*dx_+dy_*dy_+dz_*dz_;
+                            if (r2 > 0) {
+                                const double r = std::sqrt(r2), es = std::max(e,1e-300);
+                                const double g1 = w.mass*spline_force_over_r(r,es);
+                                const double g2 = w.mass*grav_tidal_factor(r,es);
+                                ott[0][i] += -g1 + dx_*dx_*g2;
+                                ott[1][i] += -g1 + dy_*dy_*g2;
+                                ott[2][i] += -g1 + dz_*dz_*g2;
+                                ott[3][i] += dx_*dy_*g2;
+                                ott[4][i] += dy_*dz_*g2;
+                                ott[5][i] += dx_*dz_*g2;
+                            }
+                        }
                     }
                 }
                 node = w.next;
@@ -380,12 +488,17 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             }
         }
         for (int i = 0; i < nb_; ++i) { ax[lo+i]=G*oax[i]; ay[lo+i]=G*oay[i]; az[lo+i]=G*oaz[i]; }
+        if (want_tidal) for (int i = 0; i < nb_; ++i) {
+            SymTensor3d& tt = (*tidal)[lo+i];
+            tt[0][0]=ott[0][i]; tt[1][1]=ott[1][i]; tt[2][2]=ott[2][i];
+            tt[0][1]=ott[3][i]; tt[1][2]=ott[4][i]; tt[0][2]=ott[5][i];
+        }
 
     }
 }
 
 void potential(const Tree& tree, const Particles& particles, const std::vector<uint32_t>& targets,
-               double theta, double G, std::vector<double>& phi) {
+               double theta, double G, std::vector<double>& phi, const double* aold) {
     const size_t n_targets = targets.size();
     phi.assign(n_targets, 0.0);
     const double theta_sq = theta * theta;
@@ -394,6 +507,8 @@ void potential(const Tree& tree, const Particles& particles, const std::vector<u
         const uint32_t target = targets[t];
         const Vec3d pos_target = particles.pos(target);
         const double soft_target = particles.soft.empty() ? 0.0 : particles.soft[target];
+        const bool gas_target = particles.is_gas(target);
+        const double aold_t = aold ? aold[t] : 0.0;
         double sum = 0;
         const WNode* __restrict nodes = tree.wn.data();
         int node_id = tree.root;
@@ -401,15 +516,27 @@ void potential(const Tree& tree, const Particles& particles, const std::vector<u
             const WNode& node = nodes[node_id];
             const Vec3d to_com = Vec3d{node.cx, node.cy, node.cz} - pos_target;
             const double r_sq = to_com.norm_sq();
-            if (node.first < 0 || node.s * node.s < theta_sq * r_sq) {
+            if (node.first < 0 ||
+                !open_node(r_sq, node.len, node.s, node.mass, node.soft, soft_target,
+                           aold_t, theta_sq,
+                           std::abs(to_com[0]), std::abs(to_com[1]), std::abs(to_com[2]))) {
                 if (node.first < 0) {
                     for (int slot = node.plo; slot < node.phi; ++slot) {
                         const uint32_t j = tree.orderbuf[slot];
                         if (j == target) continue;
-                        const double soft = std::max(
-                            soft_target, particles.soft.empty() ? 0.0 : particles.soft[j]);
                         const double r = (particles.pos(j) - pos_target).norm();
-                        if (r > 0) sum += particles.m[j] * spline_potential(r, std::max(soft, 1e-300));
+                        if (r <= 0) continue;
+                        // gas-gas: average of the two softened kernels, consistent with the pair
+                        // force; other pairs: kernel of the larger softening, same as the force
+                        const double soft_j = particles.soft.empty() ? 0.0 : particles.soft[j];
+                        if (gas_target && particles.is_gas(j)) {
+                            sum += particles.m[j] * 0.5 *
+                                   (spline_potential(r, std::max(soft_target, 1e-300)) +
+                                    spline_potential(r, std::max(soft_j, 1e-300)));
+                        } else {
+                            sum += particles.m[j] *
+                                   spline_potential(r, std::max(std::max(soft_target, soft_j), 1e-300));
+                        }
                     }
                 } else {
                     const double soft = std::max(soft_target, (double)node.soft);
@@ -434,11 +561,19 @@ void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, doubl
         uint32_t p = targets[t];
         const Vec3d xp = P.pos(p);
         double eps = P.soft.empty() ? 0.0 : P.soft[p];
+        const double mass_p = P.m[p];
+        const double zeta_p = P.zeta.empty() ? 0.0 : P.zeta[p];
+        const bool gas_p = P.is_gas(p);
         Vec3d acc{0, 0, 0};
         for (size_t q = 0; q < n; ++q) {
             if (q == p) continue;
-            double e2 = std::max(eps, P.soft.empty() ? 0.0 : P.soft[q]);
-            kick(P.pos(q) - xp, P.m[q], e2, acc);
+            const Vec3d offset = P.pos(q) - xp;
+            const double r = offset.norm();
+            if (r <= 0) continue;
+            acc += offset * pair_force_over_r(
+                r, P.m[q], eps, P.soft.empty() ? 0.0 : P.soft[q],
+                zeta_p, P.zeta.empty() ? 0.0 : P.zeta[q],
+                mass_p, gas_p && P.is_gas(q));
         }
         ax[t] = G*acc[0]; ay[t] = G*acc[1]; az[t] = G*acc[2];
     }
