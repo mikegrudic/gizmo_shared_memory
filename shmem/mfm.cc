@@ -283,6 +283,7 @@ static void predict_half(Sim& sim, const std::vector<uint32_t>& active,
         const double div_vel = work.gradient[FIELD_VX][i][0]
                              + work.gradient[FIELD_VY][i][1]
                              + work.gradient[FIELD_VZ][i][2];
+        work.div_vel[i] = div_vel;   // kept for the drift-time prediction of INACTIVE particles
         const double inv_density = 1.0 / sim.rho[i], half_dt = 0.5 * dt;
         const Vec3d& grad_pressure = work.gradient[FIELD_PRESSURE][i];
         work.predicted[FIELD_DENSITY][i] = std::max(sim.rho[i] * (1.0 - half_dt*div_vel), 1e-30);
@@ -965,6 +966,32 @@ double mfm_step(Sim& sim, double dt_max) {
         if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
         sim.P.x[i] = pos_new[0]; sim.P.y[i] = pos_new[1]; sim.P.z[i] = pos_new[2];
 
+        // Drift-time prediction for INACTIVE particles (GIZMO's core/predict.cc): between its own
+        // updates a particle's density evolves continuously as its neighbourhood converges or
+        // expands, rho_dot = -rho div v. Without this, a long-binned particle in a steadily
+        // converging flow carries a systematically LOW density until it next activates -- in noh
+        // the cold supersonic inflow sat 25% under the analytic pre-shock profile with the
+        // velocities EXACT, because only the density estimate was stale. The kernel radius
+        // follows with the opposite sign (h ~ n^{-1/dim}) and pressure tracks rho at fixed u.
+        // Clamped at +-0.3 per drift as GIZMO clamps it; cheap 2nd-order exp for the tiny
+        // arguments this almost always sees.
+        if (sim.individual_timesteps && !sim.is_active(i)) {
+            double divv_fac = work.div_vel[i] * dt;
+            if (divv_fac >  0.3) divv_fac =  0.3;
+            if (divv_fac < -0.3) divv_fac = -0.3;
+            if (divv_fac != 0.0) {
+                const double x = -divv_fac;
+                const double f = (std::abs(x) < 0.05) ? 1.0 + x*(1.0 + 0.5*x) : std::exp(x);
+                sim.rho[i]  *= f;
+                sim.ninv[i] /= f;
+                sim.press[i] = (sim.gamma - 1.0) * sim.rho[i] * sim.u[i];
+                sim.h[i]    *= (std::abs(divv_fac) < 0.15)
+                               ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
+                               : std::exp(divv_fac / sim.dim);
+                work.predicted[FIELD_DENSITY][i]  = sim.rho[i];
+                work.predicted[FIELD_PRESSURE][i] = sim.press[i];
+            }
+        }
     }
     // Accumulated displacement is what Tree::pad must cover for the reused tree to stay exact.
     sim.drift_since_build += std::sqrt(max_shift_sq);

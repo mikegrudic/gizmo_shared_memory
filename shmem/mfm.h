@@ -44,12 +44,14 @@ struct Work {
     std::array<std::vector<Vec3d>, NUM_FIELDS> gradient;       // gradient of each primitive field
     std::array<std::vector<double>, NUM_FIELDS> predicted;     // half-step predicted primitives
     std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
+    std::vector<double> div_vel;                               // velocity divergence at last update
 
     void resize(size_t n) {
         moments_inv.resize(n);
         for (auto& g : gradient)  g.resize(n);
         for (auto& p : predicted) p.resize(n);
         signal_speed.resize(n);
+        div_vel.resize(n, 0.0);
     }
 };
 
