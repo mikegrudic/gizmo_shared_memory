@@ -275,6 +275,18 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
             write_scalar_field("Density", sim.rho);
             write_scalar_field("SmoothingLength", sim.h);
         }
+        if (t == 5) {
+            // Dataset names follow the reference (file_io/io.cc:4019,4036,4040,3860). This
+            // engine has no accretion reservoir or protostellar evolution, so the stellar mass
+            // IS the dynamical mass and the reservoir/protostar fields are simply absent.
+            write_scalar_field("Sink_Mass", sim.P.m);
+            if (sim.sink_radius.size() == n_part)
+                write_scalar_field("Sink_Radius", sim.sink_radius);
+            if (sim.sink_tform.size() == n_part)
+                write_scalar_field("StellarFormationTime", sim.sink_tform);
+            if (sim.sink_m0.size() == n_part)
+                write_scalar_field("Sink_InitialMass", sim.sink_m0);
+        }
         if (sim.output_potential && sim.phi.size() == n_part)
             write_scalar_field("Potential", sim.phi);
         {

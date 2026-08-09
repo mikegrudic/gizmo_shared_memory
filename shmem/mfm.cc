@@ -851,7 +851,7 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.h); sw(sim.ninv); sw(sim.rho); sw(sim.press); sw(sim.omega); sw(sim.csnd);
     sw(sim.phi); sw(sim.a_grav); sw(sim.tidal); sw(sim.pending_half_kick);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
-    sw(sim.sink_radius); sw(sim.id);
+    sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.id);
     sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
     sw(sim.work.moments_inv); sw(sim.work.signal_speed); sw(sim.work.div_vel);
     for (auto& g : sim.work.gradient)  sw(g);
@@ -867,7 +867,7 @@ static void pop_particle(Sim& sim) {
     pop(sim.h); pop(sim.ninv); pop(sim.rho); pop(sim.press); pop(sim.omega); pop(sim.csnd);
     pop(sim.phi); pop(sim.a_grav); pop(sim.tidal); pop(sim.pending_half_kick);
     pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
-    pop(sim.sink_radius); pop(sim.id);
+    pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.id);
     pop(sim.dmom_x); pop(sim.dmom_y); pop(sim.dmom_z); pop(sim.denergy);
     pop(sim.work.moments_inv); pop(sim.work.signal_speed); pop(sim.work.div_vel);
     for (auto& g : sim.work.gradient)  pop(g);
@@ -1140,6 +1140,10 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
                                              sim.h[last_gas]);
         printf("shmem-GIZMO: sink radius = %.6g (h was %.6g)\n",
                sim.sink_radius[last_gas], sim.h[last_gas]);
+        if (sim.sink_tform.size() != sim.size()) sim.sink_tform.resize(sim.size(), 0.0);
+        if (sim.sink_m0.size()    != sim.size()) sim.sink_m0.resize(sim.size(), 0.0);
+        sim.sink_tform[last_gas] = sim.time_now();
+        sim.sink_m0[last_gas]    = sim.P.m[last_gas];
         ++sim.sinks_formed;
         printf("shmem-GIZMO: sink formed from cell %zu (m=%.6g, rho=%.6g); %lld total\n",
                last_gas, sim.P.m[last_gas], sim.rho[last_gas], sim.sinks_formed);
@@ -1194,17 +1198,22 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts = nullptr);
 void print_timebins(const Sim& sim, double systemstep, double time) {
     if (sim.bin.empty()) return;
     const int n_bins = Sim::MAX_BINS + 1;
-    std::vector<long long> count(n_bins, 0);
-    for (size_t i = 0; i < sim.size(); ++i) count[sim.bin[i]]++;
+    std::vector<long long> count(n_bins, 0), count_nc(n_bins, 0);   // cells / non-cells (sinks)
+    for (size_t i = 0; i < sim.size(); ++i)
+        (i < sim.n_gas ? count : count_nc)[sim.bin[i]]++;
 
     // cumulative[b] = particles in bin b and in every SHORTER-step bin (higher index here)
     std::vector<long long> cumulative(n_bins, 0);
     long long running = 0;
-    for (int b = n_bins - 1; b >= 0; --b) { running += count[b]; cumulative[b] = running; }
+    for (int b = n_bins - 1; b >= 0; --b) {
+        running += count[b] + count_nc[b];
+        cumulative[b] = running;
+    }
 
     int longest_active = -1;
     for (int b = 0; b < n_bins; ++b)
-        if (count[b] > 0 && (sim.clock_ticks % sim.ticks_in_bin(b)) == 0) { longest_active = b; break; }
+        if (count[b] + count_nc[b] > 0 && (sim.clock_ticks % sim.ticks_in_bin(b)) == 0)
+            { longest_active = b; break; }
 
     // cpu-frac: weight each bin's average cost by how OFTEN it recurs. Halving dt doubles the
     // number of syncs, so a cheap deep bin can still dominate the run; that is the whole point of
@@ -1216,7 +1225,7 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
     double frac_sum = 0.0;
     double weight = 1.0;
     for (int b = 0; b < n_bins; ++b) {
-        if (count[b] == 0) continue;
+        if (count[b] + count_nc[b] == 0) continue;
         frac[b] = weight * avg[b];
         frac_sum += frac[b];
         weight *= 2.0;                     // each deeper bin is visited twice as often
@@ -1225,17 +1234,18 @@ void print_timebins(const Sim& sim, double systemstep, double time) {
 
     printf("\nSync-Point %lld, Time: %.16g, Systemstep: %g\n", sim.sync_point, time, systemstep);
     printf("Occupied timebins:  non-cells       cells       dt                cumulative A    avg-time  cpu-frac\n");
-    long long total_active = 0;
+    long long total_active = 0, total_active_nc = 0;
     for (int b = 0; b < n_bins; ++b) {
-        if (count[b] == 0) continue;
+        if (count[b] + count_nc[b] == 0) continue;
         const bool active = (sim.clock_ticks % sim.ticks_in_bin(b)) == 0;
         printf(" %c  bin=%2d       %10lld  %10lld   %16.12f      %10lld %c  %10.2f    %5.1f%%\n",
-               active ? 'X' : ' ', b, 0LL, count[b], sim.dt_of_bin(b), cumulative[b],
+               active ? 'X' : ' ', b, count_nc[b], count[b], sim.dt_of_bin(b), cumulative[b],
                (b == longest_active) ? '<' : ' ', avg[b] * 1e3, 100.0 * frac[b]);
-        if (active) total_active += count[b];
+        if (active) { total_active += count[b]; total_active_nc += count_nc[b]; }
     }
     printf("               ------------------------\n");
-    printf("Total active:    %10lld  %10lld    Sum: %10lld\n\n", 0LL, total_active, total_active);
+    printf("Total active:    %10lld  %10lld    Sum: %10lld\n\n",
+           total_active_nc, total_active, total_active + total_active_nc);
 
     // SHMEM_BIN_DIAG: show WHY the deepest bin is deep. dt = cfl*h/vsig, so a particle lands there
     // either because its h collapsed or because its signal speed blew up, and the two point at

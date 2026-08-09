@@ -148,6 +148,11 @@ struct Sim {
     // Bate-style FIXED accretion radius, set once when the sink forms and carried per particle
     // (SINK_GRAVCAPTURE_FIXEDSINKRADIUS; galaxy_sf/sfr_eff.cc:602-608). Zero for gas.
     std::vector<double> sink_radius;
+    // Formation time and mass-at-formation, recorded at conversion for the snapshot's
+    // StellarFormationTime / Sink_InitialMass datasets (file_io/io.cc:3860,4040). Zero for gas.
+    // (In the legacy global-timestep A/B mode time_now() is 0, so tform reads 0 there.)
+    std::vector<double> sink_tform;
+    std::vector<double> sink_m0;
     // Particle IDs live HERE rather than beside the driver: sink formation swaps particles and
     // accretion deletes them, so anything parallel to the particle arrays has to be permuted with
     // them or the snapshot silently mislabels every particle after the first event.
