@@ -118,17 +118,22 @@ static inline void eos_apply(Sim& sim, size_t i) {
     sim.press[i] = press;
     if (sim.eos_law != Sim::EosLaw::IDEAL)
         sim.u[i] = press / (rho * (gamma_index - 1.0));
-    if (!sim.csnd.empty()) {
+    if (sim.eos_law != Sim::EosLaw::IDEAL && !sim.csnd.empty()) {
         const double g_cs = (sim.eos_law == Sim::EosLaw::BAROTROPIC && sim.baro_soundspeed)
                           ? gamma_eff : sim.gamma;
         sim.csnd[i] = std::sqrt(g_cs * press / rho);
     }
 }
 
-// Sound speed for particle i, from the EOS when one is carried and from gamma P/rho otherwise.
+// Sound speed for particle i. The IDEAL branch recomputes from press/rho rather than reading a
+// stored value, and that is deliberate: this is called per NEIGHBOUR inside the gradient and flux
+// loops, which already have press[j] and rho[j] in cache, whereas csnd[j] would be a THIRD
+// scattered array touched per neighbour. An arithmetic sqrt is cheaper than the cache miss that
+// would avoid it. csnd is therefore only allocated and consulted when a density-driven EOS
+// actually makes it differ from gamma P/rho.
 static inline double sound_speed(const Sim& sim, size_t i) {
-    if (!sim.csnd.empty() && sim.csnd[i] > 0) return sim.csnd[i];
-    return std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+    if (sim.eos_is_ideal()) return std::sqrt(sim.gamma * sim.press[i] / sim.rho[i]);
+    return sim.csnd[i];
 }
 
 [[nodiscard]] static constexpr double minmod(double a, double b) noexcept {
@@ -233,7 +238,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     sim.h.resize(n_part); sim.ninv.resize(n_part);
     sim.rho.resize(n_part); sim.press.resize(n_part);
     sim.omega.resize(n_part, 1.0);
-    sim.csnd.resize(n_part, 0.0);
+    if (!sim.eos_is_ideal()) sim.csnd.resize(n_part, 0.0);   // unused, and unallocated, for ideal gas
 
     std::vector<double> h_guess(active.size());
     const bool have_guess = !sim.h.empty();
