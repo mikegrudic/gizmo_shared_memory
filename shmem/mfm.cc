@@ -24,7 +24,7 @@ static inline void get_neighbours(const Sim& sim, const Tree& tree, size_t k, co
     (void)k;
 #endif
     neighbours.clear();
-    ngb_search(tree, sim.P, pos_i, radius, neighbours, sim.box);
+    ngb_search(tree, sim.P, pos_i, radius, neighbours, sim.box, sim.lazy());
 }
 
 // Rank-d inverse of the symmetric moments matrix E, returning false when the neighbour geometry is
@@ -251,7 +251,8 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     NeighborCache* const ngb_cache = nullptr;
 #endif
     const DensityResult solved =
-        density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim, ngb_cache);
+        density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim, ngb_cache,
+                sim.lazy());
     for (size_t k = 0; k < active.size(); ++k) sim.h[active[k]] = solved.h[k];
 
     // SHMEM_NGB_DIAG: how many tree traversals the h solve costs per target. Each Newton
@@ -494,7 +495,8 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
             aold_active[k] = sim.err_tol_force_acc * sim.a_grav[targets[k]].norm() / sim.G;
         aold_ptr = aold_active.data();
     }
-    accel_grouped(tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr);
+    accel_grouped(tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr,
+                  sim.lazy());
     if (sim.tidal_criterion) {
         sim.tidal.resize(n_part);
         #pragma omp parallel for schedule(static)
@@ -720,31 +722,122 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// LAZY DRIFT. GIZMO's core/predict.cc drift_particle(i, time1), guarded on P[i].Ti_current.
+//
+// Advance one particle's position from the tick it is current at to `target`. EXACT for an
+// inactive particle however long the gap: its velocity does not change between its own
+// activations, and the density prediction is an exponential in div_vel * elapsed, which composes
+// (exp(a)exp(b) = exp(a+b)) -- so one long catch-up equals the many short drifts it replaces.
+//
+// Idempotent, and re-checks staleness on entry: that early return is what makes a duplicate call
+// from a racing thread a no-op, exactly as GIZMO relies on (predict.cc:109).
+static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
+    const long long from = sim.last_drift[i];
+    if (from >= target) return;
+    const double dt = sim.time_of_ticks(target - from);
+    Vec3d pos_new = sim.P.pos(i) + Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]} * dt;
+    if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
+    sim.P.x[i] = pos_new[0]; sim.P.y[i] = pos_new[1]; sim.P.z[i] = pos_new[2];
+
+    // Drift-time prediction for INACTIVE particles: between its own updates a particle's density
+    // evolves as its neighbourhood converges or expands, rho_dot = -rho div v. Without this a
+    // long-binned particle in a steadily converging flow carries a systematically LOW density until
+    // it next activates -- in noh the cold supersonic inflow sat 25% under the analytic pre-shock
+    // profile with the velocities EXACT, because only the density estimate was stale. The kernel
+    // radius follows with the opposite sign (h ~ n^{-1/dim}) and pressure tracks rho at fixed u.
+    // Clamped at +-0.3 as GIZMO clamps it; cheap 2nd-order exp for the tiny arguments this sees.
+    if (sim.individual_timesteps && !sim.is_active(i)) {
+        double divv_fac = sim.work.div_vel[i] * dt;
+        if (divv_fac >  0.3) divv_fac =  0.3;
+        if (divv_fac < -0.3) divv_fac = -0.3;
+        if (divv_fac != 0.0) {
+            const double x = -divv_fac;
+            const double f = (std::abs(x) < 0.05) ? 1.0 + x*(1.0 + 0.5*x) : std::exp(x);
+            sim.rho[i]  *= f;
+            sim.ninv[i] /= f;
+            eos_apply(sim, i);              // P(rho) directly, not a scaling of the old pressure
+            sim.h[i] *= (std::abs(divv_fac) < 0.15)
+                        ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
+                        : std::exp(divv_fac / sim.dim);
+            sim.work.predicted[FIELD_DENSITY][i]  = sim.rho[i];
+            sim.work.predicted[FIELD_PRESSURE][i] = sim.press[i];
+        }
+    }
+    // Published LAST, so a thread that observes this particle as current has necessarily also
+    // observed the writes above (the same ordering GIZMO relies on, predict.cc / forcetree.cc).
+    sim.last_drift[i] = target;
+}
+
+// The in-walk callback. One global lock, entered ONLY for a genuinely stale particle -- GIZMO's
+// `#pragma omp critical(_partdriftngb_)` in system/ngb_codeblock_after_condition_threaded.h. On a
+// step where everything is already current it is never taken at all, which is why this scales with
+// actual staleness rather than with the size of the box.
+static void drift_catch_up(void* ctx, uint32_t j) {
+    Sim& sim = *static_cast<Sim*>(ctx);
+    #pragma omp critical(shmem_lazy_drift)
+    { drift_particle_to(sim, j, sim.clock_ticks); }
+}
+
+// The hook handed to the neighbour search and the gravity walk. Null (no hook, no per-neighbour
+// check at all) when nothing can be stale.
+static LazyDrift lazy_drift_hook(Sim& sim) {
+    LazyDrift lazy;
+    // Size it HERE, before the pointer is taken: the walks hold `last` for the whole step, so a
+    // reallocation while they are running would leave them reading freed memory.
+    if (sim.last_drift.size() != sim.size()) sim.last_drift.resize(sim.size(), sim.clock_ticks);
+    lazy.last     = sim.last_drift.data();
+    lazy.target   = sim.clock_ticks;
+    lazy.catch_up = &drift_catch_up;
+    lazy.ctx      = &sim;
+    return lazy;
+}
+
+// Bring EVERY particle current. Used where positions are read in bulk: before a tree build (the
+// build reads live coordinates and derives the node bounds from them) and before writing output.
+static void drift_all_to(Sim& sim, long long target) {
+    if (sim.last_drift.size() != sim.size()) sim.last_drift.assign(sim.size(), target);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < sim.size(); ++i) drift_particle_to(sim, i, target);
+}
+
+void sync_all_positions(Sim& sim) {
+    if (sim.last_drift.empty()) return;          // nothing has run yet; positions are the ICs
+    drift_all_to(sim, sim.clock_ticks);
+}
+
+// Rebuild the tree at the current positions, with the per-node velocity bound initialised from the
+// current velocities. Everything must be current first.
+static void rebuild_tree(Sim& sim) {
+    sync_all_positions(sim);
+    const double* vel[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
+    sim.tree = build(sim.P, nullptr, vel);
+    sim.tree.t_since_build = 0.0;
+    sim.tree_valid = true;
+    ++sim.tree_builds;
+}
+
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
+    sim.last_drift.assign(n_part, sim.clock_ticks);
     const size_t n_gas = std::min(sim.n_gas, n_part);
     std::vector<uint32_t> gas_list(n_gas);
     for (size_t i = 0; i < n_gas; ++i) gas_list[i] = (uint32_t)i;
-    sim.tree = build(sim.P);                 // provisional: neighbour search for the h solve
-    sim.tree_valid = true;
-    sim.drift_since_build = 0.0;
+    rebuild_tree(sim);                       // provisional: neighbour search for the h solve
     solve_h_and_volumes(sim, sim.tree, gas_list);
     update_softenings(sim);
     // Rebuild so the node max-softenings (which gate the softening force-open in the walk) see
     // the real per-particle softenings rather than the zeros the driver loaded with -- the t=0
     // potential is computed from this tree.
-    sim.tree = build(sim.P);
+    rebuild_tree(sim);
 }
 
 void compute_potential(Sim& sim) {
     const size_t n_part = sim.size();
     sim.phi.assign(n_part, 0.0);
     if (!sim.gravity_on) return;
-    if (!sim.tree_valid || sim.tree.nnodes() == 0) {
-        sim.tree = build(sim.P);
-        sim.tree_valid = true;
-        sim.drift_since_build = 0.0;
-    }
+    sync_all_positions(sim);        // GIZMO gravity/potential.cc:68 -- everyone, before the walk
+    if (!sim.tree_valid || sim.tree.nnodes() == 0) rebuild_tree(sim);
     std::vector<uint32_t> all_particles(n_part);
     for (size_t i = 0; i < n_part; ++i) all_particles[i] = (uint32_t)i;
     potential(sim.tree, sim.P, all_particles, sim.theta, sim.G, sim.phi);
@@ -992,16 +1085,27 @@ double mfm_step(Sim& sim, double dt_max) {
     // rebuild pad should track instead
     if (typical_h <= 0.0 && !sim.P.soft.empty())
         typical_h = sim.P.soft[active.empty() ? 0 : active[0]];
+    // The root node's vmax bounds every particle's speed, so root_vmax * t_since_build is an upper
+    // bound on how far anything can have moved since the build -- the same quantity the per-node
+    // prune uses, taken globally. Rebuild once that reaches a noticeable fraction of a typical h,
+    // because past that the inflated prune starts opening nodes it does not need.
+    const double max_drift = (sim.tree_valid && sim.tree.nnodes() > 0)
+                           ? (double)sim.tree.vmax[sim.tree.root] * sim.tree.t_since_build : 0.0;
     const bool must_rebuild = !sim.tree_valid || sim.tree.nnodes() == 0 ||
                               typical_h <= 0.0 ||
-                              sim.drift_since_build > sim.tree_rebuild_pad_frac * typical_h;
-    if (must_rebuild) {
-        sim.tree = build(sim.P);
-        sim.tree_valid = true;
-        sim.drift_since_build = 0.0;
-        ++sim.tree_builds;
+                              max_drift > sim.tree_rebuild_pad_frac * typical_h;
+    if (must_rebuild) rebuild_tree(sim);
+    // Make the ACTIVE set current before anything reads a position -- GIZMO's core/run.cc:588,
+    // "drift the active timebins at each sync". Parallel over a list with no duplicates, so no
+    // lock; a particle that was also active last step is already current and this is a no-op.
+    // Everyone else is caught up on touch, by the hook below.
+    if (sim.sparse_drift) {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k)
+            drift_particle_to(sim, active[k], sim.clock_ticks);
     }
-    sim.tree.pad = sim.drift_since_build;
+    sim.lazy_drift = lazy_drift_hook(sim);
+    sim.lazy_drift_on = sim.sparse_drift;
     const Tree& tree = sim.tree;
     const double t_tree = profile ? lap() : 0.0;
 
@@ -1188,44 +1292,38 @@ double mfm_step(Sim& sim, double dt_max) {
     // Compare SQUARED displacements and take the one square root at the end: this loop is over
     // every particle every sync, and a per-particle sqrt bought nothing but a rank ordering that
     // squaring already preserves.
-    double max_shift_sq = 0.0;
-    #pragma omp parallel for schedule(static) reduction(max:max_shift_sq)
-    for (size_t i = 0; i < n_part; ++i) {
-        const Vec3d shift = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]} * dt;
-        max_shift_sq = std::max(max_shift_sq, shift.norm_sq());
-        Vec3d pos_new = sim.P.pos(i) + shift;
-        if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
-        sim.P.x[i] = pos_new[0]; sim.P.y[i] = pos_new[1]; sim.P.z[i] = pos_new[2];
-
-        // Drift-time prediction for INACTIVE particles (GIZMO's core/predict.cc): between its own
-        // updates a particle's density evolves continuously as its neighbourhood converges or
-        // expands, rho_dot = -rho div v. Without this, a long-binned particle in a steadily
-        // converging flow carries a systematically LOW density until it next activates -- in noh
-        // the cold supersonic inflow sat 25% under the analytic pre-shock profile with the
-        // velocities EXACT, because only the density estimate was stale. The kernel radius
-        // follows with the opposite sign (h ~ n^{-1/dim}) and pressure tracks rho at fixed u.
-        // Clamped at +-0.3 per drift as GIZMO clamps it; cheap 2nd-order exp for the tiny
-        // arguments this almost always sees.
-        if (sim.individual_timesteps && !sim.is_active(i)) {
-            double divv_fac = work.div_vel[i] * dt;
-            if (divv_fac >  0.3) divv_fac =  0.3;
-            if (divv_fac < -0.3) divv_fac = -0.3;
-            if (divv_fac != 0.0) {
-                const double x = -divv_fac;
-                const double f = (std::abs(x) < 0.05) ? 1.0 + x*(1.0 + 0.5*x) : std::exp(x);
-                sim.rho[i]  *= f;
-                sim.ninv[i] /= f;
-                eos_apply(sim, i);          // P(rho) directly, not a scaling of the old pressure
-                sim.h[i]    *= (std::abs(divv_fac) < 0.15)
-                               ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
-                               : std::exp(divv_fac / sim.dim);
-                work.predicted[FIELD_DENSITY][i]  = sim.rho[i];
-                work.predicted[FIELD_PRESSURE][i] = sim.press[i];
-            }
+    const long long drift_target = sim.clock_ticks + step_ticks;
+    if (sim.sparse_drift) {
+        // Only the ACTIVE particles. Everyone else keeps a stale position and a last_drift tick,
+        // and is caught up exactly when something first looks at it -- which is what makes this
+        // cost scale with the work rather than with the size of the box. Parallel over a duplicate
+        // free list, so no lock is needed here.
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k)
+            drift_particle_to(sim, active[k], drift_target);
+    } else {
+        drift_all_to(sim, drift_target);
+    }
+    // Feed this step's velocity changes into the per-node bound -- GIZMO's force_kick_node
+    // (forcetree_update.cc:78), climbing the parent chain with a max. Only ACTIVE particles can
+    // have changed velocity (the gravity kick and the conserved update both cover actives only),
+    // and the climb stops at the first ancestor that already covers the speed, so in steady state
+    // this is one relaxed load per active particle.
+    if (sim.tree_valid && !sim.tree.leaf_of.empty()) {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k) {
+            const uint32_t i = active[k];
+            const int leaf = sim.tree.leaf_of[i];
+            if (leaf >= 0)
+                sim.tree.raise_vmax(
+                    leaf, (float)Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}.norm());
         }
     }
-    // Accumulated displacement is what Tree::pad must cover for the reused tree to stay exact.
-    sim.drift_since_build += std::sqrt(max_shift_sq);
+    // Motion since the build is bounded per node by Tree::vmax * this elapsed time; see the prune
+    // in ngb_search. A wrapping particle needs no special handling: the prune is on the MIN-IMAGE
+    // distance to a node's centre of mass, so a leaf at x ~ box is min-image-adjacent to a query
+    // at x ~ 0 and still gets opened, and the leaf test then reads the live folded position.
+    sim.tree.t_since_build += dt;
 
     if (profile) {
         const double t_drift = lap();
@@ -1372,7 +1470,7 @@ double face_closure(Sim& sim, int nsample) {
         for (size_t j = 0; j < sim.size(); ++j) search_radius = std::max(search_radius, sim.h[j]);
         neighbours.clear();
         const Vec3d pos_i = sim.P.pos(i);
-        ngb_search(tree, sim.P, pos_i, search_radius, neighbours, sim.box);
+        ngb_search(tree, sim.P, pos_i, search_radius, neighbours, sim.box, sim.lazy());
 
         Vec3d face_sum{0, 0, 0};
         for (uint32_t j : neighbours) {

@@ -64,9 +64,11 @@ static inline double kernel_dwdh(double r, double h, int dim = 3) {   // dW/dh a
 
 // All particles within `radius` of `centre`. APPENDS indices to `found` (does not clear it).
 // Prune: every particle in a node lies within (node.s) of the node COM by construction of
-// s = size + delta, so a node can be skipped when dist(COM, centre) > radius + s.
+// s = size + delta, plus vmax * t_since_build for motion since the tree was built, so a node can be
+// skipped when dist(COM, centre) > radius + tree.open_radius(node).
 void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centre,
-                double radius, std::vector<uint32_t>& found, double box = 0.0);
+                double radius, std::vector<uint32_t>& found, double box = 0.0,
+                const LazyDrift* lazy = nullptr);
 
 struct DensityResult {
     std::vector<double> h;        // converged support radius
@@ -96,6 +98,6 @@ struct NeighborCache {
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb,
                       const std::vector<double>& h_start, double box = 0.0, int n_dims = 3,
-                      NeighborCache* cache = nullptr);
+                      NeighborCache* cache = nullptr, const LazyDrift* lazy = nullptr);
 
 }  // namespace shmem

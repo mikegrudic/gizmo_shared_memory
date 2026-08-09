@@ -4,22 +4,40 @@
 namespace shmem {
 
 void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centre,
-                double radius, std::vector<uint32_t>& found, double box) {
+                double radius, std::vector<uint32_t>& found, double box,
+                const LazyDrift* lazy) {
     const WNode* __restrict nodes = tree.wn.data();
+    const float* __restrict node_vmax = tree.vmax.data();
+    const double elapsed = tree.t_since_build;
     const double radius_sq = radius * radius;
     int node_id = tree.root;
     while (node_id >= 0) {
         const WNode& node = nodes[node_id];
         const Vec3d to_com = min_image(Vec3d{node.cx, node.cy, node.cz} - centre, box);
-        // conservative: every particle in the node lies within node.s of its centre of mass, plus
-        // tree.pad for however far particles have drifted since the tree was built
-        const double keep_within = radius + node.s + tree.pad;
+        // Conservative: every particle in the node lies within node.s of the node's centre of mass
+        // as it was AT BUILD TIME, and none can have moved further than this node's own vmax in the
+        // time since. Per node rather than a single global pad -- one fast particle must not
+        // inflate the prune for the whole box (see Tree::vmax).
+        const double keep_within = radius + node.s + (double)node_vmax[node_id] * elapsed;
         if (to_com.norm_sq() > keep_within * keep_within) { node_id = node.next; continue; }
         if (node.first < 0) {
-            for (int slot = node.plo; slot < node.phi; ++slot) {
-                const uint32_t j = tree.orderbuf[slot];
-                if (min_image(particles.pos(j) - centre, box).norm_sq() < radius_sq)
-                    found.push_back(j);
+            // Two spellings of the same loop so the common (nothing stale) path keeps exactly the
+            // instructions it had before lazy drift existed.
+            if (lazy) {
+                for (int slot = node.plo; slot < node.phi; ++slot) {
+                    const uint32_t j = tree.orderbuf[slot];
+                    // catch up BEFORE the distance test, as GIZMO does: testing a stale position
+                    // would let a true neighbour fall outside the radius and be dropped
+                    if (lazy->last[j] < lazy->target) lazy->catch_up(lazy->ctx, j);
+                    if (min_image(particles.pos(j) - centre, box).norm_sq() < radius_sq)
+                        found.push_back(j);
+                }
+            } else {
+                for (int slot = node.plo; slot < node.phi; ++slot) {
+                    const uint32_t j = tree.orderbuf[slot];
+                    if (min_image(particles.pos(j) - centre, box).norm_sq() < radius_sq)
+                        found.push_back(j);
+                }
             }
             node_id = node.next;
         } else {
@@ -31,7 +49,7 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb,
                       const std::vector<double>& h_start, double box, int n_dims,
-                      NeighborCache* cache) {
+                      NeighborCache* cache, const LazyDrift* lazy) {
     const size_t n_targets = targets.size();
     DensityResult result;
     result.h.assign(n_targets, 0.0);    result.rho.assign(n_targets, 0.0);
@@ -84,7 +102,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
             bool converged = false;
             for (; iter < 100; ++iter) {
                 neighbours.clear();
-                ngb_search(tree, particles, pos_target, h, neighbours, box);
+                ngb_search(tree, particles, pos_target, h, neighbours, box, lazy);
                 double weight_sum = 0.0, dweight_dh = 0.0;
                 rho = 0.0; n_inside = 0;
                 for (uint32_t j : neighbours) {
@@ -116,7 +134,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
             // after the last evaluation, so the accumulated rho belongs to the previous h.
             if (!converged) {
                 neighbours.clear();
-                ngb_search(tree, particles, pos_target, h, neighbours, box);
+                ngb_search(tree, particles, pos_target, h, neighbours, box, lazy);
                 rho = 0.0; n_inside = 0;
                 for (uint32_t j : neighbours) {
                     if (!particles.is_gas(j)) continue;   // gas density counts GAS neighbours only

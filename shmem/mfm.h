@@ -85,6 +85,25 @@ struct Sim {
     // right answer (~4 bytes per neighbour per active particle, plus a transient second copy while
     // the per-thread buffers merge). Off by default.
     NeighborCache ngb_cache;
+    // ---- lazy drift (GIZMO's core/predict.cc drift_particle, guarded on P[i].Ti_current) ----
+    // An inactive particle's velocity is CONSTANT between its own activations -- the flux loop
+    // refuses to touch inactive particles and the gravity kick covers actives only -- so drifting
+    // it once over a long interval is EXACTLY equivalent to drifting it every sync, and the O(N)
+    // sweep is pure waste in the regime that matters: a few hundred cells on persistent short
+    // timesteps, where it is most of the step.
+    //
+    // Each particle records the tick its position is current at. The step drifts the ACTIVE set;
+    // everything else is caught up at the moment a search or a walk first reaches it, which is
+    // exactly where GIZMO does it. Everyone is synced before a tree build and before output.
+    std::vector<long long> last_drift;
+    bool sparse_drift = true;           // SHMEM_DENSE_DRIFT=1 restores the full sweep, for A/B
+    // The hook the step hands to every tree walk. Held here rather than threaded through
+    // solve_h_and_volumes / gradients / fluxes / compute_gravity as a parameter, which would be
+    // five layers of plumbing for one pointer. Null while the dense sweep is in use, and the walks
+    // then compile to exactly the code they had before lazy drift existed.
+    LazyDrift lazy_drift;
+    bool lazy_drift_on = false;
+    const LazyDrift* lazy() const { return lazy_drift_on ? &lazy_drift : nullptr; }
     std::vector<uint32_t> grav_targets; // scratch: active list in tree Morton order (see
                                         // compute_gravity -- batch walks need spatial coherence)
     double gamma = 5.0 / 3.0;
@@ -200,7 +219,6 @@ struct Sim {
     // pad has grown enough to make the search inefficient.
     Tree   tree;
     bool   tree_valid = false;
-    double drift_since_build = 0.0;    // upper bound on any particle's displacement since build
     double tree_rebuild_pad_frac = 0.25;  // rebuild once pad exceeds this fraction of a typical h
     long long tree_builds = 0;         // diagnostic
 
@@ -247,6 +265,12 @@ void compute_initial_state(Sim& sim);
 // v_grav = sqrt(|W|/M), and a cold start falls back to v_rms(0) ~ 0, which inflates the reported
 // drift by orders of magnitude even when momentum is conserved to 1e-5.
 void compute_potential(Sim& sim);
+
+// Bring every particle's position current at the engine clock. The step drifts only the active set
+// and catches the rest up on touch, so anything that reads positions in BULK -- writing a snapshot,
+// building a tree, any external diagnostic -- must call this first. GIZMO's equivalent sync points
+// are domain/domain.cc:238,433 and gravity/potential.cc:68.
+void sync_all_positions(Sim& sim);
 
 // Dump the timebin hierarchy in GIZMO's format (core/run.cc), so output from the two engines can be
 // read side by side. NOTE the bin convention is INVERTED relative to GIZMO's: here bin 0 is the

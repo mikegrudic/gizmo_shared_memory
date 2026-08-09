@@ -119,6 +119,21 @@ static inline uint64_t morton(uint32_t a, uint32_t b, uint32_t c) {
     return spread3(a) | (spread3(b) << 1) | (spread3(c) << 2);
 }
 
+// LAZY DRIFT HOOK, following GIZMO's system/ngb_codeblock_after_condition_{unthreaded,threaded}.h.
+// A particle is brought up to date the MOMENT a search reaches it -- before the distance test, not
+// after one passes -- so a stale position can never hide a true neighbour. The slack that makes
+// this sound lives in the node extent (Tree::vmax, below), never in the query radius.
+//
+// `last` is the per-particle tick array; the callback fires only for genuinely stale particles, so
+// a step where everything is already current pays one load and one compare per neighbour and never
+// calls out at all. That cost model is the whole point: it is proportional to actual staleness.
+struct LazyDrift {
+    const long long* last = nullptr;              // per-particle "position is current at" tick
+    long long        target = 0;                  // tick to bring particles up to
+    void           (*catch_up)(void*, uint32_t) = nullptr;
+    void*            ctx = nullptr;
+};
+
 // Packed node for TRAVERSAL. SoA is right for bulk particle loops but wrong for a tree walk, which
 // needs every field of ONE node: with 11 separate arrays each visit touched ~9 cache lines and cost
 // ~108 ns (measured), i.e. DRAM latency per node. Packed into exactly one 64-byte line the walk
@@ -150,14 +165,41 @@ struct Tree {
     int root = 0;
     int nalloc = 0;                     // bump allocator cursor for lock-free node claiming
 
-    // Conservative inflation of every node's opening radius, so a tree built at earlier positions
-    // stays USABLE after particles have drifted. Set it to (an upper bound on) how far any particle
-    // has moved since the build: the neighbour prune then still cannot reject a node that contains a
-    // true neighbour, because leaf tests read live coordinates and only the prune is approximate.
-    // This is what lets the tree be reused across many sync points instead of rebuilt every one.
-    double pad = 0.0;
+    // ---- per-node velocity bound, for reusing a tree whose particles have moved ----
+    // GIZMO's Extnodes[].vmax (gravity/forcetree.cc:827, forcetree_update.cc:78-141), kept in a
+    // side array for the same reason GIZMO keeps Extnodes separate from Nodes: the traversal node
+    // is exactly one cache line and must not grow.
+    //
+    // A node's particles all lie within `s` of its centre of mass AT BUILD TIME, and none of them
+    // can have moved further than vmax * t_since_build since, so
+    //     effective opening radius = s + vmax * t_since_build
+    // still cannot reject a node holding a true neighbour. This is GIZMO's `len += 2*vmax*dt`
+    // (forcetree_update.cc:375) written for a radius instead of a side length.
+    //
+    // It has to be PER NODE, not a global bound: a single fast particle would otherwise inflate the
+    // prune for the whole box. And the timestep criterion does NOT keep fast particles out of long
+    // bins -- v_sig is the Galilean-invariant SIGNAL speed (sound speed plus relative approach), so
+    // a cold fast-advecting region has a small v_sig, a long dt and a huge lab-frame displacement.
+    // Localising the bound is the entire point.
+    std::vector<int>   parent;          // parent node index, -1 at the root; for the kick climb
+    std::vector<int>   leaf_of;         // per PARTICLE, the leaf holding it -- GIZMO's Father[]
+    std::vector<float> vmax;            // max |v| over the node's particles, since the build
+    double t_since_build = 0.0;         // engine time elapsed since this tree was built
 
     size_t nnodes() const { return mass.size(); }   // valid after build() trims to nalloc
+
+    // Opening radius of a node, inflated for motion since the build. Cheap enough for the
+    // neighbour-search inner loop: one float load from a compact array plus an FMA.
+    double open_radius(int node_id) const {
+        return wn[node_id].s + (double)vmax[node_id] * t_since_build;
+    }
+
+    // Record that particle `i` (in leaf `leaf_node`) now moves at |v| = speed, propagating the
+    // bound to every ancestor. GIZMO's force_kick_node: climb the parent chain taking a max. The
+    // climb STOPS as soon as an ancestor already covers the speed -- a node's vmax is by
+    // construction >= all its children's, so once one covers it they all do. In steady state that
+    // breaks at the first test, which is what keeps this affordable on an all-active step.
+    void raise_vmax(int leaf_node, float speed);
 };
 
 static const int LEAF_MAX = 16;        // particles per leaf; below this, direct summation is cheaper
@@ -167,7 +209,8 @@ static const int MAX_LEVEL = 20;       // Morton keys carry 21 bits per axis
 // `order` maps sorted position -> particle index; `key` is the sorted key array.
 int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
                const std::vector<uint64_t>& key, int lo, int hi, int level,
-               double cxi, double cyi, double czi, double sz);
+               double cxi, double cyi, double czi, double sz,
+               const double* const* vel = nullptr);
 
 // Assign next[] so a walk that does not open a node can jump straight past its subtree.
 void setup_walk(Tree& T, int node, int next_sibling);
@@ -177,7 +220,10 @@ struct BuildTimes { double bbox=0, keys=0, sort=0, recurse=0, links=0, pack=0, t
 
 // Build the whole tree. Parallel key computation and walk-link setup; the recursive build is
 // task-parallel over disjoint ranges.
-Tree build(const Particles& P, BuildTimes* bt = nullptr);
+// `vel`, when non-null, points at three per-particle velocity arrays (vx, vy, vz) and switches on
+// the per-node vmax bound above. Passed rather than stored on Particles because the engine keeps
+// velocities in its own arrays; gravity-only users of the tree pass nothing and pay nothing.
+Tree build(const Particles& P, BuildTimes* bt = nullptr, const double* const* vel = nullptr);
 
 // Accelerations for the listed targets, Barnes-Hut with opening angle theta.
 // `targets` is the ACTIVE list -- the whole point is that it is usually tiny compared to P.
@@ -212,7 +258,8 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch /* = 8 */, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az,
-                   std::vector<SymTensor3d>* tidal = nullptr, const double* aold = nullptr);
+                   std::vector<SymTensor3d>* tidal = nullptr, const double* aold = nullptr,
+                   const LazyDrift* lazy = nullptr);
 
 // Gravitational potential at each target, spline-softened to match accel(). Separate from the
 // force walk because it is only wanted for diagnostics -- but it is the diagnostic that matters

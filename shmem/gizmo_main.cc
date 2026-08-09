@@ -415,6 +415,8 @@ int main(int argc, char** argv) {
     if (params.count("ErrTolForceAcc")) sim.err_tol_force_acc = atof(params["ErrTolForceAcc"].c_str());
     // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
+    // SHMEM_DENSE_DRIFT=1 restores the full O(N) drift sweep, for A/B against lazy drift.
+    sim.sparse_drift = (getenv("SHMEM_DENSE_DRIFT") == nullptr);
     if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));
     set_time_base(sim, dt_snapshot, dt_max);
     printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
@@ -474,6 +476,7 @@ int main(int argc, char** argv) {
     // sum_j m_j W that the neighbour routine returns -- see compute_initial_state.
     compute_initial_state(sim);
     if (sim.output_potential) compute_potential(sim);
+    sync_all_positions(sim);
     write_snapshot(sim, particle_ids, outdir, 0, 0.0, box);
 
     // Time is tracked in the engine's INTEGER TICKS, not accumulated in floating point. Summing
@@ -522,12 +525,14 @@ int main(int argc, char** argv) {
                                   next_snapshot_time < time_max);
         if (at_snapshot) {
             if (sim.output_potential) compute_potential(sim);
+            sync_all_positions(sim);
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time, box);
             next_snapshot_ticks += snap_ticks;
             next_snapshot_time += dt_snapshot;
         }
     }
     if (sim.output_potential) compute_potential(sim);
+    sync_all_positions(sim);
     write_snapshot(sim, particle_ids, outdir, snapshot_num, time, box);
     printf("done: t=%.6g in %d steps\n", time, n_steps);
     MPI_Finalize();

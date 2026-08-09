@@ -2,6 +2,7 @@
 #include "hydro.h"    // kernel_dwdr, for the adaptive-softening zeta correction
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <parallel/algorithm>
 
 static double now_ms(){using c=std::chrono::steady_clock;
@@ -101,7 +102,7 @@ static inline void kick(double offset_x, double offset_y, double offset_z,
 
 int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
                const std::vector<uint64_t>& key, int lo, int hi, int level,
-               double cxi, double cyi, double czi, double sz) {
+               double cxi, double cyi, double czi, double sz, const double* const* vel) {
     // Lock-free allocation: arrays are pre-sized (worst case ~2N/LEAF_MAX interior+leaf nodes,
     // bounded by 2N), so claiming a node is one atomic increment. Do NOT replace this with a
     // critical section around push_backs on the node arrays -- that serialises every task on one
@@ -143,9 +144,9 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
             double oz = czi + ((oct & 4) ? q : -q);
             if (spawn) {
                 #pragma omp task shared(T, P, order, key, kids) firstprivate(a, b, level, ox, oy, oz, h, i)
-                kids[i] = build_node(T, P, order, key, a, b, level + 1, ox, oy, oz, h);
+                kids[i] = build_node(T, P, order, key, a, b, level + 1, ox, oy, oz, h, vel);
             } else {
-                kids[i] = build_node(T, P, order, key, a, b, level + 1, ox, oy, oz, h);
+                kids[i] = build_node(T, P, order, key, a, b, level + 1, ox, oy, oz, h, vel);
             }
         }
         if (spawn) {
@@ -153,6 +154,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
         }
         if (nk == 0) { leaf = true; }
         else {
+            for (int i = 0; i < nk; ++i) T.parent[kids[i]] = me;
             T.first[me] = kids[0];
             for (int i = 0; i + 1 < nk; ++i) T.next[kids[i]] = kids[i + 1];
             T.next[kids[nk - 1]] = -1;               // patched to the uncle in setup_walk
@@ -162,13 +164,20 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     // Moments. Leaves scan their particles; interior nodes COMBINE their children's already-final
     // moments, so the total moment work is O(N) instead of O(N * depth) -- the old version re-scanned
     // the full particle range at every level, which at depth ~15 was most of the recursion cost.
-    double M = 0, sx = 0, sy = 0, sz_ = 0, smax = 0;
+    // The per-node velocity bound (Tree::vmax) accumulates the same way, in the same sweep.
+    double M = 0, sx = 0, sy = 0, sz_ = 0, smax = 0, vmax = 0;
     if (T.first[me] < 0 || nk == 0) {
         for (int i = lo; i < hi; ++i) {
             uint32_t p = order[i];
             double m = P.m[p];
             M += m; sx += m * P.x[p]; sy += m * P.y[p]; sz_ += m * P.z[p];
             if (!P.soft.empty() && P.soft[p] > smax) smax = P.soft[p];
+            if (vel) {
+                const double v = std::sqrt(vel[0][p]*vel[0][p] + vel[1][p]*vel[1][p] +
+                                           vel[2][p]*vel[2][p]);
+                if (v > vmax) vmax = v;
+            }
+            T.leaf_of[p] = me;
         }
     } else {
         for (int i = 0; i < nk; ++i) {
@@ -176,13 +185,38 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
             double m = T.mass[k];
             M += m; sx += m * T.cx[k]; sy += m * T.cy[k]; sz_ += m * T.cz[k];
             if (T.soft[k] > smax) smax = T.soft[k];
+            if (T.vmax[k] > vmax) vmax = T.vmax[k];
         }
     }
     if (M > 0) { sx /= M; sy /= M; sz_ /= M; }
     T.mass[me] = M; T.cx[me] = sx; T.cy[me] = sy; T.cz[me] = sz_; T.soft[me] = smax;
+    T.vmax[me] = (float)vmax;
     double dx = sx - cxi, dy = sy - cyi, dz = sz_ - czi;
     T.delta[me] = std::sqrt(dx*dx + dy*dy + dz*dz);
     return me;
+}
+
+// Atomic max on a NON-NEGATIVE float, done on its bit pattern: for x >= 0 the IEEE-754 encoding is
+// monotonic in the value, so an unsigned integer compare is exactly a float compare. Saves needing
+// a lock or a double-width CAS on the hot kick path. (GIZMO's atomic_max_double, same idea.)
+static inline void atomic_max_nonneg(float* slot, float value) {
+    uint32_t want; std::memcpy(&want, &value, sizeof want);
+    uint32_t* bits = reinterpret_cast<uint32_t*>(slot);
+    uint32_t seen = __atomic_load_n(bits, __ATOMIC_RELAXED);
+    while (seen < want &&
+           !__atomic_compare_exchange_n(bits, &seen, want, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { /* seen reloaded */ }
+}
+
+void Tree::raise_vmax(int leaf_node, float speed) {
+    uint32_t want; std::memcpy(&want, &speed, sizeof want);
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        // A node's vmax is >= every descendant's, so the first ancestor that already covers this
+        // speed guarantees all the ones above it do too. Almost every kick stops here.
+        const uint32_t* bits = reinterpret_cast<const uint32_t*>(&vmax[no]);
+        if (__atomic_load_n(bits, __ATOMIC_RELAXED) >= want) return;
+        atomic_max_nonneg(&vmax[no], speed);
+    }
 }
 
 void setup_walk(Tree& T, int node, int next_sibling) {
@@ -195,7 +229,7 @@ void setup_walk(Tree& T, int node, int next_sibling) {
     }
 }
 
-Tree build(const Particles& P, BuildTimes* bt) {
+Tree build(const Particles& P, BuildTimes* bt, const double* const* vel) {
     double t_a = now_ms(), t_start = t_a;
     const size_t n = P.size();
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
@@ -236,15 +270,17 @@ Tree build(const Particles& P, BuildTimes* bt) {
         T.cx.resize(cap); T.cy.resize(cap); T.cz.resize(cap);
         T.mass.resize(cap); T.size.resize(cap); T.delta.resize(cap); T.soft.resize(cap);
         T.first.resize(cap); T.next.resize(cap); T.plo.resize(cap); T.phi.resize(cap);
+        T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
+        T.leaf_of.assign(n, -1);
     }
     #pragma omp parallel
     #pragma omp single
-    T.root = build_node(T, P, order, skey, 0, (int)n, 0, cx, cy, cz, side);
+    T.root = build_node(T, P, order, skey, 0, (int)n, 0, cx, cy, cz, side, vel);
     {   // trim to what was allocated
         size_t nn = (size_t)T.nalloc;
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
-        T.plo.resize(nn); T.phi.resize(nn);
+        T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
     }
     if(bt) { bt->recurse = now_ms()-t_a; } t_a = now_ms();
     setup_walk(T, T.root, -1);
@@ -369,7 +405,7 @@ void accel_soa(const Tree& T, const Particles& P, const std::vector<uint32_t>& t
 void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t>& targets,
                    double theta, double G, int batch, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az,
-                   std::vector<SymTensor3d>* tidal, const double* aold) {
+                   std::vector<SymTensor3d>* tidal, const double* aold, const LazyDrift* lazy) {
     const size_t nt = targets.size();
     ax.assign(nt, 0.0); ay.assign(nt, 0.0); az.assign(nt, 0.0);
     const bool want_tidal = (tidal != nullptr);
@@ -425,6 +461,10 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                 if (w.first < 0) {
                     for (int k = w.plo; k < w.phi; ++k) {
                         uint32_t q = T.orderbuf[k];
+                        // Lazy drift, exactly as in the neighbour search and in GIZMO's
+                        // forcetree.cc:1678: a source particle is caught up the moment the walk
+                        // reaches it, before its position is read.
+                        if (lazy && lazy->last[q] < lazy->target) lazy->catch_up(lazy->ctx, q);
                         double qx=P.x[q], qy=P.y[q], qz=P.z[q], qm=P.m[q];
                         double qs = P.soft.empty()?0.0:P.soft[q];
                         double qzeta = have_zeta?P.zeta[q]:0.0;
