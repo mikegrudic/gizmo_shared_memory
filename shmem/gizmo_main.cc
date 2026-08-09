@@ -101,8 +101,14 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             if (flag("BOX_PERIODIC"))             box_periodic = true;
             // The STARFORGE defaults switch on the whole single-star sink package; the engine
             // implements the formation criteria of that bundle (see sink_formation_pass).
+            // The bundle also defines ADAPTIVE_GRAVSOFT_FORGAS (precompiler_logic.h:372) --
+            // without it gas gravity is softened only by the fixed SofteningGas floor, which the
+            // STARFORGE params set to ~0 precisely BECAUSE the softening is meant to be adaptive.
+            // Missing this both unsoftens close gas-gas forces and drives the acceleration
+            // timestep sqrt(eta*soft/|a|) orders of magnitude below the CFL step.
             if (flag("SINGLE_STAR_SINK_FORMATION") || flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
-                flag("SINGLE_STAR_SINK_DYNAMICS")) { sink_formation = true; tidal_criterion = true; }
+                flag("SINGLE_STAR_SINK_DYNAMICS"))
+                { sink_formation = true; tidal_criterion = true; adaptive_soft = true; }
             if (flag("EOS_GMC_BAROTROPIC_SOUNDSPEED")) baro_soundspeed = true;
             double adiabat_value;
             if (flag("EOS_ENFORCE_ADIABAT") &&
