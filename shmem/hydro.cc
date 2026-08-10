@@ -50,6 +50,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box, int n_dims,
                       NeighborCache* cache, const LazyDrift* lazy) {
+    static const bool no_face_corr = getenv("SHMEM_NO_FACECORR") != nullptr;  // A/B switch
     const size_t n_targets = targets.size();
     DensityResult result;
     result.h.assign(n_targets, 0.0);    result.rho.assign(n_targets, 0.0);
@@ -105,17 +106,49 @@ DensityResult density(const Tree& tree, const Particles& particles,
                 ngb_search(tree, particles, pos_target, h, neighbours, box, lazy);
                 double weight_sum = 0.0, dweight_dh = 0.0;
                 rho = 0.0; n_inside = 0;
+                SymTensor3d moments{0,0,0,0,0,0};   // E_i, for the face-closure correction below
+                Vec3d face_w{0, 0, 0};              // sum_j dx W_ij
                 for (uint32_t j : neighbours) {
                     if (!particles.is_gas(j)) continue;   // gas h counts GAS neighbours only
-                    const double r = min_image(particles.pos(j) - pos_target, box).norm();
-                    weight_sum += kernel_w(r, h, n_dims);
+                    const Vec3d dx = min_image(particles.pos(j) - pos_target, box);
+                    const double r = dx.norm();
+                    const double w = kernel_w(r, h, n_dims);
+                    weight_sum += w;
                     dweight_dh += kernel_dwdh(r, h, n_dims);
-                    rho += particles.m[j] * kernel_w(r, h, n_dims);
+                    rho += particles.m[j] * w;
+                    moments += outer_product(dx) * w;
+                    face_w += dx * w;
                     if (r < h) ++n_inside;
                 }
                 const double n_eff = ball_vol(h, n_dims) * weight_sum;
-                const double residual = n_eff - des_ngb;
-                if (std::abs(residual) < ngb_tol) { converged = true; break; }
+
+                // FACE-CLOSURE CORRECTION (density.cc:565-598). The effective faces around a cell
+                // should sum to zero; what is left of the one-sided estimator 2 V B . (sum_j dx W),
+                // divided by the kernel-weighted rms neighbour distance, is a dimensionless leak.
+                // Past 0.35 the reference widens the kernel in proportion, up to 2x, and solves for
+                // THAT many neighbours instead of DesNumNgb. It fires on well under 1% of cells --
+                // the density peak and the free surface -- but those are exactly the cells that set
+                // rho_max, and (since gas gravitational softening is h) the short-range gravity
+                // there. Without it a collapsing core is resolved with a kernel ~1.3x too narrow.
+                double des_eff = des_ngb, tol_eff = ngb_tol;
+                if (!no_face_corr && weight_sum > 0) {
+                    Mat3d B;
+                    if (invert_moments(moments, B, n_dims)) {
+                        const double vol = 1.0 / weight_sum;
+                        const double dx_i = std::sqrt(vol * moments.trace());
+                        const Vec3d leak = B.matvec(face_w) * (2.0 * vol);
+                        double sum_abs = 0.0;
+                        for (int c = 0; c < 3; ++c) sum_abs += std::abs(leak[c]) / n_dims;
+                        const double denom = 2.0 * n_dims * std::pow(dx_i, n_dims - 1);
+                        if (denom > 0) {
+                            const double fce = sum_abs / denom;
+                            const double ncorr = std::min(std::max(fce / 0.35, 1.0), 2.0);
+                            des_eff = des_ngb * ncorr; tol_eff = ngb_tol * ncorr;
+                        }
+                    }
+                }
+                const double residual = n_eff - des_eff;
+                if (std::abs(residual) < tol_eff) { converged = true; break; }
                 if (residual > 0) h_hi = h; else h_lo = h;
 
                 // Newton on N_eff(h), guarded by the bracket. dN/dh is positive away from
