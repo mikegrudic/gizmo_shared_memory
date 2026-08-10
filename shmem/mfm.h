@@ -46,6 +46,7 @@ struct Work {
     std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
     std::vector<double> div_vel;                               // velocity divergence at last update
     std::vector<double> condition_number;                      // E-matrix conditioning, per cell
+    std::vector<double> face_closure;                          // dimensionless face-closure leak
 
     void resize(size_t n) {
         moments_inv.resize(n);
@@ -54,6 +55,7 @@ struct Work {
         signal_speed.resize(n);
         div_vel.resize(n, 0.0);
         condition_number.resize(n, 1.0);
+        face_closure.resize(n, 0.0);
     }
 };
 
@@ -215,10 +217,22 @@ struct Sim {
     bool   tidal_criterion = false;    // TIDAL_TIMESTEP_CRITERION: dt from the tidal tensor
     std::vector<SymTensor3d> tidal;    // d2phi/dxdx per particle (no G factor), from the walk
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
+    // SWALLOW SPLIT. The reference swallows between its closing and opening half-kicks
+    // (run.cc:167-169), which is mid-step here, and removing a particle there would shift every
+    // index the rest of the step still holds. So the merge happens at that point and the removal
+    // is deferred to the end of the step -- the reference does the same thing, zeroing the
+    // swallowed cell's mass in place and tidying up later. doomed_mask keeps the marked cells out
+    // of the conserved update in between.
+    std::vector<uint32_t> doomed_cells;
+    std::vector<char>     doomed_mask;
+    Vec3d acc_audit_baseline{0, 0, 0};
     // Hydro acceleration retained from each particle's own last update, so the drift can keep its
     // PREDICTED velocity current -- see drift_particle_to. Not used by the kick, which integrates
     // the live flux accumulators.
     std::vector<Vec3d> a_hydro;
+    // SHMEM_SINK_PINNED scratch: where each sink formed, and whether that has been recorded.
+    std::vector<double> sink_pin_x, sink_pin_y, sink_pin_z;
+    std::vector<char>   sink_pinned;
     // Half-kick owed by each particle from the close of ITS OWN previous step. Must be per
     // particle: with a spread of timebins the closing half-kick a particle owes is half of its own
     // last step, which has nothing to do with the system step. A single shared scalar silently
