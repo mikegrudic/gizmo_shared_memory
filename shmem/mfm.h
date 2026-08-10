@@ -215,6 +215,10 @@ struct Sim {
     bool   tidal_criterion = false;    // TIDAL_TIMESTEP_CRITERION: dt from the tidal tensor
     std::vector<SymTensor3d> tidal;    // d2phi/dxdx per particle (no G factor), from the walk
     std::vector<Vec3d> a_grav;         // acceleration at the CURRENT positions; see mfm_step
+    // Hydro acceleration retained from each particle's own last update, so the drift can keep its
+    // PREDICTED velocity current -- see drift_particle_to. Not used by the kick, which integrates
+    // the live flux accumulators.
+    std::vector<Vec3d> a_hydro;
     // Half-kick owed by each particle from the close of ITS OWN previous step. Must be per
     // particle: with a spread of timebins the closing half-kick a particle owes is half of its own
     // last step, which has nothing to do with the system step. A single shared scalar silently

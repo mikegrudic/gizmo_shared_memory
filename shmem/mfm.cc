@@ -747,6 +747,19 @@ static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
     // radius follows with the opposite sign (h ~ n^{-1/dim}) and pressure tracks rho at fixed u.
     // Clamped at +-0.3 as GIZMO clamps it; cheap 2nd-order exp for the tiny arguments this sees.
     if (sim.individual_timesteps && !sim.is_active(i)) {
+        // PREDICTED VELOCITY -- GIZMO's VelPred (predict.cc:189), which it advances on every drift
+        // for every particle. The STORED velocity is a KDK quantity and correctly stays put between
+        // an inactive particle's own kicks, but the hydro reads the PREDICTED one, on both sides of
+        // every face. Left un-advanced, a coarse-bin neighbour enters its active neighbours'
+        // Riemann problems with a velocity stale by up to its whole step -- under gravity that is
+        // not noise but a*dt pointing steadily one way, biasing the face frame and hence P*.
+        static const bool no_velpred = getenv("SHMEM_NO_VELPRED") != nullptr;  // A/B switch
+        if (!no_velpred && i < sim.n_gas && sim.a_grav.size() > i && sim.a_hydro.size() > i) {
+            const Vec3d dv = (sim.a_grav[i] + sim.a_hydro[i]) * dt;
+            sim.work.predicted[FIELD_VX][i] += dv[0];
+            sim.work.predicted[FIELD_VY][i] += dv[1];
+            sim.work.predicted[FIELD_VZ][i] += dv[2];
+        }
         double divv_fac = sim.work.div_vel[i] * dt;
         if (divv_fac >  0.3) divv_fac =  0.3;
         if (divv_fac < -0.3) divv_fac = -0.3;
@@ -975,7 +988,10 @@ static void sink_accretion_pass(Sim& sim) {
             const double r = dx.norm();
             if (!(r > 0) || r > r_sink) continue;                // inside the fixed sink radius
             if (diag) ++acc_inside;                              // reached the physical tests
-            // the cell must be smaller than the sink it falls into (sink.cc:127)
+            // the cell must be smaller than the sink it falls into (sink.cc:127). The reference's
+            // Get_Particle_Size() is 1.61199*KernelRadius/NumNgb, where NumNgb has already been
+            // replaced by its cube root at the end of the density loop (density.cc:1037) to save
+            // repeated cbrt calls -- so it is exactly V^(1/3), which is what this computes.
             if (std::pow(sim.ninv[j], 1.0/sim.dim) > r_sink * 1.396263) {
                 if (diag) ++acc_rej_res;
                 continue;
@@ -1970,6 +1986,8 @@ double mfm_step(Sim& sim, double dt_max) {
     Work& work = sim.work;
     const auto step_start = std::chrono::steady_clock::now();
 
+    if (sim.a_hydro.size() != n_part) sim.a_hydro.resize(n_part, Vec3d{0, 0, 0});
+
     // ---- active set ----
     // Global scheme: everyone, every step. Individual: whoever the integer clock says is due.
     if (sim.individual_timesteps && sim.bin.size() != n_part) sim.bin.assign(n_part, 0);
@@ -2310,6 +2328,9 @@ double mfm_step(Sim& sim, double dt_max) {
         // rate * own dt -- the accumulators hold dP/dt and dE/dt, not amounts
         const Vec3d momentum = vel_old * mass + Vec3d{dmom_x[i], dmom_y[i], dmom_z[i]} * dt_i;
         const double energy = mass * (sim.u[i] + 0.5*vel_old.norm_sq()) + denergy[i] * dt_i;
+        // Kept for drift_particle_to's velocity prediction: the accumulators are cleared next line,
+        // and this is the only surviving record of the rate this particle last saw.
+        sim.a_hydro[i] = Vec3d{dmom_x[i], dmom_y[i], dmom_z[i]} / mass;
         dmom_x[i] = 0; dmom_y[i] = 0; dmom_z[i] = 0; denergy[i] = 0;
 
         const Vec3d vel_new = momentum / mass;
