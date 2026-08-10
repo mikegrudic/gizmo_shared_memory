@@ -45,6 +45,7 @@ struct Work {
     std::array<std::vector<double>, NUM_FIELDS> predicted;     // half-step predicted primitives
     std::vector<double> signal_speed;                          // Monaghan signal speed, per particle
     std::vector<double> div_vel;                               // velocity divergence at last update
+    std::vector<double> condition_number;                      // E-matrix conditioning, per cell
 
     void resize(size_t n) {
         moments_inv.resize(n);
@@ -52,6 +53,7 @@ struct Work {
         for (auto& p : predicted) p.resize(n);
         signal_speed.resize(n);
         div_vel.resize(n, 0.0);
+        condition_number.resize(n, 1.0);
     }
 };
 
@@ -190,6 +192,12 @@ struct Sim {
 
     double box   = 0.0;                // >0: periodic cube [0, box)^3
     double des_ngb = 32.0;
+    // MaxNumNgbDeviation from the params file: how close the kernel-weighted neighbour number
+    // must get to des_ngb before the h solve stops. This was hardcoded at 1e-4*des_ngb, i.e.
+    // 16x tighter than shu1977 actually asks for -- which matters in a tight knot of particles,
+    // where the exactly-converged kernel is much narrower than the tolerated one and gives a
+    // correspondingly sharper density peak.
+    double ngb_tol = 0.05;
     double cfl     = 0.25;
 
     // ---- self-gravity (off unless gravity_on; SELFGRAVITY_OFF in the suite configs) ----

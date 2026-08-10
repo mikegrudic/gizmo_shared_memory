@@ -96,7 +96,7 @@ struct NeighborCache {
 // initial guess; pass an empty vector to derive one from the mean interparticle spacing.
 // When `cache` is non-null it is filled with each target's neighbour list at the CONVERGED h.
 DensityResult density(const Tree& tree, const Particles& particles,
-                      const std::vector<uint32_t>& targets, double des_ngb,
+                      const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box = 0.0, int n_dims = 3,
                       NeighborCache* cache = nullptr, const LazyDrift* lazy = nullptr);
 

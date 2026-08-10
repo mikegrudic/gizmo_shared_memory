@@ -322,6 +322,36 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
     printf("wrote %s (t=%.6g)\n", filename, time); fflush(stdout);
 }
 
+
+// Write a snapshot AT a requested time that need not be a step boundary. Positions are drifted
+// back by `back_dt` from wherever the step landed; velocities are constant between kicks, so
+// this is exact rather than an interpolation error. The simulation state is restored afterwards,
+// so producing output never perturbs the integration -- which is the property that lets the
+// timestep ladder be anchored to the run instead of to the output cadence.
+static void write_snapshot_at(Sim& sim, const std::vector<long long>& particle_ids,
+                              const std::string& outdir, int snapshot_num, double out_time,
+                              double back_dt, double header_box) {
+    if (back_dt <= 0) {
+        write_snapshot(sim, particle_ids, outdir, snapshot_num, out_time, header_box);
+        return;
+    }
+    const size_t n = sim.size();
+    std::vector<double> keep_x(sim.P.x), keep_y(sim.P.y), keep_z(sim.P.z);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        double x = sim.P.x[i] - sim.vx[i] * back_dt;
+        double y = sim.P.y[i] - sim.vy[i] * back_dt;
+        double z = sim.P.z[i] - sim.vz[i] * back_dt;
+        if (sim.box > 0) {
+            x = fold_into_box(x, sim.box); y = fold_into_box(y, sim.box);
+            z = fold_into_box(z, sim.box);
+        }
+        sim.P.x[i] = x; sim.P.y[i] = y; sim.P.z[i] = z;
+    }
+    write_snapshot(sim, particle_ids, outdir, snapshot_num, out_time, header_box);
+    sim.P.x.swap(keep_x); sim.P.y.swap(keep_y); sim.P.z.swap(keep_z);
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int rank = 0;
@@ -491,6 +521,8 @@ int main(int argc, char** argv) {
                sim.nh_per_code_density, sim.code_press_per_cgs);
     if (params.count("ErrTolIntAccuracy")) sim.eta_grav = atof(params["ErrTolIntAccuracy"].c_str());
     if (params.count("ErrTolTheta"))    sim.theta = atof(params["ErrTolTheta"].c_str());
+    if (params.count("MaxNumNgbDeviation"))
+        sim.ngb_tol = atof(params["MaxNumNgbDeviation"].c_str());
     if (params.count("ErrTolForceAcc")) sim.err_tol_force_acc = atof(params["ErrTolForceAcc"].c_str());
     // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
@@ -501,7 +533,15 @@ int main(int argc, char** argv) {
     // reads node centres-of-mass as they were AT BUILD TIME, so this directly controls a force
     // error that the neighbour-search padding does not cover. 0 rebuilds every sync, for A/B.
     if (const char* tp = getenv("SHMEM_TREE_PAD_FRAC")) sim.tree_rebuild_pad_frac = atof(tp);
-    set_time_base(sim, dt_snapshot, dt_max);
+    // Anchor the integer timeline on the WHOLE RUN, exactly as the reference does
+    // (core/init.cc:114, Timebase_interval = (TimeMax - TimeBegin)/TIMEBASE). Anchoring it on
+    // the SNAPSHOT interval instead -- which this used to do -- makes the reachable timesteps
+    // depend on the output cadence: two runs of the same problem written at different
+    // TimeBetSnapshot integrate on different ladders, and neither matches GIZMO's unless the
+    // snapshot interval happens to be a power-of-two fraction of the run. With TimeMax=0.02 and
+    // MaxSizeTimestep=0.005 this gives dt_base = 0.005 = 0.02/4, so the ladder is 0.02/2^k --
+    // identical to the reference's reachable set.
+    set_time_base(sim, time_max - 0.0, dt_max);
     printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
            sim.individual_timesteps ? "individual" : "global", sim.dt_base);
 
@@ -579,8 +619,10 @@ int main(int argc, char** argv) {
     while (sim.individual_timesteps ? (sim.clock_ticks < end_ticks) : (time < time_max - 1e-12)) {
         double dt_allowed;
         if (sim.individual_timesteps) {
-            const long long target_ticks = std::min(next_snapshot_ticks, end_ticks);
-            dt_allowed = std::min(dt_max, sim.time_of_ticks(target_ticks - sim.clock_ticks));
+            // Only the END of the run bounds the step now. Snapshots are produced by drifting
+            // to the output time (below), not by truncating the step to hit it -- truncation is
+            // what forced the ladder to be tied to the output cadence.
+            dt_allowed = std::min(dt_max, sim.time_of_ticks(end_ticks - sim.clock_ticks));
         } else {
             dt_allowed = std::min(dt_max, std::min(next_snapshot_time, time_max) - time);
         }
@@ -602,15 +644,27 @@ int main(int argc, char** argv) {
             // hierarchy evolves as the run proceeds.
             if (sim.individual_timesteps) print_timebins(sim, dt_taken, time);
         }
-        const bool at_snapshot = sim.individual_timesteps
-                               ? (sim.clock_ticks >= next_snapshot_ticks && sim.clock_ticks < end_ticks)
-                               : (time >= std::min(next_snapshot_time, time_max) - 1e-12 &&
-                                  next_snapshot_time < time_max);
-        if (at_snapshot) {
+        // OUTPUT. A step may now overshoot -- or leap clean over -- one or more output times,
+        // so this is a loop, and each snapshot is written at its OWN requested time by drifting
+        // positions there rather than at wherever the step happened to land. Velocities are
+        // constant between kicks, so the interpolation is exact, not an approximation; this is
+        // GIZMO's strategy (drift to All.Ti_nextoutput, write, carry on) with the state left
+        // untouched afterwards. It also means an arbitrary list of output times costs nothing
+        // extra, which is what OutputListOn will need.
+        while (sim.individual_timesteps && sim.clock_ticks >= next_snapshot_ticks
+               && next_snapshot_ticks < end_ticks) {
+            if (sim.output_potential) compute_potential(sim);
+            sync_all_positions(sim);
+            write_snapshot_at(sim, particle_ids, outdir, snapshot_num++,
+                              sim.time_of_ticks(next_snapshot_ticks),
+                              sim.time_of_ticks(sim.clock_ticks - next_snapshot_ticks), box);
+            next_snapshot_ticks += snap_ticks;
+        }
+        if (!sim.individual_timesteps &&
+            time >= std::min(next_snapshot_time, time_max) - 1e-12 && next_snapshot_time < time_max) {
             if (sim.output_potential) compute_potential(sim);
             sync_all_positions(sim);
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time, box);
-            next_snapshot_ticks += snap_ticks;
             next_snapshot_time += dt_snapshot;
         }
     }

@@ -47,7 +47,7 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
 }
 
 DensityResult density(const Tree& tree, const Particles& particles,
-                      const std::vector<uint32_t>& targets, double des_ngb,
+                      const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box, int n_dims,
                       NeighborCache* cache, const LazyDrift* lazy) {
     const size_t n_targets = targets.size();
@@ -115,7 +115,7 @@ DensityResult density(const Tree& tree, const Particles& particles,
                 }
                 const double n_eff = ball_vol(h, n_dims) * weight_sum;
                 const double residual = n_eff - des_ngb;
-                if (std::abs(residual) < 1e-4 * des_ngb) { converged = true; break; }
+                if (std::abs(residual) < ngb_tol) { converged = true; break; }
                 if (residual > 0) h_hi = h; else h_lo = h;
 
                 // Newton on N_eff(h), guarded by the bracket. dN/dh is positive away from

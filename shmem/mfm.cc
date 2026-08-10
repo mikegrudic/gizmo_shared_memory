@@ -131,16 +131,26 @@ static inline double sound_speed(const Sim& sim, size_t i) {
 // `stol` allows overshoot beyond the smaller excursion (capped at the larger); GIZMO uses 0 with
 // gravity on and 0.1 for pure hydro. Positivity preservation (density, pressure) additionally
 // caps the slope so the value stays positive over the farthest neighbour distance d_max.
+// GIZMO does NOT hold this fixed: at gradients.cc:1005 it TIGHTENS the limiter where the
+// E-matrix is poorly conditioned --
+//     a_limiter = 0.25; if(cn > 100) a_limiter = min(0.5, 0.25 + 0.25*(cn-100)/100)
+// -- a larger a_limiter permitting a SMALLER slope. Holding it at 0.25 everywhere means
+// trusting reconstructed gradients in exactly the cells where the matrix says they are least
+// trustworthy, which in a collapsing core is where it matters.
 static constexpr double A_LIMITER = 0.25;
+static inline double a_limiter_for(double condition_number) {
+    if (condition_number <= 100.0) return A_LIMITER;
+    return std::min(0.5, 0.25 + 0.25 * (condition_number - 100.0) / 100.0);
+}
 static inline void limit_slope(Vec3d& gradient, double largest_rise, double largest_drop,
                                double h_lim, double stol, bool pos_preserve,
-                               double d_max, double val_cen) {
+                               double d_max, double val_cen, double a_limiter = A_LIMITER) {
     const double slope = gradient.norm();
     if (slope <= 0) return;
     double abs_max = std::abs(largest_rise), abs_min = std::abs(largest_drop);
     if (abs_max < abs_min) std::swap(abs_max, abs_min);
     const double allowed = std::min(abs_min + stol * abs_max, abs_max);
-    double factor = allowed / (A_LIMITER * h_lim * slope);
+    double factor = allowed / (a_limiter * h_lim * slope);
     if (pos_preserve && d_max > 0) {
         const double val_min_ngb = val_cen + largest_drop;      // actual minimum neighbour value
         const double fmin = std::min(val_cen, std::max(0.0,
@@ -229,7 +239,7 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     NeighborCache* const ngb_cache = nullptr;
 #endif
     const DensityResult solved =
-        density(tree, sim.P, active, sim.des_ngb, h_guess, sim.box, sim.dim, ngb_cache,
+        density(tree, sim.P, active, sim.des_ngb, sim.ngb_tol, h_guess, sim.box, sim.dim, ngb_cache,
                 sim.lazy());
     for (size_t k = 0; k < active.size(); ++k) sim.h[active[k]] = solved.h[k];
 
@@ -375,12 +385,23 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
             // hydro, 0 with gravity on; density and pressure positivity-preserved.
             const double h_lim = std::max(sim.h[i], max_ngb_distance);
             const double stol = sim.gravity_on ? 0.0 : 0.1;
+            // sqrt(||E|| ||E^-1||)/NUMDIMS, GIZMO's matrix_invert_ndims (system/system.cc:195).
+            // ~1 for a well-conditioned neighbour geometry.
+            double frob_e = 0.0, frob_inv = 0.0;
+            for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) {
+                frob_e   += moments[a][b] * moments[a][b];
+                frob_inv += moments_inv[a][b] * moments_inv[a][b];
+            }
+            const double cond_num =
+                std::max(std::sqrt(frob_e * frob_inv) / sim.dim, 1.0);
+            work.condition_number[i] = cond_num;
+            const double a_lim = a_limiter_for(cond_num);
             for (int f = 0; f < NUM_FIELDS; ++f) {
                 Vec3d gradient = moments_inv.matvec(weighted_diff_sum[f]);
                 const bool pos_preserve = (f == FIELD_DENSITY || f == FIELD_PRESSURE);
                 limit_slope(gradient, largest_rise[f], largest_drop[f], h_lim,
                             (f == FIELD_DENSITY) ? 0.0 : stol, pos_preserve,
-                            max_ngb_distance, field_i[f]);
+                            max_ngb_distance, field_i[f], a_lim);
                 work.gradient[f][i] = gradient;
             }
         }
@@ -956,7 +977,8 @@ static void sink_accretion_pass(Sim& sim) {
             if (diag) ++acc_inside;                              // reached the physical tests
             // the cell must be smaller than the sink it falls into (sink.cc:127)
             if (std::pow(sim.ninv[j], 1.0/sim.dim) > r_sink * 1.396263) {
-                if (diag) ++acc_rej_res; continue;
+                if (diag) ++acc_rej_res;
+                continue;
             }
 
             const Vec3d dv{sim.vx[j] - sim.vx[sph], sim.vy[j] - sim.vy[sph],
@@ -989,13 +1011,15 @@ static void sink_accretion_pass(Sim& sim) {
             }
             if (!(vesc_sq > 0)) continue;
             if ((vrel_sq + cs_sq) / vesc_sq >= 1.0) {            // unbound
-                if (diag) ++acc_rej_unbound; continue;
+                if (diag) ++acc_rej_unbound;
+                continue;
             }
             // Bate (1995): angular momentum small enough to actually reach the sink
             const double rv = dot(dx, dv);
             const double spec_mom_sq = r*r*vrel_sq - rv*rv;
             if (spec_mom_sq >= sim.G * (sim.P.m[sph] + sim.P.m[j]) * r_sink) {
-                if (diag) ++acc_rej_angmom; continue;
+                if (diag) ++acc_rej_angmom;
+                continue;
             }
 
             // SWALLOW. Mass and momentum conserved exactly; the sink keeps its position (GIZMO
@@ -1420,7 +1444,14 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         if (diag) rho_max_seen = std::max(rho_max_seen, rho);
 
         // (0) density threshold. Also sets tsfr, the reference timescale the other criteria use.
-        if (!(rho > sim.crit_phys_density)) { sim.alpha_vir_smoothed[i] = 0.0; ++veto[V_DENS]; continue; }
+        if (!(rho > sim.crit_phys_density)) {
+            // sfr_eff.cc:201 resets the rolling virial when a cell falls below threshold, so it
+            // must re-accumulate from scratch. SHMEM_NO_VIRIAL_RESET suppresses that -- a
+            // DIAGNOSTIC ONLY, to test whether the reset is what delays formation here.
+            static const bool no_reset = getenv("SHMEM_NO_VIRIAL_RESET") != nullptr;
+            if (!no_reset) sim.alpha_vir_smoothed[i] = 0.0;
+            ++veto[V_DENS]; continue;
+        }
         const double tsfr = std::sqrt(sim.crit_phys_density / rho) * sim.max_sfr_timescale;
         if (!(tsfr > 0)) { ++veto[V_TSFR]; continue; }
 
@@ -1545,6 +1576,40 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
 
         ++veto[V_PASS];
         candidates.push_back(i);
+    }
+    if (diag && !active_gas.empty() && sim.work.condition_number.size() == n_part) {
+        // how ill-conditioned are the cells that matter? >100 is where GIZMO starts tightening
+        // the slope limiter; if nothing reaches it, that correction is inert here.
+        double cn_max = 0, cn_max_dense = 0; long long n_over100 = 0;
+        for (uint32_t g : active_gas) {
+            const double c = sim.work.condition_number[g];
+            cn_max = std::max(cn_max, c);
+            if (c > 100.0) ++n_over100;
+            if (sim.rho[g] > 0.1 * sim.crit_phys_density) cn_max_dense = std::max(cn_max_dense, c);
+        }
+        static long long ccalls = 0;
+        if ((ccalls++ % 200) == 0)
+            fprintf(stderr, "[cond] nact=%zu cn_max=%.4g cn_max(dense)=%.4g n(cn>100)=%lld\n",
+                    active_gas.size(), cn_max, cn_max_dense, n_over100);
+    }
+    if (diag && !active_gas.empty() && sim.work.condition_number.size() == n_part) {
+        // Is the E-matrix conditioning bad enough to matter? GIZMO starts tightening the slope
+        // limiter above 100 (gradients.cc:1005). If nothing here reaches that, the correction is
+        // inert for this problem and cannot explain anything.
+        double cn_max = 0, cn_max_dense = 0; long long n_over100 = 0;
+        for (uint32_t g : active_gas) {
+            const double c = sim.work.condition_number[g];
+            cn_max = std::max(cn_max, c);
+            if (c > 100.0) ++n_over100;
+            if (sim.rho[g] > 0.1 * sim.crit_phys_density)
+                cn_max_dense = std::max(cn_max_dense, c);
+        }
+        static long long ccalls = 0;
+        if (ccalls < 25 || (ccalls % 500) == 0)
+            fprintf(stderr, "[cond] step %-6lld nact=%-6zu cn_max=%9.4g cn_max(dense)=%9.4g "
+                    "n(cn>100)=%lld\n", ccalls, active_gas.size(), cn_max, cn_max_dense,
+                    n_over100);
+        ++ccalls;
     }
     if (diag && !active_gas.empty()) {
         static long long calls = 0;
@@ -1831,13 +1896,15 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                 if (hermite_eligible(sim, i, dt)) dt_2body /= 0.3;
                 if (parts) parts->sink2body = dt_2body;
                 dt = std::min(dt, dt_2body);
-            } else if (gas) {
-                // (sink-gas caps for the sink itself are applied below, outside this
-                // other-sinks-exist guard: a LONE sink still needs its gas coupling)
-                const double dt_app = 0.5 * sim.cfl * sim.min_sink_tapp[i];
-                if (parts) parts->sink2body = dt_app;
-                dt = std::min(dt, dt_app);
             }
+            // NOT applied to gas: the 0.5*CourantFac*Min_Sink_Approach_Time cap on cells
+            // (timestep.cc:483) sits inside SINGLE_STAR_FB_TIMESTEPLIMIT, which requires one of
+            // the feedback modules (JETS/WINDS/SNE/RAD/RT). The plain STARFORGE defaults block
+            // only TESTS for those, never defines them, so a run like shu1977 -- STARFORGE
+            // defaults plus an EOS and nothing else -- does not have it. Applying it anyway
+            // shortens every cell's step near a sink for no reason the reference shares.
+            // (sink-gas caps for the sink ITSELF are applied below, outside this
+            // other-sinks-exist guard: a LONE sink still needs its gas coupling.)
         }
         // Hermite earns a longer step overall -- timestep.cc:477, "gives 10^-6 energy error
         // per orbit for a 0.9 eccentricity binary". Applied before the sink-gas ceiling, as
@@ -2147,11 +2214,12 @@ double mfm_step(Sim& sim, double dt_max) {
     // particle's outstanding half-kick first. Without this the audit flags any operation that
     // legitimately completes an impulse (e.g. finishing an accreted cell's kick) as if it were
     // injecting momentum.
-    auto total_p = [&sim]() {
+    auto total_p = [&sim](bool sync) {
         // sim.size() -- NOT the n_part captured at the top of the step: accretion shrinks the
         // arrays mid-step, and reading the old length walks off the end.
         const size_t n_part = sim.size();
-        const bool have = sim.pending_half_kick.size() == n_part && sim.a_grav.size() == n_part;
+        const bool have = sync && sim.pending_half_kick.size() == n_part
+                               && sim.a_grav.size() == n_part;
         double px = 0, py = 0, pz = 0;
         #pragma omp parallel for schedule(static) reduction(+:px,py,pz)
         for (size_t i = 0; i < n_part; ++i) {
@@ -2162,15 +2230,33 @@ double mfm_step(Sim& sim, double dt_max) {
         }
         return Vec3d{px, py, pz};
     };
+    // Every line carries the simulation time: the mix of contributors is not constant over a
+    // collapse, so a total summed over the whole run hides which phase produced it.
     auto probe = [&](const char* what) {
         if (!momaudit) return;
-        const Vec3d p = total_p();
+        const Vec3d p = total_p(true);
         const Vec3d d = p - p_prev;
         if (d.norm() > 0)
-            fprintf(stderr, "[mom] %-14s %14.6e %14.6e %14.6e\n", what, d[0], d[1], d[2]);
+            fprintf(stderr, "[mom] %.8e %-14s %14.6e %14.6e %14.6e\n",
+                    sim.time_now(), what, d[0], d[1], d[2]);
         p_prev = p;
     };
-    if (momaudit) p_prev = total_p();
+    if (momaudit) {
+        p_prev = total_p(true);
+        // RAW alongside SYNCHRONISED. A snapshot can only ever report the raw sum, so the gap
+        // between the two is the part of any snapshot-derived momentum drift that is kick-phase
+        // mixing rather than a real loss -- worth knowing before chasing the latter.
+        const Vec3d raw = total_p(false);
+        int bmin = 1 << 20, bmax = -1;
+        for (size_t i = 0; i < sim.bin.size(); ++i) {
+            if (sim.bin[i] < bmin) bmin = sim.bin[i];
+            if (sim.bin[i] > bmax) bmax = sim.bin[i];
+        }
+        fprintf(stderr, "[momtot] %.8e sync %14.6e %14.6e %14.6e raw %14.6e %14.6e %14.6e "
+                "nact %zu bins %d-%d\n", sim.time_now(),
+                p_prev[0], p_prev[1], p_prev[2], raw[0], raw[1], raw[2],
+                active.size(), bmin, bmax);
+    }
 
     // GRAVITY KICK. a_grav is the acceleration at this sync point, which is BOTH the end of the
     // previous step and the start of this one -- so the half-kick the previous step still owes and
