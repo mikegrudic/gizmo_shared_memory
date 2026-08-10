@@ -1110,22 +1110,23 @@ static void sink_accretion_pass(Sim& sim) {
             // does not recentre single-star sinks) and absorbs the pair's momentum. Safe to apply
             // now -- this mutates only the SINK, and no index moves until the removal phase.
             //
-            // FINISH THE CELL'S KICK FIRST. Under KDK the stored velocity is half-kicked: the
-            // particle is still OWED pending_half_kick * a_grav, and every other particle has
-            // already been given its half of that same pairwise interaction. Destroying the cell
-            // with the debt outstanding deletes one side of a force pair, so the system leaks
-            // momentum once per swallow -- thousands of times over a run, and coherently, since
-            // a_grav near a sink points radially inward. The reference never sees this because
-            // its swallow runs in calculate_non_standard_physics, AFTER do_second_halfstep_kick,
-            // so the cell is fully synchronised before it is absorbed.
-            // MERGE IN THE SYNCHRONISED FRAME. A stored velocity is half-kicked into that
-            // particle's own next step, so the two sides of this merge are at different kick
-            // phases and averaging them directly does not conserve momentum: the cell's
-            // outstanding debt is destroyed with it, and the sink's debt is subsequently paid
-            // out on a larger mass than it was computed for. Undo both debts, average, then put
-            // the sink back on its own phase. The reference sidesteps all of this by swallowing
-            // after the second half-kick, when every debt is already zero.
-            const bool have_debt = sim.pending_half_kick.size() == sim.size() &&
+            // MERGE THE STORED VELOCITIES DIRECTLY, as the reference does: sink.cc:746 is
+            //     Vel = (Vel*m_new + sum_j m_j (Vel_j - Vel)) / m_new
+            // which is the plain mass-weighted average of P[].Vel on both sides, with no kick-
+            // phase correction anywhere. There is nothing to correct: a stored KDK velocity is a
+            // well-defined quantity at any point in the step, and this engine's stored velocity is
+            // its exact analogue.
+            //
+            // An earlier version undid each side's outstanding half-kick, averaged, and re-applied
+            // the sink's. Expanding that leaves
+            //     v = [mass-weighted average] + (m_j/m_new) (a_s owed_s - a_j owed_j)
+            // -- a residual that does not vanish and is systematically signed in a collapse, where
+            // a points inward and the two particles sit on different bins. It was compensating for
+            // a debt that costs nothing: the cell's unpaid half-kick dies with the cell in the
+            // reference too, and the sink's is a velocity increment, so the sink's mass growth
+            // does not change what it is worth. SHMEM_SYNC_MERGE restores it for A/B.
+            static const bool sync_merge = getenv("SHMEM_SYNC_MERGE") != nullptr;
+            const bool have_debt = sync_merge && sim.pending_half_kick.size() == sim.size() &&
                                    sim.a_grav.size() == sim.size();
             const double owed_s = have_debt ? sim.pending_half_kick[sph] : 0.0;
             const double owed_j = have_debt ? sim.pending_half_kick[j]   : 0.0;
