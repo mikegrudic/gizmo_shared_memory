@@ -893,6 +893,29 @@ static void remove_gas_particle(Sim& sim, size_t j) {
 //
 // Serial: accretion events are few per step, they mutate the particle arrays, and running them in
 // index order makes the outcome independent of thread scheduling.
+
+// Synchronised total momentum, for the SHMEM_MOMAUDIT probes. See the lambda in mfm_step.
+static Vec3d audit_total_p(const Sim& sim) {
+    const size_t n = sim.size();
+    const bool have = sim.pending_half_kick.size() == n && sim.a_grav.size() == n;
+    double px = 0, py = 0, pz = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double owed = have ? sim.pending_half_kick[i] : 0.0;
+        px += sim.P.m[i] * (sim.vx[i] - (have ? sim.a_grav[i][0]*owed : 0.0));
+        py += sim.P.m[i] * (sim.vy[i] - (have ? sim.a_grav[i][1]*owed : 0.0));
+        pz += sim.P.m[i] * (sim.vz[i] - (have ? sim.a_grav[i][2]*owed : 0.0));
+    }
+    return Vec3d{px, py, pz};
+}
+static void audit_step(const Sim& sim, Vec3d& prev, const char* what) {
+    static const bool on = getenv("SHMEM_MOMAUDIT") != nullptr;
+    if (!on) return;
+    const Vec3d p = audit_total_p(sim);
+    const Vec3d d = p - prev;
+    if (d.norm() > 0) fprintf(stderr, "[mom] %-14s %14.6e %14.6e %14.6e\n", what, d[0], d[1], d[2]);
+    prev = p;
+}
+
 static void sink_accretion_pass(Sim& sim) {
     if (!sim.sink_formation || sim.n_gas >= sim.size()) return;
     static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
@@ -901,6 +924,7 @@ static void sink_accretion_pass(Sim& sim) {
     // the slot it vacated, so any sink index held across a deletion is stale -- the first version
     // of this kept eating with a stale index and corrupted the sink's mass. So: scan and decide
     // first, touching nothing, then apply every deletion afterwards.
+    Vec3d p_acc = audit_total_p(sim);          // baseline BEFORE any merging
     std::vector<uint32_t> doomed;              // gas indices to remove, ascending
     std::vector<char> claimed(sim.n_gas, 0);   // a cell may only be swallowed once
     std::vector<uint32_t> ngb;
@@ -986,14 +1010,25 @@ static void sink_accretion_pass(Sim& sim) {
             // a_grav near a sink points radially inward. The reference never sees this because
             // its swallow runs in calculate_non_standard_physics, AFTER do_second_halfstep_kick,
             // so the cell is fully synchronised before it is absorbed.
-            const double owed = sim.pending_half_kick.empty() ? 0.0 : sim.pending_half_kick[j];
-            const Vec3d v_j{sim.vx[j] + sim.a_grav[j][0] * owed,
-                            sim.vy[j] + sim.a_grav[j][1] * owed,
-                            sim.vz[j] + sim.a_grav[j][2] * owed};
+            // MERGE IN THE SYNCHRONISED FRAME. A stored velocity is half-kicked into that
+            // particle's own next step, so the two sides of this merge are at different kick
+            // phases and averaging them directly does not conserve momentum: the cell's
+            // outstanding debt is destroyed with it, and the sink's debt is subsequently paid
+            // out on a larger mass than it was computed for. Undo both debts, average, then put
+            // the sink back on its own phase. The reference sidesteps all of this by swallowing
+            // after the second half-kick, when every debt is already zero.
+            const bool have_debt = sim.pending_half_kick.size() == sim.size() &&
+                                   sim.a_grav.size() == sim.size();
+            const double owed_s = have_debt ? sim.pending_half_kick[sph] : 0.0;
+            const double owed_j = have_debt ? sim.pending_half_kick[j]   : 0.0;
+            const Vec3d vs_sync = Vec3d{sim.vx[sph], sim.vy[sph], sim.vz[sph]}
+                                - (have_debt ? sim.a_grav[sph] * owed_s : Vec3d{0,0,0});
+            const Vec3d vj_sync = Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]}
+                                - (have_debt ? sim.a_grav[j] * owed_j : Vec3d{0,0,0});
             const double m_new = sim.P.m[sph] + sim.P.m[j];
-            sim.vx[sph] = (sim.P.m[sph]*sim.vx[sph] + sim.P.m[j]*v_j[0]) / m_new;
-            sim.vy[sph] = (sim.P.m[sph]*sim.vy[sph] + sim.P.m[j]*v_j[1]) / m_new;
-            sim.vz[sph] = (sim.P.m[sph]*sim.vz[sph] + sim.P.m[j]*v_j[2]) / m_new;
+            const Vec3d v_sync = (vs_sync * sim.P.m[sph] + vj_sync * sim.P.m[j]) / m_new;
+            const Vec3d v_store = v_sync + (have_debt ? sim.a_grav[sph] * owed_s : Vec3d{0,0,0});
+            sim.vx[sph] = v_store[0]; sim.vy[sph] = v_store[1]; sim.vz[sph] = v_store[2];
             sim.P.m[sph] = m_new;
             // The mass/velocity jump invalidates any Hermite snapshot: the sink falls back to
             // KDK for one step and re-enters at its next sync (GIZMO's AccretedThisTimestep).
@@ -1017,8 +1052,10 @@ static void sink_accretion_pass(Sim& sim) {
     // that can silently break the books. Check the total against t=0 every time it fires.
     // DESCENDING: removing index j swaps in the particle at n_gas-1, which is always >= j, so a
     // still-pending (smaller) index is never the one moved into place.
+    audit_step(sim, p_acc, "acc:merge");
     std::sort(doomed.begin(), doomed.end(), std::greater<uint32_t>());
     for (uint32_t j : doomed) remove_gas_particle(sim, j);
+    audit_step(sim, p_acc, "acc:removal");
     // Every index the tree and the neighbour cache hold is now wrong.
     sim.ngb_cache.clear(); sim.tree_valid = false;
     if (sim.mass_initial > 0) {
@@ -2099,6 +2136,42 @@ double mfm_step(Sim& sim, double dt_max) {
         }
     }
 
+    // MOMENTUM AUDIT (SHMEM_MOMAUDIT). Total momentum can only be changed by an operation that
+    // is not pairwise antisymmetric, so rather than guess which one, measure Sum(m v) either
+    // side of each and attribute the change. Reported in units of M*cs so it is comparable with
+    // the drift plots. Costs one O(N) reduction per probe; diagnostic only.
+    static const bool momaudit = getenv("SHMEM_MOMAUDIT") != nullptr;
+    Vec3d p_prev{0, 0, 0};
+    // SYNCHRONISED momentum. A stored velocity is half-kicked into the particle's own next
+    // step, so Sum(m v_stored) mixes kick phases and is NOT the physical momentum -- undo each
+    // particle's outstanding half-kick first. Without this the audit flags any operation that
+    // legitimately completes an impulse (e.g. finishing an accreted cell's kick) as if it were
+    // injecting momentum.
+    auto total_p = [&sim]() {
+        // sim.size() -- NOT the n_part captured at the top of the step: accretion shrinks the
+        // arrays mid-step, and reading the old length walks off the end.
+        const size_t n_part = sim.size();
+        const bool have = sim.pending_half_kick.size() == n_part && sim.a_grav.size() == n_part;
+        double px = 0, py = 0, pz = 0;
+        #pragma omp parallel for schedule(static) reduction(+:px,py,pz)
+        for (size_t i = 0; i < n_part; ++i) {
+            const double owed = have ? sim.pending_half_kick[i] : 0.0;
+            px += sim.P.m[i] * (sim.vx[i] - (have ? sim.a_grav[i][0]*owed : 0.0));
+            py += sim.P.m[i] * (sim.vy[i] - (have ? sim.a_grav[i][1]*owed : 0.0));
+            pz += sim.P.m[i] * (sim.vz[i] - (have ? sim.a_grav[i][2]*owed : 0.0));
+        }
+        return Vec3d{px, py, pz};
+    };
+    auto probe = [&](const char* what) {
+        if (!momaudit) return;
+        const Vec3d p = total_p();
+        const Vec3d d = p - p_prev;
+        if (d.norm() > 0)
+            fprintf(stderr, "[mom] %-14s %14.6e %14.6e %14.6e\n", what, d[0], d[1], d[2]);
+        p_prev = p;
+    };
+    if (momaudit) p_prev = total_p();
+
     // GRAVITY KICK. a_grav is the acceleration at this sync point, which is BOTH the end of the
     // previous step and the start of this one -- so the half-kick the previous step still owes and
     // this step's opening half-kick use the same acceleration and are applied together. That is
@@ -2115,6 +2188,7 @@ double mfm_step(Sim& sim, double dt_max) {
             // what THIS particle will owe when it next becomes active -- half of its OWN step
             sim.pending_half_kick[i] = 0.5 * dt_of[i];
         }
+        probe("gravity-kick");
         // The predicted primitives carry velocity, so re-predict after the kick rather than
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
         // scale and adds no jump across a face).
@@ -2122,6 +2196,7 @@ double mfm_step(Sim& sim, double dt_max) {
         // Hermite overwrite for eligible sinks, on top of the kicks just applied -- the same
         // ordering as GIZMO's run loop (kicks, then prediction/correction, run.cc:167-177).
         hermite_pass(sim, active, dt_of);
+        probe("hermite");
     }
 
     const double t_bins = profile ? lap() : 0.0;
@@ -2171,8 +2246,11 @@ double mfm_step(Sim& sim, double dt_max) {
 
     // Sink formation, once the cells' own updates for this step are complete. Serial and after
     // the flux pass because it reorders the particle arrays.
+    probe("hydro-flux");
     sink_formation_pass(sim, active_gas, dt_of);
+    probe("sink-form");
     sink_accretion_pass(sim);
+    probe("sink-accrete");
 
     // Pass 2: drift EVERY particle over the system interval dt. A long-binned particle is drifted
     // in several sub-steps rather than one long one; its velocity is constant between its own
