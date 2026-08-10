@@ -950,9 +950,77 @@ static void audit_step(const Sim& sim, Vec3d& prev, const char* what) {
     prev = p;
 }
 
+// SINK VELOCITY PROBE (SHMEM_SINKV). A sink can be swept up to the speed of the flow around it
+// while the gas centre of mass stays put, so the total-momentum audit above cannot see it at all:
+// attribute the SINK's own velocity change to each operation instead. Tracks the heaviest sink;
+// serial at every call site, hence the plain static.
+static void sinkv_probe(const Sim& sim, const char* what) {
+    static const bool on = getenv("SHMEM_SINKV") != nullptr;
+    if (!on || sim.n_gas >= sim.size()) return;
+    size_t k = sim.n_gas;
+    for (size_t i = sim.n_gas; i < sim.size(); ++i) if (sim.P.m[i] > sim.P.m[k]) k = i;
+    static Vec3d prev{0, 0, 0};
+    const Vec3d v{sim.vx[k], sim.vy[k], sim.vz[k]};
+    const Vec3d d = v - prev;
+    if (d.norm() > 0) {
+        // The sink's bin against the deepest GAS bin: a sink integrating on a longer step than the
+        // gas it is embedded in gets its orbit resolved worse than the flow driving it.
+        int gas_deep = 0;
+        if (!sim.bin.empty())
+            for (size_t i = 0; i < sim.n_gas && i < sim.bin.size(); ++i)
+                if (sim.bin[i] > gas_deep) gas_deep = sim.bin[i];
+        fprintf(stderr, "[sinkv] %.8e %-12s m=%.6e |v|=%.6e |dv|=%.6e bin=%d gasdeep=%d\n",
+                sim.time_now(), what, sim.P.m[k], v.norm(), d.norm(),
+                sim.bin.empty() ? -1 : sim.bin[k], gas_deep);
+    }
+    prev = v;
+}
+
+// DIRECT-SUM CHECK on the sink's own gravity (SHMEM_SINKACC). The sink's trajectory is the thing
+// going wrong and the tree force is the hardest input to bound by inspection, so compare it with an
+// O(N) sum over every particle. Exact for the sink: pairs involving a non-gas particle take the
+// plain max-softening spline, with no kernel averaging and no zeta, so there is nothing the walk
+// does here that this does not.
+static void sink_accel_check(Sim& sim) {
+    static const bool on = getenv("SHMEM_SINKACC") != nullptr;
+    if (!on || sim.n_gas >= sim.size() || sim.a_grav.size() != sim.size()) return;
+    static long long calls = 0;
+    if ((calls++ % 500) != 0) return;
+    size_t k = sim.n_gas;
+    for (size_t i = sim.n_gas; i < sim.size(); ++i) if (sim.P.m[i] > sim.P.m[k]) k = i;
+    // Only when the sink is ACTIVE. a_grav is refreshed for active targets only -- an inactive
+    // particle deliberately keeps its last acceleration for the KDK kick -- so on any other step
+    // this would compare a stale walk against a current direct sum and indict the tree for it.
+    if (!sim.is_active(k)) return;
+    // Then bring every position current. Under lazy drift a particle the walk only ever saw
+    // inside a node still carries its old coordinates, so a direct sum over live coordinates
+    // would be comparing the walk against a half-stale truth. Diagnostic build only.
+    drift_all_to(sim, sim.clock_ticks);
+    const Vec3d pos_k = sim.P.pos(k);
+    const double eps_k = sim.P.soft.empty() ? 0.0 : sim.P.soft[k];
+    double ax = 0, ay = 0, az = 0;
+    #pragma omp parallel for schedule(static) reduction(+:ax,ay,az)
+    for (size_t j = 0; j < sim.size(); ++j) {
+        if (j == k) continue;
+        const Vec3d d = min_image(sim.P.pos(j) - pos_k, sim.box);
+        const double r = d.norm();
+        if (!(r > 0)) continue;
+        const double eps = std::max(std::max(eps_k, sim.P.soft.empty() ? 0.0 : sim.P.soft[j]),
+                                    1e-300);
+        const double f = sim.P.m[j] * spline_force_over_r(r, eps);
+        ax += f*d[0]; ay += f*d[1]; az += f*d[2];
+    }
+    const Vec3d direct{ax*sim.G, ay*sim.G, az*sim.G};
+    const Vec3d walk = sim.a_grav[k];
+    fprintf(stderr, "[sinkacc] %.8e |a_tree|=%.6e |a_direct|=%.6e |da|=%.6e rel=%.3e\n",
+            sim.time_now(), walk.norm(), direct.norm(), (walk-direct).norm(),
+            (walk-direct).norm() / std::max(direct.norm(), 1e-300));
+}
+
 static void sink_accretion_pass(Sim& sim) {
     if (!sim.sink_formation || sim.n_gas >= sim.size()) return;
     static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
+    sinkv_probe(sim, "pre-accrete");
 
     // TWO PHASES, and the split is not stylistic. Deleting a gas cell slides the last sink into
     // the slot it vacated, so any sink index held across a deletion is stale -- the first version
@@ -1093,6 +1161,7 @@ static void sink_accretion_pass(Sim& sim) {
     // DESCENDING: removing index j swaps in the particle at n_gas-1, which is always >= j, so a
     // still-pending (smaller) index is never the one moved into place.
     audit_step(sim, p_acc, "acc:merge");
+    sinkv_probe(sim, "accrete");
     std::sort(doomed.begin(), doomed.end(), std::greater<uint32_t>());
     for (uint32_t j : doomed) remove_gas_particle(sim, j);
     audit_step(sim, p_acc, "acc:removal");
@@ -1152,9 +1221,13 @@ static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
             if (ta2  < best_ta2)  best_ta2  = ta2;
             if (tff4 < best_tff4) best_tff4 = tff4;
         }
-        // t_approach = r_soft/|dv|; t_ff = sqrt(r_soft^3 / (G Mtot)) -- forcetree.cc:2509-2510
-        sim.min_sink_tapp[i] = std::sqrt(best_ta2);
-        sim.min_sink_tff[i]  = std::sqrt(std::sqrt(best_tff4) / sim.G);
+        // t_approach = r_soft/|dv|; t_ff = sqrt(r_soft^3 / (G Mtot)) -- forcetree.cc:2509-2510.
+        // With no OTHER sink the sentinel must survive intact: sqrt(1e300) is 1e150, which slips
+        // under the "< 1e299" guard in desired_dt and feeds the two-body term sentinel arithmetic.
+        // It only ever produced a harmlessly huge dt, but the guard was not doing its job.
+        const bool have_partner = (best_ta2 < 1e299);
+        sim.min_sink_tapp[i] = have_partner ? std::sqrt(best_ta2) : 1e300;
+        sim.min_sink_tff[i]  = have_partner ? std::sqrt(std::sqrt(best_tff4) / sim.G) : 1e300;
     }
 
     // SINK-GAS coupling (core/timestep.cc:1002-1026). A sink parked in dense collapsing gas must
@@ -1187,7 +1260,7 @@ static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
             }
             if (n_gas_found == 0) { sim.sink_dt_gas_cap[s] = 1e300; continue; }
             int deepest_bin = 0;
-            double dr_nearest = 1e300, m_sum = 0.0, cs2_sum = 0.0;
+            double dr_nearest = 1e300, m_sum = 0.0, cs2_sum = 0.0, w_sum = 0.0;
             Vec3d mv_rel{0, 0, 0};
             const Vec3d vel_s{sim.vx[s], sim.vy[s], sim.vz[s]};
             for (uint32_t j : ngb) {
@@ -1200,6 +1273,7 @@ static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
                 mv_rel += (Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]} - vel_s) * m;
                 const double cs = sound_speed(sim, j);
                 cs2_sum += m * cs * cs;
+                w_sum += kernel_w(r, radius, sim.dim);   // KERNEL-WEIGHTED, not a raw count
             }
             // 4.1x the shortest-step gas neighbour (core/timestep.cc:1002). SHMEM_SINK_WAKE_FAC
             // overrides it: a sink on a longer bin than the gas around it is kicked by that gas
@@ -1209,9 +1283,16 @@ static void sink_timestep_pass(Sim& sim, const std::vector<uint32_t>& active) {
             static const double wake_fac = getenv("SHMEM_SINK_WAKE_FAC")
                                          ? atof(getenv("SHMEM_SINK_WAKE_FAC")) : 4.1;
             const double dt_wake = wake_fac * sim.dt_of_bin(deepest_bin);
-            // eps = max(kernel-core softening, nearest gas dr, sink radius, cell size);
-            // L_sink = the volume-equivalent size of the kernel the search settled on
-            const double L_sink = 1.61199 * radius / std::cbrt((double)n_gas_found);
+            // eps = max(kernel-core softening, nearest gas dr, sink radius, cell size).
+            //
+            // L_sink is the same estimator the gas uses, V^(1/dim) with V = 1/sum_j W -- the
+            // KERNEL-WEIGHTED local volume per particle, which is what the reference's
+            // Get_Particle_Size() reduces to. It previously divided the hard-sphere search radius
+            // by the cube root of the RAW count inside it. Those agree in uniform density, but
+            // around a sink they do not: the kernel-weighted sum is dominated by the dense inner
+            // neighbours, so the raw-count form overestimates the spacing exactly where the
+            // density is peaked, and dt_ff (~eps^3/2) and dt_cour (~L) come out too permissive.
+            const double L_sink = (w_sum > 0) ? std::pow(1.0 / w_sum, 1.0 / sim.dim) : radius;
             double eps = std::max(0.5 * sim.P.soft[s], dr_nearest);
             if (!sim.sink_radius.empty()) eps = std::max(eps, sim.sink_radius[s]);
             eps = std::max(eps, L_sink);
@@ -1939,6 +2020,27 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
     return dt;
 }
 
+// Which criterion actually sets the SINK's step (SHMEM_SINKDT). The 4.1x gas-neighbour ceiling is
+// meant to be a backstop; if it is the binding term then the sink is not being stepped by its own
+// dynamics at all, and its orbit is resolved only as well as the gas happens to require.
+static void sink_dt_report(const Sim& sim) {
+    static const bool on = getenv("SHMEM_SINKDT") != nullptr;
+    if (!on || sim.n_gas >= sim.size()) return;
+    static long long calls = 0;
+    if ((calls++ % 400) != 0) return;
+    size_t k = sim.n_gas;
+    for (size_t i = sim.n_gas; i < sim.size(); ++i) if (sim.P.m[i] > sim.P.m[k]) k = i;
+    DtParts dp;
+    const double dt = desired_dt(sim, k, &dp);
+    const char* who = "none"; double best = 1e300;
+    auto pick = [&](double v, const char* n) { if (v > 0 && v < best) { best = v; who = n; } };
+    pick(dp.accel, "accel"); pick(dp.tidal, "tidal");
+    pick(dp.sink2body, "2body"); pick(dp.sinkgas, "gas-cap");
+    fprintf(stderr, "[sinkdt] %.8e dt=%.4e BIND=%-8s accel=%.4e tidal=%.4e 2body=%.4e "
+            "gascap=%.4e\n", sim.time_now(), dt, who, dp.accel, dp.tidal, dp.sink2body,
+            dp.sinkgas);
+}
+
 // Deepest bin whose step does not exceed dt_want. bin 0 is dt_base.
 static int bin_for_dt(const Sim& sim, double dt_want) {
     if (dt_want >= sim.dt_base) return 0;
@@ -2099,6 +2201,8 @@ double mfm_step(Sim& sim, double dt_max) {
     // Gravity at the CURRENT positions, one walk per step. Done before dt so the acceleration
     // can constrain it.
     if (sim.gravity_on) compute_gravity(sim, tree, active);
+    sink_accel_check(sim);
+    sink_dt_report(sim);
     const double t_grav = profile ? lap() : 0.0;
 
     // Refresh the sink approach/freefall minima for the actives before dt is chosen -- same
@@ -2293,6 +2397,7 @@ double mfm_step(Sim& sim, double dt_max) {
             sim.pending_half_kick[i] = 0.5 * dt_of[i];
         }
         probe("gravity-kick");
+        sinkv_probe(sim, "gravity-kick");
         // The predicted primitives carry velocity, so re-predict after the kick rather than
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
         // scale and adds no jump across a face).
@@ -2301,6 +2406,7 @@ double mfm_step(Sim& sim, double dt_max) {
         // ordering as GIZMO's run loop (kicks, then prediction/correction, run.cc:167-177).
         hermite_pass(sim, active, dt_of);
         probe("hermite");
+        sinkv_probe(sim, "hermite");
     }
 
     const double t_bins = profile ? lap() : 0.0;
@@ -2356,6 +2462,7 @@ double mfm_step(Sim& sim, double dt_max) {
     probe("hydro-flux");
     sink_formation_pass(sim, active_gas, dt_of);
     probe("sink-form");
+    sinkv_probe(sim, "sink-form");
     sink_accretion_pass(sim);
     probe("sink-accrete");
 
