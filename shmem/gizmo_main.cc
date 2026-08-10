@@ -294,10 +294,19 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
             write_scalar_field("SmoothingLength", sim.h);
         }
         if (t == 5) {
-            // Dataset names follow the reference (file_io/io.cc:4019,4036,4040,3860). This
-            // engine has no accretion reservoir or protostellar evolution, so the stellar mass
-            // IS the dynamical mass and the reservoir/protostar fields are simply absent.
-            write_scalar_field("Sink_Mass", sim.P.m);
+            // Dataset names follow the reference (file_io/io.cc:4019,4036,4040,3860). Sink_Mass is
+            // the STELLAR mass -- the dynamical mass less whatever has yet to drain out of the
+            // unresolved disk -- so it compares directly against the reference's field of the same
+            // name. There is still no protostellar evolution, so those fields remain absent.
+            if (sim.sink_reservoir.size() == n_part) {
+                std::vector<double> m_star(n_part);
+                for (size_t q = 0; q < n_part; ++q)
+                    m_star[q] = sim.P.m[q] - sim.sink_reservoir[q];
+                write_scalar_field("Sink_Mass", m_star);
+                write_scalar_field("Sink_Mass_Reservoir", sim.sink_reservoir);
+            } else {
+                write_scalar_field("Sink_Mass", sim.P.m);
+            }
             if (sim.sink_radius.size() == n_part)
                 write_scalar_field("Sink_Radius", sim.sink_radius);
             if (sim.sink_tform.size() == n_part)
@@ -528,7 +537,7 @@ int main(int argc, char** argv) {
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
     // SHMEM_DENSE_DRIFT=1 restores the full O(N) drift sweep, for A/B against lazy drift.
     sim.sparse_drift = (getenv("SHMEM_DENSE_DRIFT") == nullptr);
-    if (const char* bl = getenv("SHMEM_BIN_LIMIT")) sim.bin_limit = std::max(1, atoi(bl));
+    if (const char* wf = getenv("SHMEM_WAKEUP_FAC")) sim.wakeup_fac = std::max(1.0, atof(wf));
     // SHMEM_TREE_PAD_FRAC: how far the tree may go stale before a rebuild. The gravity walk
     // reads node centres-of-mass as they were AT BUILD TIME, so this directly controls a force
     // error that the neighbour-search padding does not cover. 0 rebuilds every sync, for A/B.

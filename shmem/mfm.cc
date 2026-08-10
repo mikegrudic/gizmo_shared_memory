@@ -357,11 +357,17 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                 moments += outer_product(offset) * weight;
                 face_w += offset * weight;
                 if (separation > 0) {
+                    // SIGN: GIZMO forms vdotr2 = (x_i - x_j).(v_i - v_j) and boosts vsig when it is
+                    // NEGATIVE. `offset` here is x_j - x_i, the opposite sense, so the pair is
+                    // CLOSING when approach_speed is positive and the boost is applied then.
+                    // Getting this backwards costs the velocity term exactly where it matters --
+                    // converging flow, i.e. every shock front and every collapse -- and leaves
+                    // those cells on a sound-crossing step they cannot resolve.
                     const Vec3d rel_vel = vel_i - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
                     const double approach_speed = dot(rel_vel, offset) / separation;
                     const double csound_j = sound_speed(sim, j);
                     signal_speed = std::max(signal_speed,
-                                            csound_i + csound_j - std::min(0.0, approach_speed));
+                                            csound_i + csound_j + std::max(0.0, approach_speed));
                 }
             }
             work.signal_speed[i] = signal_speed;
@@ -594,6 +600,10 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
     {
         std::vector<uint32_t> neighbours;
         std::vector<std::pair<uint32_t,int>> local_wakes;
+        // Bins a woken cell is demoted BY: the smallest n with 2^n >= WAKEUP, so its step is at
+        // least WAKEUP times shorter than the waker's (core/timestep.cc:1332). 3, for WAKEUP=4.1.
+        int wake_offset = 0;
+        while ((1 << wake_offset) < sim.wakeup_fac) ++wake_offset;
         #pragma omp for schedule(dynamic, 64) nowait
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
@@ -767,14 +777,30 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                     dmom_z[j] += momentum_flux[2];
                     #pragma omp atomic
                     denergy[j] += energy_flux;
-                } else if (sim.individual_timesteps &&
-                           sim.bin[j] < sim.bin[i] - sim.bin_limit) {
-                    // Saitoh-Makino wakeup, recorded HERE rather than in a pass of its own. The
-                    // neighbours are already in hand, so a separate sweep would just repeat this
-                    // whole tree walk for nothing -- and GIZMO likewise raises it from inside its
-                    // hydro neighbour loop. It is a deferred request: applying it immediately
-                    // would mutate bins while other threads are still reading them.
-                    local_wakes.emplace_back(j, sim.bin[i] - sim.bin_limit);
+                } else if (sim.individual_timesteps) {
+                    // Saitoh-Makino wakeup (GIZMO hydro_evaluate.h): demote an INACTIVE neighbour
+                    // when THIS pair's signal speed outruns the one j last recorded for itself. j
+                    // sized its step from its own vsig, so a pair vsig far above it means a
+                    // disturbance is arriving faster than that step can resolve. A bin-GAP test
+                    // cannot see this -- pairs straddle many bins in quiescent flow, and share a
+                    // bin across a strong shock -- which is why the criterion is on velocities.
+                    //
+                    // Recorded HERE rather than in a pass of its own: the neighbours are already in
+                    // hand, so a separate sweep would repeat this whole tree walk for nothing.
+                    // Deferred rather than applied, because writing sim.bin now would race the
+                    // threads still reading it.
+                    const Vec3d rel_vel = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}
+                                        - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
+                    const double approach_speed = dot(rel_vel, offset) / separation;
+                    const double vsig = sound_speed(sim, i) + sound_speed(sim, j)
+                                      + std::max(0.0, approach_speed);
+                    // GIZMO stores the request as waker_bin+1 (0 meaning "none") and decodes it to
+                    // bin = waker_bin - offset (core/timestep.cc:1348-1351), so the woken cell
+                    // lands on a step WAKEUP times SHORTER than the waker's -- not merely closer
+                    // to it. Bins count oppositely here, hence bin[i] + offset. The application
+                    // side only ever raises a bin, which is GIZMO's "don't increase the timestep".
+                    if (vsig > sim.wakeup_fac * work.signal_speed[j])
+                        local_wakes.emplace_back(j, sim.bin[i] + wake_offset);
                 }
             }
         }
@@ -938,7 +964,7 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.phi); sw(sim.a_grav); sw(sim.a_hydro); sw(sim.tidal); sw(sim.pending_half_kick);
     sw(sim.sink_pin_x); sw(sim.sink_pin_y); sw(sim.sink_pin_z); sw(sim.sink_pinned);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
-    sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.id);
+    sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.sink_reservoir); sw(sim.id);
     sw(sim.min_sink_tapp); sw(sim.min_sink_tff); sw(sim.sink_dt_gas_cap); sw(sim.vel_at_last_kick);
     sw(sim.herm_valid); sw(sim.herm_tick); sw(sim.herm_pos); sw(sim.herm_vel);
     sw(sim.herm_acc); sw(sim.herm_jerk);
@@ -959,7 +985,7 @@ static void pop_particle(Sim& sim) {
     pop(sim.phi); pop(sim.a_grav); pop(sim.a_hydro); pop(sim.tidal); pop(sim.pending_half_kick);
     pop(sim.sink_pin_x); pop(sim.sink_pin_y); pop(sim.sink_pin_z); pop(sim.sink_pinned);
     pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
-    pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.id);
+    pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.sink_reservoir); pop(sim.id);
     pop(sim.min_sink_tapp); pop(sim.min_sink_tff); pop(sim.sink_dt_gas_cap); pop(sim.vel_at_last_kick);
     pop(sim.herm_valid); pop(sim.herm_tick); pop(sim.herm_pos); pop(sim.herm_vel);
     pop(sim.herm_acc); pop(sim.herm_jerk);
@@ -1086,10 +1112,35 @@ static void sink_accel_check(Sim& sim) {
             (walk-direct).norm() / std::max(direct.norm(), 1e-300));
 }
 
+// Drain rate of a sink's unresolved disk (sinks/sink.cc:395-399, 465-474). Under
+// SINK_GRAVCAPTURE_FIXEDSINKRADIUS the timescale collapses to a constant fixed at formation --
+// see Sim::sink_reservoir -- floored at three steps so no single step can empty the disk.
+static double sink_mdot(const Sim& sim, size_t i, double dt) {
+    if (sim.sink_reservoir.size() != sim.size() || sim.sink_reservoir[i] <= 0) return 0.0;
+    if (sim.sink_m0.size() != sim.size() || sim.sink_m0[i] <= 0) return 0.0;
+    const double cs_min = 0.2 / std::max(sim.vel_to_kms, 1e-300);   // 0.2 km/s, in code velocity
+    double t_acc = sim.G * sim.sink_m0[i] / (cs_min * cs_min * cs_min);
+    if (dt > 0) t_acc = std::max(t_acc, 3.0 * dt);
+    return t_acc > 0 ? sim.sink_reservoir[i] / t_acc : 0.0;
+}
+
 static void sink_accretion_scan(Sim& sim) {
     if (!sim.sink_formation || sim.n_gas >= sim.size()) return;
     static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
     sinkv_probe(sim, "pre-accrete");
+
+    // Drain each ACTIVE sink's disk into stellar mass, before this step's swallows refill it --
+    // the order the reference uses (set_sink_new_mass runs in the sink pass, ahead of the swallow
+    // loop). P.m does not move: the reservoir only tracks how much of it is not yet stellar, so
+    // this changes no dynamics, only the Mdot that dt_accr reads. The 3-step floor inside
+    // sink_mdot bounds the drain at a third of the disk, so it cannot go negative.
+    if (sim.sink_reservoir.size() == sim.size() && sim.dt_of.size() == sim.size())
+        for (size_t s = sim.n_gas; s < sim.size(); ++s) {
+            if (!sim.P.type.empty() && sim.P.type[s] != 5) continue;
+            if (!sim.is_active(s) || sim.dt_of[s] <= 0) continue;
+            const double drained = sink_mdot(sim, s, sim.dt_of[s]) * sim.dt_of[s];
+            sim.sink_reservoir[s] = std::max(0.0, sim.sink_reservoir[s] - drained);
+        }
 
     // TWO PHASES, and the split is not stylistic. Deleting a gas cell slides the last sink into
     // the slot it vacated, so any sink index held across a deletion is stale -- the first version
@@ -1226,6 +1277,9 @@ static void sink_accretion_scan(Sim& sim) {
                 sim.P.x[sph] = pos_new[0]; sim.P.y[sph] = pos_new[1]; sim.P.z[sph] = pos_new[2];
             }
             sim.P.m[sph] = m_new;
+            // Swallowed gas enters the unresolved disk, not the star. P.m already carries it --
+            // this only records how much of that total has yet to drain, which is what sets Mdot.
+            if (sim.sink_reservoir.size() == sim.size()) sim.sink_reservoir[sph] += sim.P.m[j];
             // The mass/velocity jump invalidates any Hermite snapshot: the sink falls back to
             // KDK for one step and re-enters at its next sync (GIZMO's AccretedThisTimestep).
             if (sph < sim.herm_valid.size()) sim.herm_valid[sph] = 0;
@@ -1872,8 +1926,10 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
                0.79 * sim.P.m[last_gas] * sim.G / (cs_sink*cs_sink), soft_floor);
         if (sim.sink_tform.size() != sim.size()) sim.sink_tform.resize(sim.size(), 0.0);
         if (sim.sink_m0.size()    != sim.size()) sim.sink_m0.resize(sim.size(), 0.0);
+        if (sim.sink_reservoir.size() != sim.size()) sim.sink_reservoir.resize(sim.size(), 0.0);
         sim.sink_tform[last_gas] = sim.time_now();
         sim.sink_m0[last_gas]    = sim.P.m[last_gas];
+        sim.sink_reservoir[last_gas] = 0.0;   // the disk starts empty; only swallows fill it
         // A brand-new sink starts on the DEEPEST occupied bin (core/timestep.cc:1023-1027):
         // its first accretion happens immediately and must be resolved. Deepening is always a
         // legal bin move, so this needs no alignment check.
@@ -1920,6 +1976,13 @@ void compute_initial_state(Sim& sim) {
     sim.mass_initial = 0.0;
     for (size_t i = 0; i < n_part; ++i) sim.mass_initial += sim.P.m[i];
     const size_t n_gas = std::min(sim.n_gas, n_part);
+    // MaxMassForParticleSplit, from the heaviest cell present at startup (core/init.cc:965). Used
+    // only to cap the mass scale in dt_accr; splitting/merging itself is not implemented.
+    {
+        double m_max = 0.0;
+        for (size_t i = 0; i < n_gas; ++i) m_max = std::max(m_max, sim.P.m[i]);
+        sim.sink_mass_split = 3.01 * m_max;
+    }
     std::vector<uint32_t> gas_list(n_gas);
     for (size_t i = 0; i < n_gas; ++i) gas_list[i] = (uint32_t)i;
     rebuild_tree(sim);                       // provisional: neighbour search for the h solve
@@ -1953,7 +2016,7 @@ void set_time_base(Sim& sim, double interval, double max_step) {
 // Per-criterion timestep values, filled by desired_dt for diagnostics.
 struct DtParts {
     double cfl = 1e300, accel = 1e300, tidal = 1e300, selfgrav = 1e300, sink2body = 1e300,
-           sinkgas = 1e300;
+           sinkgas = 1e300, accr = 1e300;
 };
 static double desired_dt(const Sim& sim, size_t i, DtParts* parts = nullptr);
 
@@ -2118,12 +2181,28 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
         if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5 &&
             hermite_eligible(sim, i, dt)) dt *= 1.4;
         // SHMEM_SINK_DT_FAC scales a SINK's step by a constant, to test directly whether the
-        // sink's timestep is what drives the momentum injection. The reference steps its sink
-        // ~2x finer than this does and by a criterion (dt_accr) not implemented here, and the
-        // sink currently sits 2 bins SHALLOWER than the deepest gas -- so shrinking it both
-        // matches the reference and narrows the bin spread the flux exchange has to cross.
+        // sink's timestep is what drives the momentum injection.
         static const double sink_dt_fac = getenv("SHMEM_SINK_DT_FAC")
                                         ? atof(getenv("SHMEM_SINK_DT_FAC")) : 1.0;
+        // dt_accr (core/timestep.cc:989): resolve the star's GROWTH, capping the step at the time
+        // to add a tenth of the smaller of its own mass and the split mass. Uses the previous
+        // step's dt for the drain-time floor, as the reference does -- the quantity is otherwise
+        // self-referential. In the reference this binds ~40% of the time over the window where
+        // the spurious second sink appears, and is what steps its sink ~2x finer than the
+        // gas-neighbour cap alone would.
+        if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5 &&
+            sim.sink_reservoir.size() == sim.size()) {
+            const double dt_prev = (sim.dt_of.size() == sim.size()) ? sim.dt_of[i] : 0.0;
+            const double mdot = sink_mdot(sim, i, dt_prev);
+            const double m_star = sim.P.m[i] - sim.sink_reservoir[i];
+            if (mdot > 0 && m_star > 0) {
+                const double m_scale = sim.sink_mass_split > 0
+                                     ? std::min(m_star, sim.sink_mass_split) : m_star;
+                const double dt_accr = 0.1 * m_scale / mdot;
+                if (parts) parts->accr = dt_accr;
+                dt = std::min(dt, dt_accr);
+            }
+        }
         // Sink-gas ceiling (wakeup/freefall/Courant vs the surrounding gas). Deliberately
         // OUTSIDE the min_sink_tapp guard: a lone sink -- shu1977 -- sees no other sink and
         // skips the block above, but must still not sit bins above the gas it is swallowing.
@@ -2153,10 +2232,10 @@ static void sink_dt_report(const Sim& sim) {
     const char* who = "none"; double best = 1e300;
     auto pick = [&](double v, const char* n) { if (v > 0 && v < best) { best = v; who = n; } };
     pick(dp.accel, "accel"); pick(dp.tidal, "tidal");
-    pick(dp.sink2body, "2body"); pick(dp.sinkgas, "gas-cap");
+    pick(dp.sink2body, "2body"); pick(dp.sinkgas, "gas-cap"); pick(dp.accr, "accr");
     fprintf(stderr, "[sinkdt] %.8e dt=%.4e BIND=%-8s accel=%.4e tidal=%.4e 2body=%.4e "
-            "gascap=%.4e\n", sim.time_now(), dt, who, dp.accel, dp.tidal, dp.sink2body,
-            dp.sinkgas);
+            "gascap=%.4e accr=%.4e\n", sim.time_now(), dt, who, dp.accel, dp.tidal,
+            dp.sink2body, dp.sinkgas, dp.accr);
 }
 
 // Deepest bin whose step does not exceed dt_want. bin 0 is dt_base.
@@ -2196,10 +2275,10 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
     }
 }
 
-// Saitoh & Makino (2009) timestep limiter. A particle sitting many bins above an active neighbour
-// can be overrun by a shock before it ever wakes; force it down to within bin_limit of the
-// neighbour. Without this, a strong blast propagates into stale, long-binned material and the
-// solution is wrong rather than merely inaccurate.
+// Saitoh & Makino (2009) timestep limiter. A particle on a long step can be overrun by a shock
+// before it ever wakes; the flux loop demotes it once an arriving pair's signal speed outruns the
+// one it recorded for itself. Without this, a strong blast propagates into stale, long-binned
+// material and the solution is wrong rather than merely inaccurate.
 
 double mfm_step(Sim& sim, double dt_max) {
     const size_t n_part = sim.size();
@@ -2472,6 +2551,41 @@ double mfm_step(Sim& sim, double dt_max) {
     };
     // Every line carries the simulation time: the mix of contributors is not constant over a
     // collapse, so a total summed over the whole run hides which phase produced it.
+    // ANGULAR momentum, about the domain centre of mass. Linear momentum is conserved by face
+    // antisymmetry and by pairwise gravity; ANGULAR momentum is not automatic for either -- MFM's
+    // force acts along the face normal, which is not parallel to the separation, and a tree node's
+    // centre of force sits wherever its mass happens to be rather than on the line of centres. So
+    // this is measured separately, at the same phase boundaries.
+    auto total_L = [&sim]() {
+        const size_t n = sim.size();
+        double cx = 0, cy = 0, cz = 0, mt = 0;
+        #pragma omp parallel for schedule(static) reduction(+:cx,cy,cz,mt)
+        for (size_t i = 0; i < n; ++i) {
+            cx += sim.P.m[i]*sim.P.x[i]; cy += sim.P.m[i]*sim.P.y[i]; cz += sim.P.m[i]*sim.P.z[i];
+            mt += sim.P.m[i];
+        }
+        if (mt > 0) { cx /= mt; cy /= mt; cz /= mt; }
+        double lx = 0, ly = 0, lz = 0;
+        #pragma omp parallel for schedule(static) reduction(+:lx,ly,lz)
+        for (size_t i = 0; i < n; ++i) {
+            const double dx = sim.P.x[i]-cx, dy = sim.P.y[i]-cy, dz = sim.P.z[i]-cz;
+            const double m = sim.P.m[i];
+            lx += m*(dy*sim.vz[i] - dz*sim.vy[i]);
+            ly += m*(dz*sim.vx[i] - dx*sim.vz[i]);
+            lz += m*(dx*sim.vy[i] - dy*sim.vx[i]);
+        }
+        return Vec3d{lx, ly, lz};
+    };
+    Vec3d L_prev = momaudit ? total_L() : Vec3d{0,0,0};
+    auto probeL = [&](const char* what) {
+        if (!momaudit) return;
+        const Vec3d L = total_L();
+        const Vec3d d = L - L_prev;
+        fprintf(stderr, "[amom] %.8e %-14s dL=%14.6e L=%14.6e\n",
+                sim.time_now(), what, d.norm(), L.norm());
+        L_prev = L;
+    };
+
     Vec3d p_prev_raw{0, 0, 0};
     auto probe = [&](const char* what) {
         if (!momaudit) return;
@@ -2563,6 +2677,8 @@ double mfm_step(Sim& sim, double dt_max) {
             }
         }
         probe("gravity-kick");
+    probeL("gravity-kick");
+        probeL("gravity-kick");
         sinkv_probe(sim, "gravity-kick");
         // The predicted primitives carry velocity, so re-predict after the kick rather than
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
@@ -2572,6 +2688,8 @@ double mfm_step(Sim& sim, double dt_max) {
         // ordering as GIZMO's run loop (kicks, then prediction/correction, run.cc:167-177).
         hermite_pass(sim, active, dt_of);
         probe("hermite");
+    probeL("hermite");
+        probeL("hermite");
         sinkv_probe(sim, "hermite");
     }
 
@@ -2653,8 +2771,10 @@ double mfm_step(Sim& sim, double dt_max) {
     // Sink formation, once the cells' own updates for this step are complete. Serial and after
     // the flux pass because it reorders the particle arrays.
     probe("hydro-flux");
+    probeL("hydro-flux");
     sink_formation_pass(sim, active_gas, dt_of);
     probe("sink-form");
+    probeL("sink-form");
     sinkv_probe(sim, "sink-form");
     // The scan already ran up at the swallow point under the split ordering; only the deferred
     // removals are left. Formation stays here either way: it reorders the arrays too, but fires
@@ -2668,6 +2788,7 @@ double mfm_step(Sim& sim, double dt_max) {
             sim.vx[i] = 0.0; sim.vy[i] = 0.0; sim.vz[i] = 0.0;
         }
     probe("sink-accrete");
+    probeL("sink-accrete");
 
     // Pass 2: drift EVERY particle over the system interval dt. A long-binned particle is drifted
     // in several sub-steps rather than one long one; its velocity is constant between its own

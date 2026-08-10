@@ -161,6 +161,18 @@ struct Sim {
     // (In the legacy global-timestep A/B mode time_now() is 0, so tform reads 0 there.)
     std::vector<double> sink_tform;
     std::vector<double> sink_m0;
+    // SINK_ALPHADISK_ACCRETION (a STARFORGE default): swallowed gas lands in an unresolved-disk
+    // reservoir and drains into the star over t_acc, rather than becoming stellar mass on contact.
+    // P.m stays the DYNAMICAL mass throughout -- reservoir included -- so gravity is untouched;
+    // the split exists to give Sink_Mdot a smooth value, which is what dt_accr steps on. For
+    // SINK_GRAVCAPTURE_FIXEDSINKRADIUS the drain time reduces to a constant set at formation,
+    //   t_acc = sqrt(reff^3/(G*M_form)) = G*M_form/cs_min^3,  reff = G*M_form/cs_min^2
+    // (sinks/sink.cc:395-399) -- i.e. mdot = (cs_min^3/G) * (reservoir/M_form), the Shu isothermal
+    // rate scaled by how full the disk is. cs_min is a hard floor of 0.2 km/s, not the local
+    // sound speed. Verified against the reference's own Sink_Mdot to 1-2% at every snapshot.
+    std::vector<double> sink_reservoir;
+    double sink_mass_split = 0.0;      // MaxMassForParticleSplit = 3.01 * max initial gas mass
+                                       // (core/init.cc:965); caps the mass scale in dt_accr
     // SINGLE_STAR_TIMESTEPPING: per-particle minimum approach / freefall time to the sink
     // population (gravity/forcetree.cc:2509-2510), refreshed for active particles each sync.
     // 1e300 = "no sink seen"; feeds the two-body sink criterion and the gas approach cap.
@@ -252,8 +264,10 @@ struct Sim {
     bool      individual_timesteps = false;
     double    dt_base    = 0.0;        // step of bin 0; 0 until set_time_base()
     long long clock_ticks = 0;         // current time, in ticks of dt_base / 2^MAX_BINS
-    int       bin_limit  = 3;          // Saitoh-Makino: a particle may not sit more than this many
-                                       // bins above an ACTIVE neighbour, or a shock outruns it
+    double    wakeup_fac = 4.1;        // Saitoh-Makino: demote an inactive neighbour once a pair's
+                                       // signal speed exceeds this multiple of the one it last
+                                       // recorded for itself (GIZMO WAKEUP, declarations/constants.h;
+                                       // 4.1 allows two bins within a kernel, 2.1 only one)
     std::vector<int>      bin;         // current timebin per particle
     std::vector<uint32_t> active;      // indices due at this sync point
     // wall time attributed to each bin, for the cpu-frac column of the timebin dump: a sync is
