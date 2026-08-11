@@ -146,6 +146,10 @@ static inline double sound_speed(const Sim& sim, size_t i) {
 // trusting reconstructed gradients in exactly the cells where the matrix says they are least
 // trustworthy, which in a collapsing core is where it matters.
 static constexpr double A_LIMITER = 0.25;
+// Condition number above which the matrix-based gradients are not trusted
+// (declarations/constants.h:79 -- 1e3 for everything except MHD-without-cooling and EOS_ELASTIC).
+static constexpr double CONDITION_NUMBER_DANGER = 1.0e3;
+
 static inline double a_limiter_for(double condition_number) {
     if (condition_number <= 100.0) return A_LIMITER;
     return std::min(0.5, 0.25 + 0.25 * (condition_number - 100.0) / 100.0);
@@ -626,9 +630,39 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 const double weight_i = kernel_w(separation, sim.h[i], sim.dim);
                 const double weight_j = kernel_w(separation, sim.h[j], sim.dim);
 
-                // effective face A_ij (points i -> j): V_i B_i dx W_i(r) + V_j B_j dx W_j(r)
-                const Vec3d face = work.moments_inv[i].matvec(offset) * (sim.ninv[i] * weight_i)
-                                 + work.moments_inv[j].matvec(offset) * (sim.ninv[j] * weight_j);
+                // effective face A_ij (points i -> j): wt_i B_i dx W_i(r) + wt_j B_j dx W_j(r).
+                //
+                // CENTRED WEIGHTS (compute_finitevol_faces.h:15-18). The Lanson & Vila form takes
+                // wt = V on each side, which -- as the reference's own comment says -- assumes
+                // negligible variation in h between neighbours. In a collapse that is false
+                // everywhere, and the volume gradient then TILTS the face: the pair force stays
+                // antisymmetric (momentum is safe) but its direction is biased, which is a torque.
+                // Once the volumes differ by more than 1.25 per dimension GIZMO switches both
+                // sides to one centred weight, recovering a face that does not lean on the side
+                // with the larger cell.
+                const double V_i = sim.ninv[i], V_j = sim.ninv[j];
+                double wt_i = V_i, wt_j = V_j;
+                const double vmin = std::min(V_i, V_j);
+                if (vmin > 0 && (std::abs(V_i - V_j) / vmin) / sim.dim > 1.25) {
+                    const double den = V_i * weight_i + V_j * weight_j;
+                    if (den > 0) wt_i = wt_j = V_i * V_j * (weight_i + weight_j) / den;
+                }
+                Vec3d face = work.moments_inv[i].matvec(offset) * (wt_i * weight_i)
+                           + work.moments_inv[j].matvec(offset) * (wt_j * weight_j);
+                // DEGENERATE GEOMETRY (compute_finitevol_faces.h:56-60). For a positive-definite
+                // E both terms of A.dx are positive, so a negative projection means the moment
+                // matrix has degenerated numerically; the same applies when the condition numbers
+                // blow up. GIZMO then falls back to a face along the SEPARATION, which is exactly
+                // central and therefore contributes no torque at all for that pair.
+                const bool cond_ok = work.condition_number.size() == sim.size();
+                const double cn_i = cond_ok ? work.condition_number[i] : 0.0;
+                const double cn_j = cond_ok ? work.condition_number[j] : 0.0;
+                if (dot(face, offset) < 0 ||
+                    cn_i*cn_i + cn_j*cn_j > 1.0e12 + CONDITION_NUMBER_DANGER*CONDITION_NUMBER_DANGER) {
+                    const double dwk_i = kernel_dwdr(separation, sim.h[i], sim.dim);
+                    const double dwk_j = kernel_dwdr(separation, sim.h[j], sim.dim);
+                    face = offset * (-(wt_i*V_i*dwk_i + wt_j*V_j*dwk_j) / separation);
+                }
                 const double face_area = face.norm();
                 if (face_area <= 0) continue;
                 const Vec3d normal = face / face_area;
