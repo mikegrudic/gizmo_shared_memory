@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
 
 #ifdef SHMEM_CUDA
 extern "C" void shmem_cuda_accel_bruteforce(
@@ -1098,7 +1099,8 @@ static void rebuild_tree(Sim& sim) {
     sync_all_positions(sim);
     const double* vel[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
     // Per-node centre-of-mass velocities only when a Hermite jerk will ask for them.
-    sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0);
+    sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0,
+                     sim.randomize_gravtree ? sim.tree_builds : -1);
     sim.tree.t_since_build = 0.0;
     // vcom was just built from these velocities and the node dp accumulators are zero, so this
     // is the baseline every later kick is measured against.
@@ -2438,6 +2440,30 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                     dt_tidal = std::min(dt_tidal, dt_sg);
                 }
                 dt = std::min(dt, dt_tidal);
+                // SHMEM_ATU_PROBE: what ADAPTIVE_TREEFORCE_UPDATE would be worth here, measured
+                // before building it. The reference refreshes a gas cell's tree force once it has
+                // advanced 0.0625 of its tidal time, so the fraction of walks it would SKIP is
+                // 1 - dt/(0.0625*dt_tidal). Skipping is only worth having if that is large, because
+                // the price is computing a jerk on every walk that does happen -- and the tidal
+                // tensor, a comparable term, already doubles this walk's cost.
+                static const bool atu_probe = getenv("SHMEM_ATU_PROBE") != nullptr;
+                if (atu_probe && gas) {
+                    static std::atomic<long long> n_gas_seen{0}, n_would_skip{0};
+                    static std::atomic<long long> ratio_milli{0};
+                    const double thresh = 0.0625 * dt_tidal;
+                    const double ratio = (thresh > 0) ? dt / thresh : 1.0;
+                    n_gas_seen.fetch_add(1, std::memory_order_relaxed);
+                    ratio_milli.fetch_add((long long)(1000.0 * std::min(ratio, 10.0)),
+                                          std::memory_order_relaxed);
+                    if (ratio < 1.0) n_would_skip.fetch_add(1, std::memory_order_relaxed);
+                    const long long seen = n_gas_seen.load(std::memory_order_relaxed);
+                    if ((seen % 2000000) == 0)
+                        fprintf(stderr, "[atu] gas dt-evals=%lld  below-threshold=%.1f%%  "
+                                "mean dt/(0.0625*t_tidal)=%.3f  => est. walks skipped %.1f%%\n",
+                                seen, 100.0*n_would_skip.load()/seen,
+                                1e-3*ratio_milli.load()/seen,
+                                100.0*std::max(0.0, 1.0 - 1e-3*ratio_milli.load()/seen));
+                }
             }
         }
         // SINGLE_STAR_TIMESTEPPING (core/timestep.cc:451-486). For a SINK, the two-body

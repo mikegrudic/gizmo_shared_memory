@@ -338,7 +338,11 @@ struct Sim {
     Tree   tree;
     bool   tree_valid = false;
     double tree_rebuild_pad_frac = 0.25;  // rebuild once pad exceeds this fraction of a typical h
-    long long tree_builds = 0;         // diagnostic
+    long long tree_builds = 0;         // diagnostic; also seeds the randomised root offset
+    // RANDOMIZE_GRAVTREE: redraw the tree's root offset on every build so the walk's force errors
+    // are decorrelated between steps rather than repeating. A fixed grid's errors are the same
+    // every step and integrate into a secular drift; redrawn ones average out.
+    bool      randomize_gravtree = false;
 
     // scratch reused across steps, so a sync does not allocate and zero several N-sized arrays
     std::vector<double> dt_of, dmom_x, dmom_y, dmom_z, denergy;

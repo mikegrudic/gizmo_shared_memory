@@ -36,6 +36,25 @@ g++ --version | head -1
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores
 
+# DO NOT LAUNCH THIS THROUGH mpirun. OpenMPI binds to a CORE when np <= 2, so `mpirun -np 1` pins
+# the rank to one core and every OpenMP thread inherits that mask -- the run then measures a single
+# core no matter what OMP_NUM_THREADS says. That is not hypothetical: job 6786243 reported
+# 96 threads and 96 cpus online, and produced
+#
+#   96 threads  wall 587.10 s  user 1107.08 s     user/wall = 1.89
+#   48 threads  wall 576.31 s  user 1099.90 s     user/wall = 1.91
+#   24 threads  wall 579.92 s  user 1116.76 s     user/wall = 1.93
+#   12 threads  wall 574.22 s  user 1112.99 s     user/wall = 1.94
+#
+# -- flat wall from 12 to 96 threads, and ~2 cores' worth of CPU throughout (one core, two SMT
+# threads). The engine's sched_setaffinity widening in gizmo_main.cc does not rescue it, because
+# libgomp has already built its place list from the restricted mask by then and OMP_PLACES=cores
+# then binds every thread inside it.
+#
+# There is nothing for mpirun to do here anyway: one rank, one process, threads from OpenMP. If you
+# ever do need it (to match the pytest harness, say), it MUST carry --bind-to none, which is
+# exactly what python_src/gizmo/test.py:219 passes.
+
 # A Genoa node is multi-socket, and every bulk array here is first-touched by ONE thread while the
 # ICs are read -- so without interleaving, all of it lands on a single NUMA domain and every thread
 # on the other sockets pays remote-memory latency for the whole run. That penalty grows with thread
@@ -45,6 +64,11 @@ if command -v numactl >/dev/null 2>&1; then
     NUMA_PREFIX="numactl --interleave=all"
     echo "=== NUMA topology ==="; numactl --hardware | head -8
 fi
+
+# How many CPUs this shell may actually use. If this is not the full node, nothing below measures
+# what it claims to, so print it where it cannot be missed.
+echo "=== CPU affinity: $(taskset -cp $$ 2>/dev/null | sed 's/.*: //') ==="
+echo "=== nproc sees $(nproc) of $(getconf _NPROCESSORS_ONLN) online ==="
 
 cd ../test/sedov
 # ICs are fetched by the pytest harness; if this is a fresh checkout, run the test once on a login
@@ -60,7 +84,7 @@ for THREADS in 96 48 24 12; do
     # `grep | tail` buffers the whole pass, so the job looks hung for ten minutes and there is no
     # way to tell a slow run from a stuck one -- which is exactly when you want the output.
     stdbuf -oL -eL /usr/bin/time -f "wall %e s   user %U s   maxrss %M kB" \
-        $NUMA_PREFIX mpirun -np 1 ../../shmem/GIZMO sedov.params 0 2>&1 | \
+        $NUMA_PREFIX ../../shmem/GIZMO sedov.params 0 2>&1 | \
         stdbuf -oL tee "sedov_omp${THREADS}.log" | \
         stdbuf -oL grep -E "^shmem-GIZMO|^done:|^  step |wall "
 done

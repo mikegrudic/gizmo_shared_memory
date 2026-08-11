@@ -306,8 +306,14 @@ struct BuildTimes { double bbox=0, keys=0, sort=0, recurse=0, links=0, pack=0, t
 // `vel`, when non-null, points at three per-particle velocity arrays (vx, vy, vz) and switches on
 // the per-node vmax bound above. Passed rather than stored on Particles because the engine keeps
 // velocities in its own arrays; gravity-only users of the tree pass nothing and pay nothing.
+// `randomize_seed`, when >= 0, turns on RANDOMIZE_GRAVTREE: the root box is displaced by a random
+// offset of up to half a side per axis and then DOUBLED so it still covers everything (GIZMO's
+// domain.cc:2722-2731). Every node wall in the tree moves with it, so the walk's force errors --
+// which are a function of where the cell walls fall relative to the mass -- are redrawn on each
+// build instead of repeating. Uncorrelated errors average out over a run; a fixed grid's errors
+// accumulate into a secular drift. Pass the step number so successive builds differ.
 Tree build(const Particles& P, BuildTimes* bt = nullptr, const double* const* vel = nullptr,
-           bool want_vcom = false);
+           bool want_vcom = false, long long randomize_seed = -1);
 
 // Accelerations for the listed targets, Barnes-Hut with opening angle theta.
 // `targets` is the ACTIVE list -- the whole point is that it is usually tiny compared to P.

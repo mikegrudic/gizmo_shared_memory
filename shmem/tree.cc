@@ -263,7 +263,8 @@ void setup_walk(Tree& T, int node, int next_sibling) {
     }
 }
 
-Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool want_vcom) {
+Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool want_vcom,
+           long long randomize_seed) {
     if (!vel) want_vcom = false;                  // no velocities, no centre-of-mass velocity
     double t_a = now_ms(), t_start = t_a;
     const size_t n = P.size();
@@ -278,6 +279,27 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     double cx = 0.5*(lo[0]+hi[0]), cy = 0.5*(lo[1]+hi[1]), cz = 0.5*(lo[2]+hi[2]);
     double side = std::max(hi[0]-lo[0], std::max(hi[1]-lo[1], hi[2]-lo[2])) * 1.0000001;
     if (side <= 0) side = 1.0;
+    // RANDOMIZE_GRAVTREE (domain.cc:2722-2731). Offset the root centre by up to half a side per
+    // axis, then DOUBLE the side so the displaced box still covers every particle. That moves every
+    // node wall in the tree, and a Barnes-Hut force error depends on where the walls fall relative
+    // to the mass -- so redrawing per build decorrelates the error between steps. Uncorrelated
+    // errors average out; a fixed grid's repeat and integrate into a secular drift.
+    //
+    // splitmix64 on the seed rather than rand(): reproducible, no global state, and no lock in what
+    // may be called from a parallel region. The reference reseeds from the step number likewise.
+    if (randomize_seed >= 0) {
+        uint64_t s = (uint64_t)randomize_seed * 0x9E3779B97F4A7C15ull;
+        auto next = [&s]() {
+            uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            return (double)((z ^ (z >> 31)) >> 11) * (1.0 / 9007199254740992.0);  // [0,1)
+        };
+        cx += side * (next() - 0.5);
+        cy += side * (next() - 0.5);
+        cz += side * (next() - 0.5);
+        side *= 2.0;
+    }
     // SHMEM_TREE_SHIFT="fx,fy,fz": displace the root box by these fractions of a side, which moves
     // every node boundary in the tree with it. The force error of a Barnes-Hut walk is a function
     // of WHERE the cell walls fall relative to the mass, so a grid-imprinted error rotates with
