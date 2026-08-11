@@ -565,8 +565,10 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     // whatever momentum the gravity kick still injects is the force LAW and the timestep
     // structure, not the walk. Diagnostic: it is O(N_active * N) and only affordable because the
     // active set is small for most of a collapse.
-    accel_grouped(tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az, tidal_out, aold_ptr,
-                  sim.lazy());
+    static const int grav_batch = getenv("SHMEM_GRAV_BATCH")
+                                ? atoi(getenv("SHMEM_GRAV_BATCH")) : 8;   // diagnostic override
+    accel_grouped(tree, sim.P, targets, sim.theta, sim.G, grav_batch, ax, ay, az, tidal_out,
+                  aold_ptr, sim.lazy(), nullptr, nullptr, sim.sink_direct_radius);
 
     // SHMEM_CUDA_GRAVITY replaces the walk's ACCELERATION with an O(N^2) GPU direct sum applying
     // the same pair force (grav_cuda.cu), leaving the tidal tensor to the walk -- that feeds the

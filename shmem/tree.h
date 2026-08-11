@@ -242,6 +242,10 @@ struct Tree {
     std::vector<int>   parent;          // parent node index, -1 at the root; for the kick climb
     std::vector<int>   leaf_of;         // per PARTICLE, the leaf holding it -- GIZMO's Father[]
     std::vector<float> vmax;            // max |v| over the node's particles, since the build
+    // Sinks contained in the node, for the direct-summation criterion (see accel_grouped). A
+    // separate array rather than a WNode field: WNode is exactly one cache line, and this is only
+    // read when the target itself is a sink, which is a vanishing fraction of walks.
+    std::vector<uint32_t> nsink;
     // Centre-of-mass velocity per node -- GIZMO's Extnodes[].vs. Only populated when the build
     // is given velocities AND a jerk is wanted (Hermite); empty otherwise, so runs that never
     // ask for a jerk pay neither the memory nor the sweep.
@@ -352,7 +356,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                    std::vector<SymTensor3d>* tidal = nullptr, const double* aold = nullptr,
                    const LazyDrift* lazy = nullptr,
                    std::vector<Vec3d>* jerk = nullptr,
-                   const double* const* vel = nullptr);
+                   const double* const* vel = nullptr,
+                   // SINK-SINK DIRECT SUMMATION (forcetree.cc:1975). When a SINK is the target and
+                   // a node holds sinks within this radius, open it and sum the pairs exactly
+                   // rather than accepting a multipole. Collisional pairs are what a multipole
+                   // approximates worst, and a binary integrated through one drifts in energy.
+                   // In code length units; 0 disables. The reference's default is 1000 AU.
+                   double sink_direct_radius = 0.0);
 
 // Gravitational potential at each target, spline-softened to match accel(). Separate from the
 // force walk because it is only wanted for diagnostics -- but it is the diagnostic that matters

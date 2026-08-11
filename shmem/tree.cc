@@ -148,6 +148,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     // (forcetree.cc:1641). Only built when velocities are supplied.
     double M = 0, sx = 0, sy = 0, sz_ = 0, smax = 0, vmax = 0;
     double pvx = 0, pvy = 0, pvz = 0;               // mass-weighted momentum, for vcom
+    uint32_t nsink = 0;                             // sinks below this node, for direct summation
     if (T.first[me] < 0 || nk == 0) {
         for (int i = lo; i < hi; ++i) {
             uint32_t p = order[i];
@@ -160,6 +161,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
                 if (v > vmax) vmax = v;
                 pvx += m * vel[0][p]; pvy += m * vel[1][p]; pvz += m * vel[2][p];
             }
+            if (!P.type.empty() && P.type[p] == 5) ++nsink;
             T.leaf_of[p] = me;
         }
     } else {
@@ -169,6 +171,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
             M += m; sx += m * T.cx[k]; sy += m * T.cy[k]; sz_ += m * T.cz[k];
             if (T.soft[k] > smax) smax = T.soft[k];
             if (T.vmax[k] > vmax) vmax = T.vmax[k];
+            nsink += T.nsink.empty() ? 0u : T.nsink[k];
             if (vel && !T.vcom_x.empty()) {
                 pvx += m * T.vcom_x[k]; pvy += m * T.vcom_y[k]; pvz += m * T.vcom_z[k];
             }
@@ -177,6 +180,7 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     if (M > 0) { sx /= M; sy /= M; sz_ /= M; }
     T.mass[me] = M; T.cx[me] = sx; T.cy[me] = sy; T.cz[me] = sz_; T.soft[me] = smax;
     T.vmax[me] = (float)vmax;
+    if (!T.nsink.empty()) T.nsink[me] = nsink;
     if (vel && !T.vcom_x.empty() && M > 0) {
         T.vcom_x[me] = pvx / M; T.vcom_y[me] = pvy / M; T.vcom_z[me] = pvz / M;
     }
@@ -287,6 +291,8 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.mass.resize(cap); T.size.resize(cap); T.delta.resize(cap); T.soft.resize(cap);
         T.first.resize(cap); T.next.resize(cap); T.plo.resize(cap); T.phi.resize(cap);
         T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
+        // Only when there are sinks to find; gas-only runs never allocate or touch this.
+        if (!P.type.empty()) T.nsink.assign(cap, 0u);
         if (want_vcom) {
             T.vcom_x.assign(cap, 0.0); T.vcom_y.assign(cap, 0.0); T.vcom_z.assign(cap, 0.0);
             T.dp_x.assign(cap, 0.0);   T.dp_y.assign(cap, 0.0);   T.dp_z.assign(cap, 0.0);
@@ -301,6 +307,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
         T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
+        if (!T.nsink.empty()) T.nsink.resize(nn);
         if (!T.vcom_x.empty()) {
             T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn);
             T.dp_x.resize(nn);   T.dp_y.resize(nn);   T.dp_z.resize(nn);
@@ -442,8 +449,12 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                    double theta, double G, int batch, std::vector<double>& ax,
                    std::vector<double>& ay, std::vector<double>& az,
                    std::vector<SymTensor3d>* tidal, const double* aold, const LazyDrift* lazy,
-                   std::vector<Vec3d>* jerk, const double* const* vel) {
+                   std::vector<Vec3d>* jerk, const double* const* vel,
+                   double sink_direct_radius) {
     const size_t nt = targets.size();
+    // Only live when there is a radius, the tree counted sinks, and types exist to identify them.
+    const bool sink_direct = (sink_direct_radius > 0.0) && (T.nsink.size() == T.nnodes())
+                             && !P.type.empty();
     ax.assign(nt, 0.0); ay.assign(nt, 0.0); az.assign(nt, 0.0);
     const bool want_tidal = (tidal != nullptr);
     // A jerk needs source velocities: the tree's per-node vcom for multipoles and `vel` for
@@ -473,6 +484,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             bz0=std::min(bz0,P.z[p]); bz1=std::max(bz1,P.z[p]);
             if (!P.soft.empty()) emax = std::max(emax, P.soft[p]);
         }
+        // Conservative like every other batch reduction: if ANY member is a sink, the whole batch
+        // uses the sink-direct criterion. Over-opening for the batch's non-sinks costs a little
+        // work; under-opening would silently approximate a collisional pair.
+        bool batch_has_sink = false;
+        if (sink_direct)
+            for (size_t i = lo; i < hi && !batch_has_sink; ++i)
+                batch_has_sink = (P.type[targets[i]] == 5);
         // Batch opening uses the CONSERVATIVE reduction of every per-member test: nearest bbox
         // point for r, the largest softening, and the SMALLEST aold (an aold of 0 anywhere in the
         // batch forces the geometric test, which opens at least as much).
@@ -520,8 +538,17 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             // Newtonian on both softenings, so the gas-gas kernel average degenerates to the
             // single evaluation the multipole applies, and the zeta corrections (r < h only) are
             // identically zero. Accepting a leaf therefore drops nothing that was contributing.
-            const bool accept = !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min,
-                                           theta2, dx, dy, dz);
+            bool accept = !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min,
+                                     theta2, dx, dy, dz);
+            // SINK-SINK DIRECT SUMMATION (forcetree.cc:1975). A sink looking at a node that holds
+            // sinks within sink_direct_radius opens it, so star-star pairs are always summed
+            // exactly. Applied after the general criterion because it only ever ADDS opening.
+            // Distance is to the node's TOTAL centre of mass with a 0.6*len margin, matching the
+            // reference -- which measures r2 to u.d.s and does not use its own sink_pos here.
+            if (accept && batch_has_sink && T.nsink[node] > 0) {
+                const double reach = sink_direct_radius + 0.6 * w.len;
+                if (rmin2 < reach * reach) accept = false;
+            }
             if (accept || w.first < 0) {
                 if (!accept) {
                     for (int k = w.plo; k < w.phi; ++k) {

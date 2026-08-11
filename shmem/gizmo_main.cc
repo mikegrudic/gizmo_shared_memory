@@ -506,6 +506,12 @@ int main(int argc, char** argv) {
     sim.opacity_limit_physics = cooling_on || (baro_variant >= 0);
     sim.sink_formation = sink_formation;
     sim.hybrid_opening = hybrid_opening;
+    // Sink-sink direct summation, on wherever the sink bundle is (the reference gates it on
+    // SINGLE_STAR_TIMESTEPPING or SINGLE_STAR_FIND_BINARIES, both of which ride in that bundle).
+    // 1000 AU converted to code units; sinks are the only type it applies to, so a run without
+    // them never pays for it.
+    if (sink_formation && sim.length_to_au > 0)
+        sim.sink_direct_radius = 1000.0 / sim.length_to_au;
     // MFM+GALSF contact-wave vsig (hydro_core_meshless.h:253). Off by default pending replicate
     // validation, NOT because anything is known wrong with it: the two failures seen while
     // developing it were both this port's own, and both are fixed -- the wakeup compared a

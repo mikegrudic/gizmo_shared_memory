@@ -142,6 +142,11 @@ struct Sim {
     double vel_to_kms = 1.0;           // code velocity -> km/s (UnitVelocity_in_cm_per_s / 1e5)
     // code length -> AU, for the 0.1 AU Larson-core floor on sink formation (sfr_eff.cc:348)
     double length_to_au = 0.0;
+    // Radius inside which SINK-SINK gravity is summed exactly rather than through a multipole
+    // (SINGLE_STAR_DIRECT_GRAVITY_RADIUS, precompiler_logic.h:378 -- 1000 AU, on by default in the
+    // STARFORGE bundle). In CODE length units; 0 disables. A binary integrated through a multipole
+    // drifts in energy, which is precisely what the collisional tests measure.
+    double sink_direct_radius = 0.0;
     // COOLING || EOS_GMC_BAROTROPIC -- the reference's guard on that floor (sfr_eff.cc:347).
     bool opacity_limit_physics = false;
     double crit_phys_density = 0.0;    // PhysDensThresh, code units (CritPhysDensity / n_H per rho)
