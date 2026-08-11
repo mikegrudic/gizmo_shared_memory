@@ -139,9 +139,16 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             // ADAPTIVE_TREEFORCE_UPDATE=0.0625 is the reference's own default when the flag is
             // present without a value (precompiler_logic.h:381).
             double atu_value;
-            if (flag("ADAPTIVE_TREEFORCE_UPDATE"))
+            if (flag("ADAPTIVE_TREEFORCE_UPDATE")) {
                 atu_frac = (sscanf(line, "ADAPTIVE_TREEFORCE_UPDATE=%lf", &atu_value) == 1)
                          ? atu_value : 0.0625;
+                // ATU sets its refresh cadence from the TIDAL timestep, so it needs that computed
+                // whether or not the config asked for the tidal criterion itself. The reference
+                // makes the same implication (precompiler_logic.h:600-603, "need this to estimate
+                // the dynamical time"). Without it tdyn_for_treeforce stays 0, every particle is
+                // forced fresh, and the whole feature is silently inert.
+                tidal_criterion = true;
+            }
             // Whether the paramfile's accuracy settings are honoured at all (begrun.cc:2637).
             if (flag("DEVELOPER_MODE")) developer_mode = true;
             // HERMITE_INTEGRATION 32 rides in the STARFORGE bundle (precompiler_logic.h:369)
@@ -527,6 +534,22 @@ int main(int argc, char** argv) {
     sim.sink_formation = sink_formation;
     sim.hybrid_opening = hybrid_opening;
     sim.randomize_gravtree = randomize_gravtree;
+    // Config-driven, as the reference is. MEASURED on evrard (27k particles, adiabatic collapse),
+    // sweeping the fraction with everything else fixed -- the engine is bit-reproducible at fixed
+    // thread count (two baselines agreed to 8e-15), so these are signal:
+    //
+    //     frac     steps   wall    grav    rho error vs base
+    //     base     1010    96.1s   35.1s   --
+    //     0.0625   1010    96.1s   36.1s   1.7e-02      <- reference default: skips nothing here
+    //     0.5      1006    71.6s   12.0s   6.1e-02
+    //     2         986    64.4s    5.7s   1.0e-01
+    //     8         904    60.3s    3.8s   3.6e-01
+    //     32        800    60.0s    2.0s   8.6e-01
+    //
+    // So the scheme works, and the FRACTION is the knob. 0.0625 is tuned for runs whose steps are
+    // set by multiphysics (radiation, feedback), where dt << t_tidal already -- gravity-limited
+    // problems like this one need a larger value before anything is skipped, and pay a jerk per
+    // walk in the meantime. The accuracy cost is jerk extrapolation error and rises steeply past 2.
     sim.atu_frac = atu_frac;
     if (atu_frac > 0)
         printf("shmem-GIZMO: adaptive tree-force update ON (gas keeps a jerk-advanced force for "

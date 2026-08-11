@@ -3300,9 +3300,13 @@ double mfm_step(Sim& sim, double dt_max) {
         c_bins+=t_bins; c_flux+=t_flux; c_drift+=t_drift; ++c_steps;
         const double tot = c_tree+c_dens+c_grad+c_grav+c_bins+c_flux+c_drift;
         if (getenv("SHMEM_PROFILE_TOTALS") && tot > 0 && (c_steps % 100) == 0) {
-            fprintf(stderr, "[prof-total] %lld steps  tree=%.1f dens=%.1f grad=%.1f grav=%.1f "
-                            "bins=%.1f flux=%.1f DRIFT=%.1f s  (drift %.1f%% of profiled time)\n",
-                    c_steps, c_tree*1e-3, c_dens*1e-3, c_grad*1e-3, c_grav*1e-3,
+            // tree_builds is what makes the `tree` column readable: a large number there is either
+            // many cheap checks or a few expensive REBUILDS, and only the count distinguishes them.
+            // Inferring the rate from the timing alone is how the rebuild cost got misattributed.
+            fprintf(stderr, "[prof-total] %lld steps  %lld rebuilds  tree=%.1f dens=%.1f grad=%.1f "
+                            "grav=%.1f bins=%.1f flux=%.1f DRIFT=%.1f s  (drift %.1f%% of profiled"
+                            " time)\n",
+                    c_steps, sim.tree_builds, c_tree*1e-3, c_dens*1e-3, c_grad*1e-3, c_grav*1e-3,
                     c_bins*1e-3, c_flux*1e-3, c_drift*1e-3, 100.0*c_drift/tot);
         }
         static int shown = 0;
