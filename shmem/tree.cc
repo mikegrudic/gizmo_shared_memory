@@ -12,6 +12,12 @@ namespace shmem {
 
 // spline_force_over_r and spline_potential live in tree.h, beside grav_tidal_factor.
 
+// SHMEM_TREE_NODELTA, read once. See the use site in the node-packing loop.
+static bool nodelta_opening() {
+    static const bool v = (getenv("SHMEM_TREE_NODELTA") != nullptr);
+    return v;
+}
+
 static inline void kick(const Vec3d& offset, double mass, double softening, Vec3d& accel) {
     const double r = offset.norm();
     if (r <= 0) return;
@@ -239,6 +245,20 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     double cx = 0.5*(lo[0]+hi[0]), cy = 0.5*(lo[1]+hi[1]), cz = 0.5*(lo[2]+hi[2]);
     double side = std::max(hi[0]-lo[0], std::max(hi[1]-lo[1], hi[2]-lo[2])) * 1.0000001;
     if (side <= 0) side = 1.0;
+    // SHMEM_TREE_SHIFT="fx,fy,fz": displace the root box by these fractions of a side, which moves
+    // every node boundary in the tree with it. The force error of a Barnes-Hut walk is a function
+    // of WHERE the cell walls fall relative to the mass, so a grid-imprinted error rotates with
+    // this while a physical one does not -- that is the test. It is also the mechanism behind
+    // GIZMO's RANDOMIZE_GRAVTREE: re-drawing the offset decorrelates successive steps' errors so
+    // they average out instead of accumulating into a secular drift.
+    if (const char* s = getenv("SHMEM_TREE_SHIFT")) {
+        double fx = 0, fy = 0, fz = 0;
+        if (sscanf(s, "%lf,%lf,%lf", &fx, &fy, &fz) == 3) {
+            cx += fx * side; cy += fy * side; cz += fz * side;
+            // the box has to still cover every particle after the shift
+            side *= 1.0 + 2.0 * (std::fabs(fx) + std::fabs(fy) + std::fabs(fz));
+        }
+    }
 
     const double scale = ((1u << MAX_LEVEL) - 1) / side;
     std::vector<uint64_t> key(n);
@@ -299,7 +319,14 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     for (size_t i = 0; i < T.nnodes(); ++i) {
         WNode& w = T.wn[i];
         w.cx = T.cx[i]; w.cy = T.cy[i]; w.cz = T.cz[i];
-        w.s  = T.size[i] + T.delta[i];
+        // SHMEM_TREE_NODELTA: drop the COM-offset term from the opening radius, leaving the raw
+        // side length -- which is what the reference's Barnes-Hut test uses (forcetree.cc:1889,
+        // `nop->len * nop->len > r2 * theta^2`). `delta` depends on WHERE the mass sits inside a
+        // node, and in a density gradient that offset is systematically oriented rather than
+        // random, so it biases which nodes open in a direction correlated with the gradient. That
+        // is a candidate for the coherent, axis-aligned torque this tree shows and GIZMO's does
+        // not; less conservative, so expect a larger |da| if it is doing real work.
+        w.s  = T.size[i] + (nodelta_opening() ? 0.0 : T.delta[i]);
         w.mass = T.mass[i]; w.soft = (float)T.soft[i]; w.len = (float)T.size[i];
         w.first = T.first[i]; w.next = T.next[i];
         w.plo = T.plo[i]; w.phi = T.phi[i];

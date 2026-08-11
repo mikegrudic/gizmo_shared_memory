@@ -3,6 +3,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 
 #ifdef SHMEM_CUDA
@@ -583,10 +584,72 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
         for (size_t k = 0; k < targets.size(); ++k) sim.tidal[targets[k]] = tidal_active[k];
     }
 
+    // SHMEM_EXACT_GRAVITY: replace the walk with the exact pairwise sum. Unlike the radial
+    // projection below this removes NO physics -- it is the same force law, summed without
+    // approximation -- and it is torque-free to round-off because pair_force_over_r is symmetric,
+    // so Newton's third law holds exactly. That makes it the controlled way to ask whether the
+    // tree's spurious torque drives the fragmentation. Affordable only because the cost is
+    // O(N_active * N) and N_active is small away from full syncs; needs SHMEM_DENSE_DRIFT so every
+    // source position is current, since this does not use the lazy-drift hook the walk does.
+    static const bool exact_grav = getenv("SHMEM_EXACT_GRAVITY") != nullptr;
+    if (exact_grav) accel_brute(sim.P, targets, sim.G, ax, ay, az);
+
     sim.a_grav.resize(n_part);
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < targets.size(); ++k)
         sim.a_grav[targets[k]] = Vec3d{ax[k], ay[k], az[k]};
+
+    // SHMEM_RADIAL_GRAVITY: keep only the component of gravity along the line to the collapse
+    // centre, discarding the transverse part. A central field exerts no torque about that point BY
+    // CONSTRUCTION, so this cannot conserve angular momentum better by accident -- it removes the
+    // spurious torque and a great deal of real physics with it. Purely a causal test, never a fix.
+    if (getenv("SHMEM_RADIAL_GRAVITY") && n_part > 0) {
+        // ONLY once a sink exists. Radialising before that guts local self-gravity everywhere -- a
+        // clump's pull on its own gas is almost entirely tangential in the global frame, so nothing
+        // can become self-bound, the centre accumulates a pressure-supported blob and the first
+        // sink forms ~9x late (measured). Picking the heaviest particle at t=0 is equally wrong:
+        // every gas cell has the same mass, so the choice lands on an arbitrary one.
+        size_t heavy = n_part;
+        for (size_t i = sim.n_gas; i < n_part; ++i)
+            if (!sim.P.type.empty() && sim.P.type[i] == 5 &&
+                (heavy == n_part || sim.P.m[i] > sim.P.m[heavy])) heavy = i;
+        if (heavy == n_part) return;                 // no sink yet: leave gravity alone
+        // WHICH centre matters more than it looks. A force aimed at the sink exerts no torque about
+        // the sink instantaneously, but the sink ACCELERATES, so that frame is non-inertial. Worse,
+        // the sink does not sit at the centre of the density cusp -- measured 0.80 r_sink away here
+        // against the reference's 0.26 -- and a force aimed at a point offset by d still torques
+        // about the true mass centre, with a tangential fraction ~d/r: about 20% at r = 4 r_sink,
+        // precisely where the spin-up is measured. So a null result from aiming at the sink means
+        // nothing. "cusp" aims at the density-weighted centroid, the centre that actually has to be
+        // torque-free; "box" aims at a fixed inertial point, additionally removing the sink's own
+        // acceleration.
+        const char* mode = getenv("SHMEM_RADIAL_GRAVITY");
+        Vec3d centre = sim.P.pos(heavy);
+        if (mode && strcmp(mode, "box") == 0) {
+            centre = Vec3d{0.0, 0.0, 0.0};
+        } else if (mode && strcmp(mode, "cusp") == 0) {
+            const double r_cut = 30.0 * (sim.sink_radius.size() == n_part && sim.sink_radius[heavy] > 0
+                                         ? sim.sink_radius[heavy] : 1.0248e-05);
+            Vec3d num{0, 0, 0}; double den = 0;
+            for (size_t i = 0; i < sim.n_gas; ++i) {
+                const Vec3d d = min_image(sim.P.pos(i) - centre, sim.box);
+                if (d.norm() > r_cut) continue;
+                const double w = sim.rho[i] * sim.P.m[i];      // density-weighted, as the diagnostic
+                num += sim.P.pos(i) * w; den += w;
+            }
+            if (den > 0) centre = num / den;
+        }
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < targets.size(); ++k) {
+            const size_t i = targets[k];
+            if (i == heavy) continue;
+            const Vec3d d = min_image(sim.P.pos(i) - centre, sim.box);
+            const double r = d.norm();
+            if (!(r > 0)) continue;
+            const Vec3d rhat = d / r;
+            sim.a_grav[i] = rhat * dot(sim.a_grav[i], rhat);
+        }
+    }
 }
 
 // Flux exchange over unique pairs. Pair discovery from the SMALLER kernel side would miss
@@ -2066,6 +2129,97 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
     if (!candidates.empty()) { sim.ngb_cache.clear(); sim.tree_valid = false; }
 }
 
+// SHMEM_ACCTEST: score the gravity walk against an exact O(N^2) sum on whatever was loaded as ICs
+// (a GIZMO snapshot is a valid IC, so this runs on any output). It reports the per-particle force
+// error and the SPURIOUS TORQUE separately, because they are different quantities and a walk can
+// be better on one while worse on the other: torque comes from the ANISOTROPY of the error, not
+// its size, so errors that are large but central cancel in sum(r x m a) while small correlated
+// ones do not.
+//
+// The batch=1 arm is the point of the test. accel_grouped decides node opening once per BATCH,
+// against the batch's bounding box, so every particle in a batch shares the same opened set and
+// inherits the same error -- correlated at the batch scale rather than independent. Independent
+// errors cancel in the torque sum; correlated ones survive it. If batch=1 injects less torque at
+// equal or worse |da|, the grouping is what generates the spin-up and the fix is a smaller batch,
+// not a tighter theta.
+static void gravity_ground_truth(Sim& sim) {
+    if (!getenv("SHMEM_ACCTEST")) return;
+    const size_t n = sim.size();
+    std::vector<uint32_t> targets(n);
+    for (size_t i = 0; i < n; ++i) targets[i] = (uint32_t)i;
+
+    // one origin for every solver, so the torques are directly comparable
+    double cx = 0, cy = 0, cz = 0, mtot = 0;
+    for (size_t i = 0; i < n; ++i) {
+        cx += sim.P.m[i]*sim.P.x[i]; cy += sim.P.m[i]*sim.P.y[i]; cz += sim.P.m[i]*sim.P.z[i];
+        mtot += sim.P.m[i];
+    }
+    if (mtot > 0) { cx /= mtot; cy /= mtot; cz /= mtot; }
+
+    std::vector<double> bx, by, bz;
+    printf("shmem-GIZMO: [acctest] exact O(N^2) reference over %zu particles...\n", n); fflush(stdout);
+    const auto t0 = std::chrono::steady_clock::now();
+    accel_brute(sim.P, targets, sim.G, bx, by, bz);
+    printf("shmem-GIZMO: [acctest]   done in %.1f s\n",
+           std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());
+
+    Vec3d Ldir{0,0,0};
+    auto torque = [&](const std::vector<double>& ax, const std::vector<double>& ay,
+                      const std::vector<double>& az) {
+        double Lx = 0, Ly = 0, Lz = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double dx = sim.P.x[i]-cx, dy = sim.P.y[i]-cy, dz = sim.P.z[i]-cz, m = sim.P.m[i];
+            Lx += m*(dy*az[i] - dz*ay[i]);
+            Ly += m*(dz*ax[i] - dx*az[i]);
+            Lz += m*(dx*ay[i] - dy*ax[i]);
+        }
+        const double L = std::sqrt(Lx*Lx + Ly*Ly + Lz*Lz);
+        Ldir = (L > 0) ? Vec3d{Lx/L, Ly/L, Lz/L} : Vec3d{0,0,0};   // DIRECTION: a grid-imprinted
+        return L;                                                   // torque rotates with the root
+    };
+    // The relative criterion needs each target's PREVIOUS |a| (GIZMO's OldAcc, in the walk's no-G
+    // units). Passing nothing leaves it zero, which opens every node and silently turns the walk
+    // into the very brute force it is being compared against -- the first run of this test scored
+    // 1e-14, i.e. round-off, identically at every batch size. The exact accelerations are the best
+    // possible stand-in for a converged previous step.
+    std::vector<double> aold(n);
+    for (size_t i = 0; i < n; ++i)
+        aold[i] = sim.err_tol_force_acc * std::sqrt(bx[i]*bx[i]+by[i]*by[i]+bz[i]*bz[i]) / sim.G;
+
+    printf("shmem-GIZMO: [acctest] theta=%.3f errtolforceacc=%.4g  |torque| exact = %.6e\n",
+           sim.theta, sim.err_tol_force_acc, torque(bx,by,bz));
+
+    for (int batch : {8, 4, 1}) {
+        std::vector<double> ax, ay, az;
+        accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, batch, ax, ay, az,
+                      nullptr, aold.data());
+        std::vector<double> rel; rel.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const double bmag = std::sqrt(bx[i]*bx[i] + by[i]*by[i] + bz[i]*bz[i]);
+            if (!(bmag > 0)) continue;
+            const double dx = ax[i]-bx[i], dy = ay[i]-by[i], dz = az[i]-bz[i];
+            rel.push_back(std::sqrt(dx*dx + dy*dy + dz*dz) / bmag);
+        }
+        std::sort(rel.begin(), rel.end());
+        const auto q = [&](double f) { return rel.empty() ? 0.0 : rel[(size_t)(f*(rel.size()-1))]; };
+        const double Lmag = torque(ax, ay, az);
+        printf("shmem-GIZMO: [acctest] batch=%-2d  |da|/|a| med=%.3e p95=%.3e max=%.3e   "
+               "|torque|=%.6e dir=(%+.3f,%+.3f,%+.3f)\n", batch, q(0.5), q(0.95),
+               rel.empty() ? 0.0 : rel.back(), Lmag, Ldir[0], Ldir[1], Ldir[2]);
+        fflush(stdout);
+        // SHMEM_ACCDUMP: per-particle exact and tree accelerations, keyed by ID, so the REFERENCE's
+        // own walk can be scored on the same positions against the same exact sum (its [gacc]
+        // probe emits the matching fields). Only the default batch is dumped.
+        if (getenv("SHMEM_ACCDUMP")) {
+            for (size_t i = 0; i < n; ++i)
+                fprintf(stderr, "[sacc] k=%d ID=%llu bx=%.12e by=%.12e bz=%.12e "
+                        "tx=%.12e ty=%.12e tz=%.12e\n", batch,
+                        (unsigned long long)(sim.id.size() > i ? sim.id[i] : (long long)i),
+                        bx[i], by[i], bz[i], ax[i], ay[i], az[i]);
+        }
+    }
+}
+
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
     sim.last_drift.assign(n_part, sim.clock_ticks);
@@ -2094,6 +2248,7 @@ void compute_initial_state(Sim& sim) {
     // Ti_Current==0 for exactly this purpose. Leaving it live outside STARFORGE configs opens the
     // union of both criteria, which is more nodes than the reference visits and measurably slower.
     if (!sim.hybrid_opening) sim.theta = 0.0;
+    gravity_ground_truth(sim);   // SHMEM_ACCTEST only; a no-op otherwise
 }
 
 void compute_potential(Sim& sim) {
@@ -2827,7 +2982,19 @@ double mfm_step(Sim& sim, double dt_max) {
 
     std::vector<double>& dmom_x = sim.dmom_x;  std::vector<double>& dmom_y = sim.dmom_y;
     std::vector<double>& dmom_z = sim.dmom_z;  std::vector<double>& denergy = sim.denergy;
-    fluxes(sim, tree, active_gas, dt_of, dmom_x, dmom_y, dmom_z, denergy);
+    // SHMEM_NO_HYDRO: skip the flux exchange entirely, leaving pure gravitational free-fall. A
+    // spherically symmetric IC must then collapse symmetrically, so ANY asymmetry that survives
+    // this is gravity's -- it separates "the tree breaks symmetry" from "the hydro does" without
+    // relying on either being made exact. Not a physical configuration; diagnostic only.
+    static const bool no_hydro = getenv("SHMEM_NO_HYDRO") != nullptr;
+    if (no_hydro) {
+        // assign, not fill: sizing these is fluxes()' job, so skipping it leaves them EMPTY and
+        // the conserved update below indexes off the end.
+        dmom_x.assign(n_part, 0.0); dmom_y.assign(n_part, 0.0);
+        dmom_z.assign(n_part, 0.0); denergy.assign(n_part, 0.0);
+    } else {
+        fluxes(sim, tree, active_gas, dt_of, dmom_x, dmom_y, dmom_z, denergy);
+    }
     const double t_flux = profile ? lap() : 0.0;
 
     // Conserved update. This runs over ALL particles, not just the active ones: an inactive
