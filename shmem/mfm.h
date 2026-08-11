@@ -343,14 +343,27 @@ struct Sim {
     // are decorrelated between steps rather than repeating. A fixed grid's errors are the same
     // every step and integrate into a secular drift; redrawn ones average out.
     bool      randomize_gravtree = false;
+    // Guards the active-set-only softening update: a full sweep is redone whenever either of these
+    // changes, which is how sink formation (which reorders the arrays) forces one.
     // Representative h of the WHOLE distribution as of the last tree build. The rebuild trigger
     // asks "has drift degraded THIS tree", which is a property of every particle the tree covers --
-    // not of whichever few are active.
+    // not of whichever few are active. Sampling h from one active particle instead made the
+    // threshold collapse to a core cell's h on deep-bin steps and rebuilt 3.5e6 nodes almost every
+    // step: measured ~130 ms of tree per step at nact=21 on the bate cloud.
     double    tree_typical_h = 0.0;
-    // Guards the active-set-only softening update: a full sweep is redone whenever either changes,
-    // which is how sink formation (which reorders the arrays) forces one.
     size_t    soft_valid_n = (size_t)-1;
     size_t    soft_valid_ngas = (size_t)-1;
+    // ADAPTIVE_TREEFORCE_UPDATE=f: a GAS cell keeps its cached tree force, advanced with the jerk,
+    // until it has aged past f * its tidal time (gravtree.cc:939-951, sfr_eff dt_tidal). 0 = off.
+    // Non-gas and Hermite-integrated types always take a fresh force: the predictor-corrector
+    // sub-stepping is incompatible with a cached one (gravtree.cc:941).
+    double    atu_frac = 0.0;
+    std::vector<double> time_since_treeforce;   // per particle, code time since its last real walk
+    // mutable because desired_dt() is a const query and this is a CACHE it fills in passing: the
+    // tidal dt is computed there and nowhere else, and recomputing it in the caller would mean
+    // duplicating the tensor norm and the self-gravity floor.
+    mutable std::vector<double> tdyn_for_treeforce;   // per particle, tidal dt setting the cadence
+    std::vector<Vec3d>  a_grav_jerk;            // per particle, d(a)/dt from that walk
 
     // scratch reused across steps, so a sync does not allocate and zero several N-sized arrays
     std::vector<double> dt_of, dmom_x, dmom_y, dmom_z, denergy;

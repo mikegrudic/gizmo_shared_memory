@@ -497,11 +497,13 @@ static void predict_half(Sim& sim, const std::vector<uint32_t>& active,
 // ACTIVE-SET ONLY once the table is valid. soft[i] is a pure function of h[i] for gas and of the
 // fixed table for everything else, and h only ever changes for ACTIVE gas -- the h solve runs on
 // the active set. So an inactive particle's softening is already correct, and rewriting all of it
-// every step is pure O(N) waste.
+// every step is pure O(N) waste. Measured on the 3.5e6-cell bate cloud: this pass sat inside a
+// gravity phase that cost 80 ms on a step moving 21 particles.
 //
 // A FULL pass is still required whenever the layout could have moved under us -- first call, a
 // changed particle count, or a changed gas/non-gas split, which is what sink formation does when it
-// converts a cell and re-sorts the arrays.
+// converts a cell and re-sorts the arrays. Those are exactly the cases where an index no longer
+// means what it did last step.
 static void update_softenings(Sim& sim, const std::vector<uint32_t>* active = nullptr) {
     const size_t n_part = sim.size();
     sim.P.soft.resize(n_part);
@@ -520,6 +522,23 @@ static void update_softenings(Sim& sim, const std::vector<uint32_t>* active = nu
         #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < active->size(); ++k) set_one((*active)[k]);
     }
+}
+
+// ADAPTIVE_TREEFORCE_UPDATE: does this particle need a real tree walk this step, or can it keep
+// its cached acceleration advanced by the jerk? Mirrors needs_new_treeforce (gravtree.cc:939-951).
+//
+// Only GAS is ever lazy. A Hermite-integrated type must always be fresh -- its predictor-corrector
+// sub-stepping is incompatible with a cached force (gravtree.cc:941) -- and the reference restricts
+// the lazy path to type 0 regardless (:943), because everything else is a sink whose orbit is the
+// thing being resolved.
+static inline bool atu_needs_fresh(const Sim& sim, size_t i) {
+    if (sim.atu_frac <= 0) return true;
+    if (i >= sim.n_gas) return true;                       // non-gas: always fresh
+    if (!sim.P.type.empty() && (sim.hermite_mask & (1 << sim.P.type[i]))) return true;
+    // Nothing cached yet -- first walk, or a particle created since the last one.
+    if (sim.a_grav.size() != sim.size() || sim.a_grav_jerk.size() != sim.size()) return true;
+    if (!(sim.tdyn_for_treeforce[i] > 0)) return true;
+    return sim.time_since_treeforce[i] >= sim.atu_frac * sim.tdyn_for_treeforce[i];
 }
 
 static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
@@ -559,6 +578,20 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
         }
     }
 
+    // ATU: split the Morton-ordered active set into those needing a real walk and those keeping a
+    // jerk-advanced cached force. Partitioned IN PLACE so the walk's target list stays contiguous
+    // and stays in Morton order -- the batch walk's entire advantage rests on that ordering.
+    std::vector<uint32_t> atu_skipped;
+    if (sim.atu_frac > 0) {
+        size_t keep = 0;
+        for (size_t k = 0; k < targets.size(); ++k) {
+            const uint32_t i = targets[k];
+            if (atu_needs_fresh(sim, i)) targets[keep++] = i;
+            else                         atu_skipped.push_back(i);
+        }
+        targets.resize(keep);
+    }
+
     std::vector<double> ax, ay, az;
     // grouped walk: one traversal per batch of 8, measured 1.71x over the per-target walk.
     // The tidal tensor rides along in the same walk when the tidal timestep criterion wants it.
@@ -590,8 +623,15 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     // amount of extra threads pays that back.
     static const int grav_batch = getenv("SHMEM_GRAV_BATCH")
                                 ? atoi(getenv("SHMEM_GRAV_BATCH")) : 8;   // diagnostic override
+    // The jerk is what makes a skipped force usable: the cached acceleration is advanced as
+    // a += j*dt rather than merely reused stale. It costs extra work in every walk that DOES run,
+    // which is why the reference gates the whole scheme behind a flag.
+    std::vector<Vec3d> jerk_active;
+    std::vector<Vec3d>* jerk_out = (sim.atu_frac > 0) ? &jerk_active : nullptr;
+    const double* vel3[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
     accel_grouped(tree, sim.P, targets, sim.theta, sim.G, grav_batch, ax, ay, az, tidal_out,
-                  aold_ptr, sim.lazy(), nullptr, nullptr, sim.sink_direct_radius);
+                  aold_ptr, sim.lazy(), jerk_out, (sim.atu_frac > 0 ? vel3 : nullptr),
+                  sim.sink_direct_radius);
 
     // SHMEM_CUDA_GRAVITY replaces the walk's ACCELERATION with an O(N^2) GPU direct sum applying
     // the same pair force (grav_cuda.cu), leaving the tidal tensor to the walk -- that feeds the
@@ -639,6 +679,27 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < targets.size(); ++k)
         sim.a_grav[targets[k]] = Vec3d{ax[k], ay[k], az[k]};
+    if (sim.atu_frac > 0) {
+        sim.a_grav_jerk.resize(n_part);
+        sim.time_since_treeforce.resize(n_part, 0.0);
+        // Fresh: cache the jerk and reset the age to this step's dt, so the counter measures how
+        // old the cached force will be by the end of the step (gravtree.cc:508).
+        const bool have_jerk = jerk_active.size() == targets.size();
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < targets.size(); ++k) {
+            const uint32_t i = targets[k];
+            if (have_jerk) sim.a_grav_jerk[i] = jerk_active[k];
+            sim.time_since_treeforce[i] = sim.time_of_ticks(sim.ticks_in_bin(sim.bin[i]));
+        }
+        // Skipped: advance the cached acceleration with its jerk and age it (gravtree.cc:504-505).
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < atu_skipped.size(); ++k) {
+            const uint32_t i = atu_skipped[k];
+            const double dt = sim.time_of_ticks(sim.ticks_in_bin(sim.bin[i]));
+            sim.a_grav[i] += sim.a_grav_jerk[i] * dt;
+            sim.time_since_treeforce[i] += dt;
+        }
+    }
 
     // SHMEM_RADIAL_GRAVITY: keep only the component of gravity along the line to the collapse
     // centre, discarding the transverse part. A central field exerts no torque about that point BY
@@ -1118,7 +1179,9 @@ static void rebuild_tree(Sim& sim) {
     sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0,
                      sim.randomize_gravtree ? sim.tree_builds : -1);
     sim.tree.t_since_build = 0.0;
-    // One O(N) pass per REBUILD (not per step), dwarfed by the O(N log N) build it follows.
+    // One O(N) pass per REBUILD (not per step), dwarfed by the O(N log N) build it follows. Mean
+    // over gas rather than a median: the point is a scale for "has anything moved appreciably",
+    // and sorting 3.5e6 values to refine that would cost more than it is worth.
     {
         const size_t ng = std::min(sim.n_gas, sim.h.size());
         double sum_h = 0.0; size_t cnt = 0;
@@ -2278,6 +2341,11 @@ static void gravity_ground_truth(Sim& sim) {
 void compute_initial_state(Sim& sim) {
     const size_t n_part = sim.size();
     sim.last_drift.assign(n_part, sim.clock_ticks);
+    if (sim.atu_frac > 0) {                      // ADAPTIVE_TREEFORCE_UPDATE per-particle state
+        sim.time_since_treeforce.assign(n_part, 0.0);
+        sim.tdyn_for_treeforce.assign(n_part, 0.0);   // 0 => no cached force yet, forces a walk
+        sim.a_grav_jerk.assign(n_part, Vec3d{0,0,0});
+    }
     sim.mass_initial = 0.0;
     for (size_t i = 0; i < n_part; ++i) sim.mass_initial += sim.P.m[i];
     const size_t n_gas = std::min(sim.n_gas, n_part);
@@ -2468,6 +2536,11 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                     if (parts) parts->selfgrav = dt_sg;
                     dt_tidal = std::min(dt_tidal, dt_sg);
                 }
+                // ADAPTIVE_TREEFORCE_UPDATE reads this as the cadence for refreshing the cached
+                // tree force (timestep.cc:443, tdyn_step_for_treeforce = dt_tidal). Stored after
+                // the self-gravity floor, exactly where the reference stores it.
+                if (sim.atu_frac > 0 && sim.tdyn_for_treeforce.size() == sim.size())
+                    sim.tdyn_for_treeforce[i] = dt_tidal;
                 dt = std::min(dt, dt_tidal);
                 // SHMEM_ATU_PROBE: what ADAPTIVE_TREEFORCE_UPDATE would be worth here, measured
                 // before building it. The reference refreshes a gas cell's tree force once it has
@@ -2711,7 +2784,8 @@ double mfm_step(Sim& sim, double dt_max) {
     // because past that the padded prune starts opening nodes it does not need.
     // Scale for "has drift degraded this tree": the mean h over ALL gas, recorded when the tree was
     // built. Taking it from one ACTIVE particle instead ties the threshold to whoever is awake, and
-    // on a deep-bin step that is a core cell whose h is orders of magnitude below the box.
+    // on a deep-bin step that is a core cell whose h is orders of magnitude below the box -- which
+    // rebuilt the whole 3.5e6-particle tree nearly every step for no benefit.
     double typical_h = sim.tree_typical_h;
     if (typical_h <= 0.0 && !sim.h.empty())
         typical_h = sim.h[active.empty() ? 0 : active[0]];

@@ -55,13 +55,14 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                          double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
                          bool& sink_formation, int& hermite_mask, bool& cooling_on,
                          bool& hybrid_opening, bool& developer_mode, bool& galsf,
-                         bool& randomize_gravtree) {
+                         bool& randomize_gravtree, double& atu_frac) {
     bool hermite_disabled = false;
     cooling_on = false;
     hybrid_opening = false;
     developer_mode = false;
     galsf = false;
     randomize_gravtree = false;
+    atu_frac = 0.0;
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -135,6 +136,12 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                 flag("SINGLE_STAR_SINK_DYNAMICS") || flag("SINGLE_STAR_SINK_FORMATION"))
                 galsf = true;
             if (flag("RANDOMIZE_GRAVTREE")) randomize_gravtree = true;
+            // ADAPTIVE_TREEFORCE_UPDATE=0.0625 is the reference's own default when the flag is
+            // present without a value (precompiler_logic.h:381).
+            double atu_value;
+            if (flag("ADAPTIVE_TREEFORCE_UPDATE"))
+                atu_frac = (sscanf(line, "ADAPTIVE_TREEFORCE_UPDATE=%lf", &atu_value) == 1)
+                         ? atu_value : 0.0625;
             // Whether the paramfile's accuracy settings are honoured at all (begrun.cc:2637).
             if (flag("DEVELOPER_MODE")) developer_mode = true;
             // HERMITE_INTEGRATION 32 rides in the STARFORGE bundle (precompiler_logic.h:369)
@@ -438,10 +445,11 @@ int main(int argc, char** argv) {
     double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
     int hermite_mask = 0; bool cooling_on = false; bool hybrid_opening = false;
     bool developer_mode = false; bool galsf = false; bool randomize_gravtree = false;
+    double atu_frac = 0.0;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
                  box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation,
                  hermite_mask, cooling_on, hybrid_opening, developer_mode, galsf,
-                 randomize_gravtree);
+                 randomize_gravtree, atu_frac);
     // Units first: G falls back to the PHYSICAL constant in code units when the params file
     // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
     // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
@@ -519,6 +527,10 @@ int main(int argc, char** argv) {
     sim.sink_formation = sink_formation;
     sim.hybrid_opening = hybrid_opening;
     sim.randomize_gravtree = randomize_gravtree;
+    sim.atu_frac = atu_frac;
+    if (atu_frac > 0)
+        printf("shmem-GIZMO: adaptive tree-force update ON (gas keeps a jerk-advanced force for "
+               "%.4g of its tidal time)\n", atu_frac);
     // Sink-sink direct summation, on wherever the sink bundle is (the reference gates it on
     // SINGLE_STAR_TIMESTEPPING or SINGLE_STAR_FIND_BINARIES, both of which ride in that bundle).
     // 1000 AU converted to code units; sinks are the only type it applies to, so a run without
