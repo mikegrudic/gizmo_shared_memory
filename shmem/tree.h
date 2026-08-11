@@ -123,9 +123,23 @@ static inline bool open_node(double r_sq, double len, double l_open, double node
     // mass sits rather than on the line of centres. Measured on shu1977 with global timesteps,
     // angular momentum per gravity kick is 8.5e-12 for this test alone, 1.5e-12 for Barnes-Hut
     // alone, ~1e-22 for an exact O(N^2) sum -- but note the union did NOT cure the spurious
-    // spin-up it was reached for. aold == 0 (no walk yet) collapses the right-hand side to zero
-    // and opens everything, which is what makes a first pass with no acceleration exact.
-    if (node_mass * len * len > r_sq * r_sq * aold) return true;
+    // spin-up it was reached for.
+    //
+    // aold == 0 means no previous force for this target. The reference SKIPS this criterion
+    // entirely on that first walk (forcetree.cc:1912, `!(Ti_Current==0 && RestartFlag!=1)`) and
+    // bootstraps on Barnes-Hut alone, retiring ErrTolTheta only afterwards (gravtree.cc:491).
+    // Letting aold == 0 fall through here instead collapses the right-hand side to zero, opens
+    // every node and turns the walk into an O(N^2) direct sum: measured 48.6 s for one 128k step
+    // against 0.9 s with this guard, and 76% of a shu1977 run to its first snapshot.
+    if (aold > 0) {
+        if (node_mass * len * len > r_sq * r_sq * aold) return true;
+    } else if (theta_sq <= 0.0) {
+        // No criterion left to decide with -- no previous acceleration AND no geometric test.
+        // Open, which is the accurate-but-slow path. This is the case for a particle created
+        // mid-run (a fresh sink has no a_prev) once theta has been retired, and it must not be
+        // turned into "open nothing", which would hand that particle a badly wrong force.
+        return true;
+    }
     return adx < 0.6 * len && ady < 0.6 * len && adz < 0.6 * len;
 }
 
