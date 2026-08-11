@@ -53,9 +53,12 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
                          bool& output_potential, bool& tidal_criterion, bool& box_periodic,
                          double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
-                         bool& sink_formation, int& hermite_mask, bool& cooling_on) {
+                         bool& sink_formation, int& hermite_mask, bool& cooling_on,
+                         bool& hybrid_opening, bool& developer_mode) {
     bool hermite_disabled = false;
     cooling_on = false;
+    hybrid_opening = false;
+    developer_mode = false;
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -115,6 +118,14 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                 flag("SINGLE_STAR_SINK_DYNAMICS"))
                 { sink_formation = true; tidal_criterion = true; adaptive_soft = true;
                   output_potential = true; }
+            // The same bundle carries GRAVITY_ACCURATE_FEWBODY_INTEGRATION, hence the hybrid
+            // opening criterion (see Sim::hybrid_opening). Everything else keeps the reference's
+            // relative-only walk.
+            if (flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
+                flag("GRAVITY_ACCURATE_FEWBODY_INTEGRATION") ||
+                flag("GRAVITY_HYBRID_OPENING_CRIT")) hybrid_opening = true;
+            // Whether the paramfile's accuracy settings are honoured at all (begrun.cc:2637).
+            if (flag("DEVELOPER_MODE")) developer_mode = true;
             // HERMITE_INTEGRATION 32 rides in the STARFORGE bundle (precompiler_logic.h:369)
             // unless PMGRID or DISABLE_HERMITE_INTEGRATION -- the latter is exactly what the
             // plummer_binaries "kdk" pytest variant appends, so the variants become a true
@@ -414,10 +425,11 @@ int main(int argc, char** argv) {
     bool gravity_on = false, adaptive_soft = false, output_potential = false;
     bool tidal_criterion = false, box_periodic = false, sink_formation = false;
     double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
-    int hermite_mask = 0; bool cooling_on = false;
+    int hermite_mask = 0; bool cooling_on = false; bool hybrid_opening = false;
+    bool developer_mode = false;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
                  box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation,
-                 hermite_mask, cooling_on);
+                 hermite_mask, cooling_on, hybrid_opening, developer_mode);
     // Units first: G falls back to the PHYSICAL constant in code units when the params file
     // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
     // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
@@ -493,6 +505,7 @@ int main(int argc, char** argv) {
     sim.length_to_au = unit_length_cgs / 1.495978707e13;
     sim.opacity_limit_physics = cooling_on || (baro_variant >= 0);
     sim.sink_formation = sink_formation;
+    sim.hybrid_opening = hybrid_opening;
     if (sink_formation) {
         // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
         const double crit_nh = params.count("CritPhysDensity")
@@ -533,6 +546,24 @@ int main(int argc, char** argv) {
     if (params.count("MaxNumNgbDeviation"))
         sim.ngb_tol = atof(params["MaxNumNgbDeviation"].c_str());
     if (params.count("ErrTolForceAcc")) sim.err_tol_force_acc = atof(params["ErrTolForceAcc"].c_str());
+    // WITHOUT DEVELOPER_MODE the reference IGNORES these accuracy parameters and substitutes its
+    // own (core/begrun.cc:2637-2677, which warns "Tag ... was specified, but it is being ignored").
+    // Reading them from the file instead is not a small difference: shu1977 asks for CourantFac
+    // 0.2 and ErrTolTheta 0.21 while the reference runs 0.4 and 0.5, so every Courant step here
+    // was half the reference's and every tree walk opened more nodes than its does.
+    if (!developer_mode) {
+        sim.cfl = 0.4; sim.eta_grav = 0.02; sim.theta = 0.7; sim.err_tol_force_acc = 0.0025;
+        // ...then the accurate-few-body tightenings on top (begrun.cc:2744-2748), which the
+        // STARFORGE bundle turns on via GRAVITY_ACCURATE_FEWBODY_INTEGRATION.
+        if (hybrid_opening) {
+            if (sim.eta_grav > 0.01) sim.eta_grav = 0.01;
+            if (sim.theta    > 0.5)  sim.theta    = 0.5;
+            if (sim.ngb_tol  > 0.05) sim.ngb_tol  = 0.05;
+        }
+        printf("shmem-GIZMO: no DEVELOPER_MODE -- using the reference's built-in accuracy "
+               "parameters (CourantFac=%g ErrTolIntAccuracy=%g ErrTolTheta=%g ErrTolForceAcc=%g)\n",
+               sim.cfl, sim.eta_grav, sim.theta, sim.err_tol_force_acc);
+    }
     // SHMEM_GLOBAL_TIMESTEP=1 forces the old all-active scheme, for A/B against this one.
     sim.individual_timesteps = (getenv("SHMEM_GLOBAL_TIMESTEP") == nullptr);
     // SHMEM_DENSE_DRIFT=1 restores the full O(N) drift sweep, for A/B against lazy drift.

@@ -1992,6 +1992,12 @@ void compute_initial_state(Sim& sim) {
     // the real per-particle softenings rather than the zeros the driver loaded with -- the t=0
     // potential is computed from this tree.
     rebuild_tree(sim);
+    // Retire the geometric criterion now that the walks above have given every particle an aold,
+    // unless the config asked for the hybrid. This is gravtree.cc:489 -- the reference zeroes
+    // ErrTolTheta at the END of the first gravity_tree(), which accel.cc:49 schedules at
+    // Ti_Current==0 for exactly this purpose. Leaving it live outside STARFORGE configs opens the
+    // union of both criteria, which is more nodes than the reference visits and measurably slower.
+    if (!sim.hybrid_opening) sim.theta = 0.0;
 }
 
 void compute_potential(Sim& sim) {
@@ -2127,7 +2133,15 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                     : 1e300;
     if (parts) parts->cfl = dt;
     if (sim.gravity_on) {
-        const double accel_mag = sim.a_grav[i].norm();
+        // WHICH acceleration this criterion sees (core/timestep.cc:348-379). It starts as the
+        // GRAVITATIONAL acceleration and picks up the hydro one for gas -- except under
+        // TIDAL_TIMESTEP_CRITERION, where the gravitational part is zeroed outright, because the
+        // tidal tensor is already supplying the gravity timestep and counting it twice pins every
+        // cell to its softening-over-gravity time. Using a_grav here regardless made this the
+        // binding criterion for 98.5% of cells where the reference is limited by the tidal term.
+        Vec3d acc_for_dt = sim.tidal_criterion ? Vec3d{0, 0, 0} : sim.a_grav[i];
+        if (gas && sim.a_hydro.size() == sim.size()) acc_for_dt += sim.a_hydro[i];
+        const double accel_mag = acc_for_dt.norm();
         if (accel_mag > 0) {
             // sqrt(2 eta (KERNEL_CORE_SIZE * eps) / |a|) with KERNEL_CORE_SIZE = 1/2 for the
             // cubic spline: GIZMO measures the softening scale by the kernel CORE, not the full
@@ -2272,6 +2286,24 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
             while (b > want && (sim.clock_ticks & (sim.ticks_in_bin(b - 1) - 1)) == 0) --b;
         }
         sim.bin[i] = std::min(std::max(b, 0), Sim::MAX_BINS);
+    }
+    // SHMEM_DTDUMP: every criterion and the bin actually assigned, per active gas cell, to compare
+    // the DISTRIBUTIONS against the reference's [gdt] dump at a matched time. Serial so the lines
+    // stay whole. NOTE when comparing: `tidal` here is the pure tidal value, whereas the
+    // reference's dt_tidal already has the self-gravity floor folded in -- match it against
+    // min(tidal, selfgrav). One line per active cell per sync, so redirect this.
+    if (getenv("SHMEM_DTDUMP")) {
+        for (size_t k = 0; k < active.size(); ++k) {
+            const uint32_t i = active[k];
+            if (i >= sim.n_gas) continue;
+            DtParts dp;
+            const double dt = desired_dt(sim, i, &dp);
+            fprintf(stderr, "[sdt] %.8e ID=%llu dt=%.6e courant=%.6e accel=%.6e tidal=%.6e "
+                    "selfgrav=%.6e bin=%d h=%.6e rho=%.6e\n",
+                    sim.time_now(),
+                    (unsigned long long)(sim.id.size() > i ? sim.id[i] : (long long)i),
+                    dt, dp.cfl, dp.accel, dp.tidal, dp.selfgrav, sim.bin[i], sim.h[i], sim.rho[i]);
+        }
     }
 }
 

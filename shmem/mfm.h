@@ -217,7 +217,15 @@ struct Sim {
     // ---- self-gravity (off unless gravity_on; SELFGRAVITY_OFF in the suite configs) ----
     bool   gravity_on = false;
     double G          = 1.0;           // GravityConstantInternal
-    double theta      = 0.5;           // geometric opening angle (ErrTolTheta); bootstrap only
+    double theta      = 0.5;           // geometric opening angle (ErrTolTheta). Bootstrap only
+                                       // unless hybrid_opening: see below.
+    // GRAVITY_HYBRID_OPENING_CRIT, which GRAVITY_ACCURATE_FEWBODY_INTEGRATION enables and the
+    // STARFORGE defaults enable in turn (precompiler_logic.h:373, 567). WITHOUT it the reference
+    // zeroes ErrTolTheta once the first walk has established aold (gravtree.cc:489, with
+    // TypeOfOpeningCriterion hardcoded to 1 at begrun.cc:2740), leaving the relative criterion
+    // alone; WITH it Barnes-Hut stays live and the two run as a union. Getting this wrong costs
+    // real time -- the union opens strictly more nodes than either test by itself.
+    bool hybrid_opening = false;
                                        // once the relative criterion below is active
     double err_tol_force_acc = 0.0;    // ErrTolForceAcc; 0 = geometric opening only
     double soft_min   = 0.0;           // floor on the gas softening, as a kernel extent

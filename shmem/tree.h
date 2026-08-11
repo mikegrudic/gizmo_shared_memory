@@ -112,22 +112,20 @@ static inline bool open_node(double r_sq, double len, double l_open, double node
                              double adx, double ady, double adz) {
     const double grow_t = soft_target + 0.6 * len, grow_n = node_maxsoft + 0.6 * len;
     if (r_sq < grow_t * grow_t || r_sq < grow_n * grow_n) return true;
-    // BOTH criteria, opening if EITHER demands it -- GRAVITY_HYBRID_OPENING_CRIT, which
-    // GRAVITY_ACCURATE_FEWBODY_INTEGRATION turns on and the STARFORGE defaults turn that on.
-    // With it set the reference never zeroes ErrTolTheta (gravtree.cc:490 is compiled out) and the
-    // relative test stops being the `else` of the Barnes-Hut one (forcetree.cc:1896), so the two
-    // run in series and the union decides.
-    //
-    // The reason is in the reference's own comment: aold can be dominated by one close companion
-    // while distant nodes still need to be resolved. That is this problem exactly -- once a sink
-    // forms, aold for the gas around it is set by the sink, the relative test
-    // (mass*len^2 > r^4 * ErrTolForceAcc * |a_old|) stops opening distant nodes, and the monopole
-    // error left behind is a TORQUE: a node's centre of force is wherever its mass sits, not on
-    // the line of centres. Measured on shu1977 with global timesteps, angular momentum injected
-    // per gravity kick is 8.5e-12 for the relative test alone, 1.5e-12 for Barnes-Hut alone, and
-    // ~1e-22 for an exact O(N^2) sum. Using either criterion alone spins up the infalling gas.
+    // Barnes-Hut, live only where the config keeps ErrTolTheta nonzero. Under
+    // GRAVITY_HYBRID_OPENING_CRIT that is always, and the two tests below form a union; otherwise
+    // the reference retires this one after the first walk (gravtree.cc:489) and theta_sq is 0 by
+    // then. The union opens strictly more nodes, so it is not free -- see Sim::hybrid_opening.
     if (theta_sq > 0.0 && l_open * l_open >= theta_sq * r_sq) return true;
-    if (aold > 0.0 && node_mass * len * len > r_sq * r_sq * aold) return true;
+    // Relative criterion. Its own rationale, from the reference: aold can be dominated by one
+    // close companion while distant nodes still need resolving, and the monopole error left in a
+    // node that should have been opened is a TORQUE, since its centre of force is wherever its
+    // mass sits rather than on the line of centres. Measured on shu1977 with global timesteps,
+    // angular momentum per gravity kick is 8.5e-12 for this test alone, 1.5e-12 for Barnes-Hut
+    // alone, ~1e-22 for an exact O(N^2) sum -- but note the union did NOT cure the spurious
+    // spin-up it was reached for. aold == 0 (no walk yet) collapses the right-hand side to zero
+    // and opens everything, which is what makes a first pass with no acceleration exact.
+    if (node_mass * len * len > r_sq * r_sq * aold) return true;
     return adx < 0.6 * len && ady < 0.6 * len && adz < 0.6 * len;
 }
 
