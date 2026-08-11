@@ -454,7 +454,14 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
     const double theta2 = theta * theta;
     const int nb = (int)((nt + batch - 1) / batch);
 
-    #pragma omp parallel for schedule(dynamic, 1)
+    // SHMEM_COUNT_WALK: node visits and pair interactions per target. Counts, not times, so
+    // frequency scaling does not touch them -- which is what settled whether this walk was doing
+    // more work than a reference walk or the same work more slowly.
+    static const bool count_walk = (getenv("SHMEM_COUNT_WALK") != nullptr);
+    long long n_nodes_visited = 0, n_multipole = 0, n_pairs = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1) \
+            reduction(+:n_nodes_visited,n_multipole,n_pairs)
     for (int b = 0; b < nb; ++b) {
         size_t lo = (size_t)b * batch, hi = std::min(lo + batch, nt);
         // batch bounding box
@@ -497,14 +504,26 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
         int node = T.root;
         while (node >= 0) {
             const WNode& w = W[node];
+            if (count_walk) ++n_nodes_visited;
             double dx = std::max(0.0, std::max(bx0 - w.cx, w.cx - bx1));
             double dy = std::max(0.0, std::max(by0 - w.cy, w.cy - by1));
             double dz = std::max(0.0, std::max(bz0 - w.cz, w.cz - bz1));
             double rmin2 = dx*dx + dy*dy + dz*dz;
-            if (w.first < 0 ||
-                !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min, theta2,
-                           dx, dy, dz)) {
-                if (w.first < 0) {
+            // A LEAF IS A NODE. Testing `w.first < 0` first would short-circuit the criterion and
+            // direct-sum every leaf reached, up to LEAF_MAX particles, even where the multipole
+            // was acceptable: measured 4444.9 direct pairs per target against pytreegrav's 695.7
+            // on the same ICs and theta, which is the whole of a 2.6x interaction-count gap. Ask
+            // the criterion first; expand only the leaves it actually wants opened.
+            //
+            // Safe because the softening-overlap arm of the criterion opens any node whose
+            // particles could reach the target's kernel. Beyond that overlap the spline is
+            // Newtonian on both softenings, so the gas-gas kernel average degenerates to the
+            // single evaluation the multipole applies, and the zeta corrections (r < h only) are
+            // identically zero. Accepting a leaf therefore drops nothing that was contributing.
+            const bool accept = !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min,
+                                           theta2, dx, dy, dz);
+            if (accept || w.first < 0) {
+                if (!accept) {
                     for (int k = w.plo; k < w.phi; ++k) {
                         uint32_t q = T.orderbuf[k];
                         // Lazy drift, exactly as in the neighbour search and in GIZMO's
@@ -520,6 +539,7 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                             const double dx_=qx-tx[i], dy_=qy-ty[i], dz_=qz-tz[i];
                             const double r2 = dx_*dx_ + dy_*dy_ + dz_*dz_;
                             if (r2 <= 0) continue;
+                            if (count_walk) ++n_pairs;
                             const double r = std::sqrt(r2);
                             const double fac = pair_force_over_r(
                                 r, qm, te[i], qs, tzeta[i], qzeta,
@@ -562,6 +582,7 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                         }
                     }
                 } else {
+                    if (count_walk) n_multipole += nb_;
                     for (int i = 0; i < nb_; ++i) {
                         double e = std::max(te[i], (double)w.soft);
                         kick(w.cx-tx[i], w.cy-ty[i], w.cz-tz[i], w.mass, e, oax[i], oay[i], oaz[i]);
@@ -609,6 +630,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             tt[0][1]=ott[3][i]; tt[1][2]=ott[4][i]; tt[0][2]=ott[5][i];
         }
 
+    }
+    if (count_walk && nt > 0) {
+        fprintf(stderr, "[walk] targets=%zu batch=%d  nodes_visited=%lld (%.1f/target)  "
+                "multipole=%lld (%.1f/target)  pairs=%lld (%.1f/target)  interactions=%.1f/target\n",
+                nt, batch, n_nodes_visited, (double)n_nodes_visited/nt,
+                n_multipole, (double)n_multipole/nt, n_pairs, (double)n_pairs/nt,
+                (double)(n_multipole + n_pairs)/nt);
     }
 }
 
