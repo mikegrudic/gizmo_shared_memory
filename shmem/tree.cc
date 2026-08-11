@@ -102,6 +102,13 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     int me;
     #pragma omp atomic capture
     me = T.nalloc++;
+    // REFUSE rather than overrun. The arena is pre-sized from a heuristic tuned on roughly uniform
+    // fills, and a heuristic can be wrong by a lot: a cloud occupying a thousandth of its box (the
+    // MakeCloud convention -- R=0.1875 inside box=1.875) must descend several levels before it
+    // reaches any mass, and turbulent clumping adds more, so it needs far more nodes per particle.
+    // Writing past the end silently corrupts the heap, which surfaces as an unrelated free() abort
+    // later. nalloc keeps counting past the end on purpose: build() reads it to size the retry.
+    if ((size_t)me >= T.size.size()) return -1;
     T.size[me] = sz; T.first[me] = -1; T.next[me] = -1; T.plo[me] = lo; T.phi[me] = hi;
 
     bool leaf = (hi - lo <= LEAF_MAX) || (level >= MAX_LEVEL);
@@ -144,6 +151,13 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
         if (spawn) {
             #pragma omp taskwait
         }
+        // Drop any child the arena refused. Everything below is index arithmetic on kids[], and a
+        // -1 would be written straight into T.parent[]. This attempt's tree is already garbage --
+        // build() is going to throw it away and retry -- but it must not corrupt memory on the way
+        // out.
+        { int keep = 0;
+          for (int i = 0; i < nk; ++i) if (kids[i] >= 0) kids[keep++] = kids[i];
+          nk = keep; }
         if (nk == 0) { leaf = true; }
         else {
             for (int i = 0; i < nk; ++i) T.parent[kids[i]] = me;
@@ -299,12 +313,23 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     for (size_t i = 0; i < n; ++i) skey[i] = key[order[i]];
 
     Tree T;
-    {   // pre-size: <= one node per LEAF_MAX particles at the bottom + interior ~ 8/7 of that; 2x
-        // headroom on top because Morton splits can be uneven. Trimmed to nalloc after the build.
-        size_t cap = (2 * n) / LEAF_MAX * 3 + 1024;
-        T.cx.resize(cap); T.cy.resize(cap); T.cz.resize(cap);
-        T.mass.resize(cap); T.size.resize(cap); T.delta.resize(cap); T.soft.resize(cap);
-        T.first.resize(cap); T.next.resize(cap); T.plo.resize(cap); T.phi.resize(cap);
+    // Pre-size: <= one node per LEAF_MAX particles at the bottom + interior ~ 8/7 of that; 2x
+    // headroom on top because Morton splits can be uneven. Trimmed to nalloc after the build.
+    //
+    // That estimate assumes the particles roughly fill their box. When they do not it is far too
+    // small -- a MakeCloud cloud fills a thousandth of its box volume and needs several levels of
+    // nearly-empty nodes before it reaches any mass -- so the build can want more nodes than the
+    // arena holds. It used to run off the end and corrupt the heap. Now the allocator refuses past
+    // the end and we simply build again with a bigger arena. nalloc is only a LOWER bound on what
+    // was needed (refused nodes never recursed), hence doubling rather than sizing exactly; two
+    // attempts is the most this has ever taken.
+    size_t cap = (2 * n) / LEAF_MAX * 3 + 1024;
+    for (;;) {
+        T.cx.assign(cap, 0.0); T.cy.assign(cap, 0.0); T.cz.assign(cap, 0.0);
+        T.mass.assign(cap, 0.0); T.size.assign(cap, 0.0); T.delta.assign(cap, 0.0);
+        T.soft.assign(cap, 0.0);
+        T.first.assign(cap, -1); T.next.assign(cap, -1);
+        T.plo.assign(cap, 0); T.phi.assign(cap, 0);
         T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
         // Only when there are sinks to find; gas-only runs never allocate or touch this.
         if (!P.type.empty()) T.nsink.assign(cap, 0u);
@@ -313,10 +338,13 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
             T.dp_x.assign(cap, 0.0);   T.dp_y.assign(cap, 0.0);   T.dp_z.assign(cap, 0.0);
         }
         T.leaf_of.assign(n, -1);
+        T.nalloc = 0;
+        #pragma omp parallel
+        #pragma omp single
+        T.root = build_node(T, P, order, skey, 0, (int)n, 0, cx, cy, cz, side, vel);
+        if ((size_t)T.nalloc <= cap) break;
+        cap = (size_t)T.nalloc * 2 + 1024;
     }
-    #pragma omp parallel
-    #pragma omp single
-    T.root = build_node(T, P, order, skey, 0, (int)n, 0, cx, cy, cz, side, vel);
     {   // trim to what was allocated
         size_t nn = (size_t)T.nalloc;
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
