@@ -606,6 +606,13 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
         dmom_z.assign(n_part, 0); denergy.assign(n_part, 0);
     }
     sim.wake_requests.clear();
+    // Staged, not written in place: the wakeup test reads its NEIGHBOUR's recorded signal speed,
+    // so overwriting the live array mid-loop would have it compare against values already updated
+    // this step by other threads. The reference has the same separation -- it accumulates into a
+    // per-target `out` and merges afterwards.
+    static std::vector<double> vsig_new;
+    const bool contact_vsig = sim.contact_wave_vsig;
+    if (contact_vsig) vsig_new.assign(n_part, 0.0);
     #pragma omp parallel
     {
         std::vector<uint32_t> neighbours;
@@ -620,6 +627,18 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
             // search with h_i; pairs where h_j > r >= h_i are found from j's side (j also loops)
             const Vec3d pos_i = sim.P.pos(i);
             get_neighbours(sim, tree, k, pos_i, sim.h[i], neighbours);
+            // MFM+GALSF signal velocity, accumulated HERE rather than in the density pass, because
+            // the reference derives it from the Riemann solve: vsig = 2*S_M + max(0, dv_face)
+            // (hydro_core_meshless.h:253), replacing the Monaghan cs_i+cs_j estimate. Only the
+            // OWNER i is updated, exactly as the reference does -- it writes j's copy only under
+            // j_is_active_for_fluxes, which is never set -- so this needs no atomic.
+            //
+            // SEEDED with i's own sound speed, not zero (hydro_evaluate.h:82,
+            // out.MaxSignalVel = kernel.sound_i). This is the floor, and the pair loop below only
+            // ever raises it: 2*S_M carries no lower bound of its own, so a cell in near
+            // equilibrium sees S_M ~ 0 on every pair and would otherwise end the step with vsig 0
+            // and an unbounded Courant limit.
+            double vsig_i = sound_speed(sim, i);
             for (uint32_t j : neighbours) {
                 if (j == i) continue;
                 if (j >= sim.n_gas) continue;   // fluxes are exchanged between gas pairs only
@@ -716,6 +735,30 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 const auto [contact_speed, contact_pressure] = solve_hllc_contact(
                     left[FIELD_DENSITY],  vnorm_left,  left[FIELD_PRESSURE],
                     right[FIELD_DENSITY], vnorm_right, right[FIELD_PRESSURE], geff_i, geff_j);
+
+                // THE pair signal speed for this step: the contact-wave form when enabled, the
+                // Monaghan estimate otherwise. Computed ONCE and used for both the per-particle
+                // accumulator and the wakeup test below -- the two must be the SAME quantity. When
+                // they were not (Monaghan in the wakeup, contact-wave in the stored value) the
+                // ratio in the wakeup test ran ~40 against a threshold of 4.1, so every inactive
+                // neighbour was demoted three bins every step and the box ran away to bin 21 with
+                // every dt criterion still reading large.
+                double vsig_pair;
+                if (contact_vsig) {
+                    const double fv_i = dot(Vec3d{work.predicted[FIELD_VX][i],
+                                                  work.predicted[FIELD_VY][i],
+                                                  work.predicted[FIELD_VZ][i]}, normal);
+                    const double fv_j = dot(Vec3d{work.predicted[FIELD_VX][j],
+                                                  work.predicted[FIELD_VY][j],
+                                                  work.predicted[FIELD_VZ][j]}, normal);
+                    vsig_pair = 2.0*contact_speed + std::max(0.0, fv_j - fv_i);
+                    vsig_i = std::max(vsig_i, vsig_pair);
+                } else {
+                    const Vec3d rel = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}
+                                    - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
+                    vsig_pair = sound_speed(sim, i) + sound_speed(sim, j)
+                              + std::max(0.0, dot(rel, offset) / separation);
+                }
 
                 // Lagrangian flux: zero mass flux; P* acts across the face, which moves at
                 // v_frame + S* nhat in the lab. Momentum goes from i to j along +nhat.
@@ -829,11 +872,10 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                     // hand, so a separate sweep would repeat this whole tree walk for nothing.
                     // Deferred rather than applied, because writing sim.bin now would race the
                     // threads still reading it.
-                    const Vec3d rel_vel = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}
-                                        - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
-                    const double approach_speed = dot(rel_vel, offset) / separation;
-                    const double vsig = sound_speed(sim, i) + sound_speed(sim, j)
-                                      + std::max(0.0, approach_speed);
+                    // vsig_pair, computed once above, is whichever definition this run stores in
+                    // signal_speed -- comparing unlike quantities here is what produced the bin-21
+                    // runaway.
+                    const double vsig = vsig_pair;
                     // GIZMO stores the request as waker_bin+1 (0 meaning "none") and decodes it to
                     // bin = waker_bin - offset (core/timestep.cc:1348-1351), so the woken cell
                     // lands on a step WAKEUP times SHORTER than the waker's -- not merely closer
@@ -843,11 +885,25 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                         local_wakes.emplace_back(j, sim.bin[i] + wake_offset);
                 }
             }
+            if (contact_vsig) vsig_new[i] = vsig_i;
         }
         if (!local_wakes.empty()) {
             #pragma omp critical
             sim.wake_requests.insert(sim.wake_requests.end(),
                                      local_wakes.begin(), local_wakes.end());
+        }
+    }
+    // Merge the staged signal speeds now that every thread is done reading the old ones. Every
+    // active cell is written, since the seed alone guarantees a positive value; inactive cells keep
+    // theirs, as in the reference, where only the active pass resets MaxSignalVel.
+    if (contact_vsig) {
+        std::vector<double>& sig = const_cast<Work&>(work).signal_speed;
+        if (sig.size() == n_part) {
+            #pragma omp parallel for schedule(static)
+            for (size_t k = 0; k < active.size(); ++k) {
+                const uint32_t i = active[k];
+                if (vsig_new[i] > 0) sig[i] = vsig_new[i];
+            }
         }
     }
 }

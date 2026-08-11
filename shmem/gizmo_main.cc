@@ -506,6 +506,13 @@ int main(int argc, char** argv) {
     sim.opacity_limit_physics = cooling_on || (baro_variant >= 0);
     sim.sink_formation = sink_formation;
     sim.hybrid_opening = hybrid_opening;
+    // MFM+GALSF contact-wave vsig (hydro_core_meshless.h:253). Off by default pending replicate
+    // validation, NOT because anything is known wrong with it: the two failures seen while
+    // developing it were both this port's own, and both are fixed -- the wakeup compared a
+    // Monaghan pair vsig against a stored contact-wave one, and the accumulator was seeded at
+    // zero instead of the reference's cs_i floor. Since vsig sets the Courant step, flipping the
+    // default needs sedov plus shu1977 replicates, not one passing run.
+    sim.contact_wave_vsig = (getenv("SHMEM_CONTACT_VSIG") != nullptr);
     if (sink_formation) {
         // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
         const double crit_nh = params.count("CritPhysDensity")

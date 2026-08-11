@@ -272,6 +272,12 @@ struct Sim {
     bool      individual_timesteps = false;
     double    dt_base    = 0.0;        // step of bin 0; 0 until set_time_base()
     long long clock_ticks = 0;         // current time, in ticks of dt_base / 2^MAX_BINS
+    // MFM+GALSF replaces the Monaghan signal velocity with the CONTACT WAVE speed from the
+    // Riemann solve, vsig = 2*S_M + max(0, dv_face) (hydro/hydro_core_meshless.h:253), floored at
+    // the cell's own sound speed. That feeds the Courant step, and measures ~2x smaller than
+    // cs_i+cs_j for quiescent gas -- half of the factor-4 Courant discrepancy against the
+    // reference. Off by default; see the gate in gizmo_main.cc.
+    bool      contact_wave_vsig = false;
     double    wakeup_fac = 4.1;        // Saitoh-Makino: demote an inactive neighbour once a pair's
                                        // signal speed exceeds this multiple of the one it last
                                        // recorded for itself (GIZMO WAKEUP, declarations/constants.h;
