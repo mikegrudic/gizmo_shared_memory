@@ -130,7 +130,7 @@ static inline bool open_node(double r_sq, double len, double l_open, double node
     // bootstraps on Barnes-Hut alone, retiring ErrTolTheta only afterwards (gravtree.cc:491).
     // Letting aold == 0 fall through here instead collapses the right-hand side to zero, opens
     // every node and turns the walk into an O(N^2) direct sum: measured 48.6 s for one 128k step
-    // against 0.9 s with this guard, and 76% of a shu1977 run to its first snapshot.
+    // against 1.8 s with this guard, and 76% of a shu1977 run to its first snapshot.
     if (aold > 0) {
         if (node_mass * len * len > r_sq * r_sq * aold) return true;
     } else if (theta_sq <= 0.0) {
@@ -242,9 +242,9 @@ struct Tree {
     std::vector<int>   parent;          // parent node index, -1 at the root; for the kick climb
     std::vector<int>   leaf_of;         // per PARTICLE, the leaf holding it -- GIZMO's Father[]
     std::vector<float> vmax;            // max |v| over the node's particles, since the build
-    // Sinks contained in the node, for the direct-summation criterion (see accel_grouped). A
-    // separate array rather than a WNode field: WNode is exactly one cache line, and this is only
-    // read when the target itself is a sink, which is a vanishing fraction of walks.
+    // Sinks contained in the node, for the direct-summation criterion (see open_node). A separate
+    // array rather than a WNode field: WNode is exactly one cache line, and this is only read when
+    // the target itself is a sink, which is a vanishing fraction of walks.
     std::vector<uint32_t> nsink;
     // Centre-of-mass velocity per node -- GIZMO's Extnodes[].vs. Only populated when the build
     // is given velocities AND a jerk is wanted (Hermite); empty otherwise, so runs that never
@@ -357,8 +357,8 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                    const LazyDrift* lazy = nullptr,
                    std::vector<Vec3d>* jerk = nullptr,
                    const double* const* vel = nullptr,
-                   // SINK-SINK DIRECT SUMMATION (forcetree.cc:1975). When a SINK is the target and
-                   // a node holds sinks within this radius, open it and sum the pairs exactly
+                   // SINK-SINK DIRECT SUMMATION (forcetree.cc:1973-1979). When a SINK is the target
+                   // and a node holds sinks within this radius, open it and sum the pairs exactly
                    // rather than accepting a multipole. Collisional pairs are what a multipole
                    // approximates worst, and a binary integrated through one drifts in energy.
                    // In code length units; 0 disables. The reference's default is 1000 AU.

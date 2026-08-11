@@ -54,11 +54,12 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                          bool& output_potential, bool& tidal_criterion, bool& box_periodic,
                          double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
                          bool& sink_formation, int& hermite_mask, bool& cooling_on,
-                         bool& hybrid_opening, bool& developer_mode) {
+                         bool& hybrid_opening, bool& developer_mode, bool& galsf) {
     bool hermite_disabled = false;
     cooling_on = false;
     hybrid_opening = false;
     developer_mode = false;
+    galsf = false;
     // Gravity is ON in GIZMO unless SELFGRAVITY_OFF is set, so default to on and let the config
     // switch it off -- the opposite default would silently drop gravity from any test whose
     // Config.sh simply does not mention it.
@@ -124,6 +125,13 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
             if (flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
                 flag("GRAVITY_ACCURATE_FEWBODY_INTEGRATION") ||
                 flag("GRAVITY_HYBRID_OPENING_CRIT")) hybrid_opening = true;
+            // GALSF, which the sink bundle defines rather than the config naming it directly:
+            // SINGLE_STAR_STARFORGE_DEFAULTS -> SINGLE_STAR_SINK_DYNAMICS (precompiler_logic.h:368)
+            // -> GALSF (:476). It gates the contact-wave signal velocity, which the reference
+            // applies under MFM+GALSF only.
+            if (flag("GALSF") || flag("SINGLE_STAR_STARFORGE_DEFAULTS") ||
+                flag("SINGLE_STAR_SINK_DYNAMICS") || flag("SINGLE_STAR_SINK_FORMATION"))
+                galsf = true;
             // Whether the paramfile's accuracy settings are honoured at all (begrun.cc:2637).
             if (flag("DEVELOPER_MODE")) developer_mode = true;
             // HERMITE_INTEGRATION 32 rides in the STARFORGE bundle (precompiler_logic.h:369)
@@ -426,10 +434,10 @@ int main(int argc, char** argv) {
     bool tidal_criterion = false, box_periodic = false, sink_formation = false;
     double eos_adiabat = 0.0; int baro_variant = -1; bool baro_soundspeed = false;
     int hermite_mask = 0; bool cooling_on = false; bool hybrid_opening = false;
-    bool developer_mode = false;
+    bool developer_mode = false; bool galsf = false;
     parse_config(n_dims, gamma, gravity_on, adaptive_soft, output_potential, tidal_criterion,
                  box_periodic, eos_adiabat, baro_variant, baro_soundspeed, sink_formation,
-                 hermite_mask, cooling_on, hybrid_opening, developer_mode);
+                 hermite_mask, cooling_on, hybrid_opening, developer_mode, galsf);
     // Units first: G falls back to the PHYSICAL constant in code units when the params file
     // leaves GravityConstantInternal at 0 or absent, which is GIZMO's documented behaviour
     // ("calculated by code if =0") and what every physical-units test relies on. Defaults match
@@ -512,13 +520,17 @@ int main(int argc, char** argv) {
     // them never pays for it.
     if (sink_formation && sim.length_to_au > 0)
         sim.sink_direct_radius = 1000.0 / sim.length_to_au;
-    // MFM+GALSF contact-wave vsig (hydro_core_meshless.h:253). Off by default pending replicate
-    // validation, NOT because anything is known wrong with it: the two failures seen while
-    // developing it were both this port's own, and both are fixed -- the wakeup compared a
-    // Monaghan pair vsig against a stored contact-wave one, and the accumulator was seeded at
-    // zero instead of the reference's cs_i floor. Since vsig sets the Courant step, flipping the
-    // default needs sedov plus shu1977 replicates, not one passing run.
-    sim.contact_wave_vsig = (getenv("SHMEM_CONTACT_VSIG") != nullptr);
+    // Contact-wave signal velocity, ON wherever the reference applies it: MFM + GALSF
+    // (hydro_core_meshless.h:252-254). This engine is MFM-only, so the config's GALSF decides.
+    //
+    // It costs about 10% more steps: 3753 against 3402 to reach t=0.002 on shu1977, two replicates
+    // each and exactly reproducible. 2*S_M runs somewhat above the Monaghan cs_i+cs_j, so the
+    // Courant step tightens -- but only modestly, not the factor of ~2 the raw dt values at a
+    // couple of sampled points suggest. Count steps from the run's own "done: ... in N steps"
+    // total; the progress lines are a 10-second wall-clock heartbeat, so comparing the last one
+    // between runs of different length compares different fractions of each run.
+    // SHMEM_NO_CONTACT_VSIG forces the Monaghan estimate for A/B work.
+    sim.contact_wave_vsig = galsf && (getenv("SHMEM_NO_CONTACT_VSIG") == nullptr);
     if (sink_formation) {
         // CritPhysDensity is in n_H cm^-3; PhysDensThresh is the same in code density units.
         const double crit_nh = params.count("CritPhysDensity")

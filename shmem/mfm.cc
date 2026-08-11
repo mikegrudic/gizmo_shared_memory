@@ -565,6 +565,12 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     // whatever momentum the gravity kick still injects is the force LAW and the timestep
     // structure, not the walk. Diagnostic: it is O(N_active * N) and only affordable because the
     // active set is small for most of a collapse.
+    // KEEP batch=8 even when that leaves threads idle. Shrinking the batch to buy parallelism on
+    // small steps was tried and is a large net LOSS: measured nact=8 going 2.4 ms -> 16.1 ms at
+    // batch=1. The active particles of a deep bin all sit in the same dense clump, so a batch of 8
+    // opens very nearly the same nodes as a batch of 1 -- batching there saves close to the full
+    // 8x in traversal work, far more than the 1.71x it is worth on an all-active step, and no
+    // amount of extra threads pays that back.
     static const int grav_batch = getenv("SHMEM_GRAV_BATCH")
                                 ? atoi(getenv("SHMEM_GRAV_BATCH")) : 8;   // diagnostic override
     accel_grouped(tree, sim.P, targets, sim.theta, sim.G, grav_batch, ax, ay, az, tidal_out,
