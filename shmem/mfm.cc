@@ -221,8 +221,14 @@ struct ContactState { double speed, pressure; };
                            - density_right * vnorm_right * (wave_right - vnorm_right);
     const double denominator = density_left  * (wave_left  - vnorm_left)
                              - density_right * (wave_right - vnorm_right);
-    const double contact_speed = (std::abs(denominator) > 1e-300)
-                               ? numerator / denominator : 0.5*(vnorm_left + vnorm_right);
+    double contact_speed = (std::abs(denominator) > 1e-300)
+                         ? numerator / denominator : 0.5*(vnorm_left + vnorm_right);
+    // CLAMP into the wave fan, as the reference does (reimann.h:572). The denominator
+    // rho_L(S_L-v_L) - rho_R(S_R-v_R) is bounded away from zero for well-separated states, but not
+    // for near-degenerate ones, and an unclamped ratio then returns a contact speed orders of
+    // magnitude outside the fan -- which is unphysical for the face flux and catastrophic if the
+    // signal velocity is derived from it (measured 1.2e5 against a sound speed of 0.2).
+    contact_speed = std::min(std::max(contact_speed, wave_left), wave_right);
     double contact_pressure = pressure_left
                             + density_left * (wave_left - vnorm_left) * (contact_speed - vnorm_left);
     // vacuum-adjacent guard; the tier-1 tests never reach it
