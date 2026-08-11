@@ -214,6 +214,11 @@ struct Tree {
     std::vector<int>    next;           // next node to visit when this one is NOT opened
     std::vector<int>    plo, phi;       // particle range [plo, phi) for leaves
     std::vector<uint32_t> orderbuf;     // Morton-sorted particle indices; leaf ranges index this
+    // Inverse of orderbuf: rank[i] is where particle i sits in Morton order. Lets a caller put a
+    // SMALL active set into tree order by sorting it (O(k log k)) instead of scanning all N to
+    // filter orderbuf -- that scan is O(N) whatever the active set size, which on a deep timestep
+    // hierarchy is the dominant per-step cost. Built with orderbuf, so the two never disagree.
+    std::vector<uint32_t> rank;
     std::vector<WNode>  wn;             // packed traversal copy, built once after the tree
     int root = 0;
     int nalloc = 0;                     // bump allocator cursor for lock-free node claiming

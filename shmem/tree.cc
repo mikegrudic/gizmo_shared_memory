@@ -311,6 +311,11 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     // Leaf ranges index the Morton-sorted order, so the tree owns it: a leaf's particles are
     // orderbuf[plo..phi), contiguous by construction.
     T.orderbuf.swap(order);
+    // Inverse permutation, so a small active set can be put in tree order by sorting rather than
+    // by scanning all N. One O(N) pass on a build that is already O(N log N).
+    T.rank.resize(n);
+    #pragma omp parallel for schedule(static)
+    for (size_t r = 0; r < n; ++r) T.rank[T.orderbuf[r]] = (uint32_t)r;
 
     if(bt) { bt->links = now_ms()-t_a; } t_a = now_ms();
     // Pack the traversal copy: one 64-byte line per node instead of 9 scattered arrays.

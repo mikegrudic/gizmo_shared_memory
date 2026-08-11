@@ -518,12 +518,28 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     // than pytreegrav's reference walk at the same theta on the same machine. Re-emitting the
     // actives in the tree's own Morton order makes every batch compact for ANY IC ordering, at
     // one O(N) pass -- the same cost class as the active-set scan that runs every sync anyway.
+    // Three ways to produce the same Morton-ordered active list; which is cheapest depends only on
+    // how many are active. The scan is O(N) whatever the answer's size, which on a deep hierarchy
+    // means a step moving 8 particles paid the same 0.92 ms as one moving all 128k -- 28% of a
+    // small step, and it does not parallelise.
     std::vector<uint32_t>& targets = sim.grav_targets;
-    targets.clear();
-    targets.reserve(active.size());
-    for (size_t r = 0; r < n_part; ++r) {
-        const uint32_t i = tree.orderbuf[r];
-        if (sim.is_active(i)) targets.push_back(i);
+    const bool have_rank = tree.rank.size() == n_part;
+    if (active.size() >= n_part) {
+        // everything active: the Morton order IS orderbuf, no filtering needed
+        targets.assign(tree.orderbuf.begin(), tree.orderbuf.end());
+    } else if (have_rank && active.size() < n_part / 8) {
+        // small active set: sort it by tree rank, O(k log k). Only below the crossover -- sorting
+        // the whole set would be O(N log N), strictly worse than the O(N) scan it replaces.
+        targets.assign(active.begin(), active.end());
+        std::sort(targets.begin(), targets.end(),
+                  [&rk = tree.rank](uint32_t a, uint32_t b) { return rk[a] < rk[b]; });
+    } else {
+        targets.clear();
+        targets.reserve(active.size());
+        for (size_t r = 0; r < n_part; ++r) {
+            const uint32_t i = tree.orderbuf[r];
+            if (sim.is_active(i)) targets.push_back(i);
+        }
     }
 
     std::vector<double> ax, ay, az;
