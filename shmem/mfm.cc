@@ -1922,9 +1922,13 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         const double particle_size = std::pow(sim.ninv[i], 1.0 / sim.dim);
         double v_fast = sound_speed(sim, i);
         if (sim.eos_law != Sim::EosLaw::IDEAL && sim.nh_per_code_density > 0) {
-            // opacity-limit relief: without it a run that resolves the first core bogs down and
-            // can never form the sink at all
-            if (rho * sim.nh_per_code_density > 1e13) v_fast = std::min(v_fast, 0.2);
+            // Opacity-limit relief (sfr_eff.cc:241): once an optically-thick first core forms, its
+            // real sound speed rises and the virial criterion never lets a sink form, so the
+            // thermal support is capped at 0.2 km/s above n_H = 1e13. The reference writes that as
+            // 0.2/UNIT_VEL_IN_KMS -- it is 0.2 KM/S, not 0.2 code units, and the two coincide only
+            // because these runs happen to use km/s. A STARFORGE m/s run would cap 1000x too low.
+            if (rho * sim.nh_per_code_density > 1e13 && sim.vel_to_kms > 0)
+                v_fast = std::min(v_fast, 0.2 / sim.vel_to_kms);
         }
         const double k_cs = M_PI * v_fast / std::max(particle_size, 1e-300);
         // Only INFLOW is excused from counting against the virial criterion (sfr_eff.cc:254
