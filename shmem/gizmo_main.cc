@@ -613,12 +613,19 @@ int main(int argc, char** argv) {
     // Every particle type present, in ascending type order -- which is what gives the engine its
     // gas-first index layout (Sim::n_gas). Masses fall back to the header MassTable when a group
     // carries no Masses dataset; InternalEnergy exists for gas only.
+    // MassTable is OPTIONAL. All-zero is the common case anyway ("masses are in the dataset"), and
+    // a minimal writer may omit it entirely -- MakeCloud does, so every STARFORGE cloud IC lacks
+    // it, as does the bate M50 production run's. Opening it unconditionally aborts the read on
+    // those files. Absent means zero, which is the same instruction.
     double ic_mass_table[6] = {0,0,0,0,0,0};
     {
         hid_t header = H5Gopen2(ic_file, "Header", H5P_DEFAULT);
-        hid_t attr = H5Aopen(header, "MassTable", H5P_DEFAULT);
-        H5Aread(attr, H5T_NATIVE_DOUBLE, ic_mass_table);
-        H5Aclose(attr); H5Gclose(header);
+        if (H5Aexists(header, "MassTable") > 0) {
+            hid_t attr = H5Aopen(header, "MassTable", H5P_DEFAULT);
+            H5Aread(attr, H5T_NATIVE_DOUBLE, ic_mass_table);
+            H5Aclose(attr);
+        }
+        H5Gclose(header);
     }
     std::vector<long long>& particle_ids = sim.id;
     std::vector<uint8_t> loaded_types;
