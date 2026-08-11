@@ -494,21 +494,37 @@ static void predict_half(Sim& sim, const std::vector<uint32_t>& active,
 // sourced by ALL of them, so this loop stays global even when the forces do not. Gas softens on
 // its own kernel radius under adaptive_soft (floored by soft_min) or sits at the fixed gas value;
 // collisionless types take their fixed kernel-extent softening from soft_fixed.
-static void update_softenings(Sim& sim) {
+// ACTIVE-SET ONLY once the table is valid. soft[i] is a pure function of h[i] for gas and of the
+// fixed table for everything else, and h only ever changes for ACTIVE gas -- the h solve runs on
+// the active set. So an inactive particle's softening is already correct, and rewriting all of it
+// every step is pure O(N) waste.
+//
+// A FULL pass is still required whenever the layout could have moved under us -- first call, a
+// changed particle count, or a changed gas/non-gas split, which is what sink formation does when it
+// converts a cell and re-sorts the arrays.
+static void update_softenings(Sim& sim, const std::vector<uint32_t>* active = nullptr) {
     const size_t n_part = sim.size();
     sim.P.soft.resize(n_part);
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n_part; ++i) {
+    auto set_one = [&sim](size_t i) {
         if (i < sim.n_gas)
             sim.P.soft[i] = sim.adaptive_soft ? std::max(sim.h[i], sim.soft_min) : sim.soft_min;
         else
             sim.P.soft[i] = sim.soft_fixed[sim.P.type.empty() ? 1 : sim.P.type[i]];
+    };
+    const bool full = !active || sim.soft_valid_n != n_part || sim.soft_valid_ngas != sim.n_gas;
+    if (full) {
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n_part; ++i) set_one(i);
+        sim.soft_valid_n = n_part; sim.soft_valid_ngas = sim.n_gas;
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active->size(); ++k) set_one((*active)[k]);
     }
 }
 
 static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
     const size_t n_part = sim.size();
-    update_softenings(sim);
+    update_softenings(sim, &active);
 
     // BATCH SPATIAL COHERENCE. accel_grouped walks once per batch of 8 targets and opens the
     // UNION of what the batch needs, so a batch only pays off when its 8 targets are spatially
@@ -1102,6 +1118,15 @@ static void rebuild_tree(Sim& sim) {
     sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0,
                      sim.randomize_gravtree ? sim.tree_builds : -1);
     sim.tree.t_since_build = 0.0;
+    // One O(N) pass per REBUILD (not per step), dwarfed by the O(N log N) build it follows.
+    {
+        const size_t ng = std::min(sim.n_gas, sim.h.size());
+        double sum_h = 0.0; size_t cnt = 0;
+        #pragma omp parallel for schedule(static) reduction(+:sum_h,cnt)
+        for (size_t i = 0; i < ng; ++i) if (sim.h[i] > 0) { sum_h += sim.h[i]; ++cnt; }
+        if (cnt > 0) sim.tree_typical_h = sum_h / (double)cnt;
+        else if (!sim.P.soft.empty()) sim.tree_typical_h = sim.P.soft[0];
+    }
     // vcom was just built from these velocities and the node dp accumulators are zero, so this
     // is the baseline every later kick is measured against.
     if (sim.hermite_mask != 0) {
@@ -2684,12 +2709,12 @@ double mfm_step(Sim& sim, double dt_max) {
     // neighbour prune conservative in the meantime, which is what makes reuse exact rather than
     // approximate. Rebuild once the accumulated drift is a noticeable fraction of a typical h,
     // because past that the padded prune starts opening nodes it does not need.
-    double typical_h = 0.0;
-    if (!sim.h.empty()) {
-        // cheap stand-in for the median: h of one active particle, which tracks the resolution of
-        // the region actually doing work
+    // Scale for "has drift degraded this tree": the mean h over ALL gas, recorded when the tree was
+    // built. Taking it from one ACTIVE particle instead ties the threshold to whoever is awake, and
+    // on a deep-bin step that is a core cell whose h is orders of magnitude below the box.
+    double typical_h = sim.tree_typical_h;
+    if (typical_h <= 0.0 && !sim.h.empty())
         typical_h = sim.h[active.empty() ? 0 : active[0]];
-    }
     // collisionless particles have no kernel radius; their softening is the resolution scale the
     // rebuild pad should track instead
     if (typical_h <= 0.0 && !sim.P.soft.empty())

@@ -343,6 +343,14 @@ struct Sim {
     // are decorrelated between steps rather than repeating. A fixed grid's errors are the same
     // every step and integrate into a secular drift; redrawn ones average out.
     bool      randomize_gravtree = false;
+    // Representative h of the WHOLE distribution as of the last tree build. The rebuild trigger
+    // asks "has drift degraded THIS tree", which is a property of every particle the tree covers --
+    // not of whichever few are active.
+    double    tree_typical_h = 0.0;
+    // Guards the active-set-only softening update: a full sweep is redone whenever either changes,
+    // which is how sink formation (which reorders the arrays) forces one.
+    size_t    soft_valid_n = (size_t)-1;
+    size_t    soft_valid_ngas = (size_t)-1;
 
     // scratch reused across steps, so a sync does not allocate and zero several N-sized arrays
     std::vector<double> dt_of, dmom_x, dmom_y, dmom_z, denergy;
