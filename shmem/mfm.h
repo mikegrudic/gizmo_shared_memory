@@ -408,6 +408,9 @@ void compute_initial_state(Sim& sim);
 // v_grav = sqrt(|W|/M), and a cold start falls back to v_rms(0) ~ 0, which inflates the reported
 // drift by orders of magnitude even when momentum is conserved to 1e-5.
 void compute_potential(Sim& sim);
+// SHMEM_ENERGY_LOG: total energy with the pending half kick undone, so KE and PE are at
+// the same instant. Snapshot energies are NOT usable for this -- see the definition.
+void energy_log_step(Sim& sim, double t);
 
 // Bring every particle's position current at the engine clock. The step drifts only the active set
 // and catches the rest up on touch, so anything that reads positions in BULK -- writing a snapshot,

@@ -1338,6 +1338,34 @@ static Vec3d audit_total_p(const Sim& sim) {
     }
     return Vec3d{px, py, pz};
 }
+// SHMEM_ENERGY_LOG: total energy at a SYNCHRONISED state.
+//
+// A snapshot cannot be used for this. write_snapshot_at back-drifts POSITIONS to the requested
+// output time, but the stored velocity is half-kicked into the NEXT step (pending_half_kick), so a
+// snapshot pairs x(t) with v(t + dt/2) and its energy carries an O(dt * a * v) error. On the
+// e=0.9 binary that artifact is ~5e-4 relative -- larger than the integration error it was being
+// used to measure, and it scales with dt, so it masquerades as an error floor when two schemes are
+// compared at different step sizes.
+//
+// Undoing the owed half kick exactly as audit_total_p does puts KE and PE at the same instant.
+void energy_log_step(Sim& sim, double t) {
+    static const bool on = getenv("SHMEM_ENERGY_LOG") != nullptr;
+    if (!on) return;
+    const size_t n = sim.size();
+    const bool have = sim.pending_half_kick.size() == n && sim.a_grav.size() == n;
+    compute_potential(sim);
+    double ke = 0, pe = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double owed = have ? sim.pending_half_kick[i] : 0.0;
+        const double ux = sim.vx[i] - (have ? sim.a_grav[i][0] * owed : 0.0);
+        const double uy = sim.vy[i] - (have ? sim.a_grav[i][1] * owed : 0.0);
+        const double uz = sim.vz[i] - (have ? sim.a_grav[i][2] * owed : 0.0);
+        ke += 0.5 * sim.P.m[i] * (ux*ux + uy*uy + uz*uz);
+        pe += 0.5 * sim.P.m[i] * sim.phi[i];   // 0.5 so each pair is counted once
+    }
+    fprintf(stderr, "[energy] t=%.12g KE=%.17g PE=%.17g E=%.17g\n", t, ke, pe, ke + pe);
+}
+
 static void audit_step(const Sim& sim, Vec3d& prev, const char* what) {
     static const bool on = getenv("SHMEM_MOMAUDIT") != nullptr;
     if (!on) return;
@@ -1842,6 +1870,64 @@ void hermite_report() {
                 100.0 * (double)hermite_h_mismatch / (double)tot, hermite_h_mismatch_max);
 }
 
+
+// GIZMO's HermiteOnlyFlag=1 pass plus the mode==0 snapshot, together (run.cc:150-153,
+// kicks.cc:369-372). Runs BEFORE the kick, so the velocity here is v(t_start): the reference
+// applies its two half kicks separately, while we fuse them and defer one, so the owed half kick
+// is added back to recover v0.
+//
+// Saves the four "Old" quantities the corrector needs -- OldPos, OldVel, Hermite_OldAcc, OldJerk --
+// as ONE consistent snapshot of the start-of-step state, then the KDK step proceeds provisionally
+// over it, exactly as the methods paper describes ("saving the initial state of the timestep").
+static void hermite_snapshot(Sim& sim, const std::vector<uint32_t>& active,
+                             const std::vector<double>& dt_of) {
+    if (sim.hermite_mask == 0 || sim.P.type.empty()) return;
+    const size_t n_part = sim.size();
+    if (sim.herm_valid.size() != n_part) {
+        sim.herm_valid.assign(n_part, 0);
+        sim.herm_tick.assign(n_part, 0);
+        sim.herm_pos.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_vel.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_acc.assign(n_part, Vec3d{0, 0, 0});
+        sim.herm_jerk.assign(n_part, Vec3d{0, 0, 0});
+    }
+    if (sim.pending_half_kick.size() != n_part || sim.a_grav.size() != n_part) return;
+
+    std::vector<uint32_t> tg;
+    for (size_t k = 0; k < active.size(); ++k) {
+        const uint32_t i = active[k];
+        if (i >= sim.n_gas && hermite_eligible(sim, i, dt_of[i])) tg.push_back(i);
+    }
+    if (tg.empty()) return;
+
+    // v0 = stored + the owed half kick. Write it in so the walk's JERK is evaluated at v0 -- the
+    // jerk depends on velocity, the acceleration does not, and this is the whole reason the pass
+    // has to exist rather than reusing the step's main walk.
+    std::vector<Vec3d> saved(tg.size());
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < tg.size(); ++k) {
+        const uint32_t i = tg[k];
+        saved[k] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]};
+        const double owed = sim.pending_half_kick[i];
+        sim.vx[i] = saved[k][0] + sim.a_grav[i][0] * owed;
+        sim.vy[i] = saved[k][1] + sim.a_grav[i][1] * owed;
+        sim.vz[i] = saved[k][2] + sim.a_grav[i][2] * owed;
+    }
+    std::vector<double> ax, ay, az; std::vector<Vec3d> jk;
+    hermite_eval_group(sim, tg, ax, ay, az, jk);
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < tg.size(); ++k) {
+        const uint32_t i = tg[k];
+        sim.herm_pos[i]  = sim.P.pos(i);
+        sim.herm_vel[i]  = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]};   // v0
+        sim.herm_acc[i]  = Vec3d{ax[k], ay[k], az[k]};
+        sim.herm_jerk[i] = jk[k];
+        sim.herm_tick[i] = sim.clock_ticks;
+        sim.herm_valid[i] = 1;
+        sim.vx[i] = saved[k][0]; sim.vy[i] = saved[k][1]; sim.vz[i] = saved[k][2];
+    }
+}
+
 static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
                          const std::vector<double>& dt_of) {
     if (sim.hermite_mask == 0 || sim.P.type.empty()) return;
@@ -1877,8 +1963,10 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
     for (size_t k = 0; k < nt; ++k) {
         const uint32_t i = targets[k];
         const double dt_new = dt_of[i];
-        const Vec3d half_kick = sim.a_grav[i] * (0.5 * dt_new);
-        vel_true[k] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]} - half_kick;
+        // Runs AFTER the drift, as the reference does (run.cc:237 is past
+        // find_next_sync_point_and_drift at :156). x0/v0/a0/j0 come from hermite_snapshot, taken
+        // before the kick, so there is no half kick to undo here.
+        vel_true[k] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]};
         eligible[k] = hermite_eligible(sim, i, dt_new) ? 1 : 0;
         // The interval is what the CLOCK says elapsed since the snapshot, never a stored dt.
         const double h_elapsed = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
@@ -1900,7 +1988,13 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
         }
         if (sim.herm_valid[i] && eligible[k] && h_elapsed > 0) {
             stepping[k] = 1;
-            const double h = h_elapsed;
+            // THE STEP'S OWN dt, not a Hermite-specific elapsed time. The reference keeps no
+            // separate Hermite timeline: find_timesteps picks dt once at the top of the step and
+            // both the KDK kick and the Hermite predictor/corrector use that same value.
+            // Deriving h from a stored herm_tick makes it the PREVIOUS interval, since the clock
+            // does not advance until the end of mfm_step -- equal on a power-of-two ladder except
+            // when a particle CHANGES BIN, which on an eccentric orbit happens at periapsis.
+            const double h = dt_of[i];
             const Vec3d x0 = sim.herm_pos[i], v0 = sim.herm_vel[i];
             const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
             // predictor (kicks.cc:147-148)
@@ -1929,7 +2023,7 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
         for (size_t k = 0; k < nt; ++k) {
             if (!stepping[k]) continue;
             const uint32_t i = targets[k];
-            const double h = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
+            const double h = dt_of[i];   // same dt the predictor used, and the kick
             const Vec3d v0 = sim.herm_vel[i], x0 = sim.herm_pos[i];
             const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
             const Vec3d a1{ax[s], ay[s], az[s]}, j1 = jk[s];
@@ -1941,32 +2035,29 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
             sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
         }
     }
-    // Phase D: one more walk, at the settled mutually-consistent states, to open the next
-    // interval -- the reference's start-of-next-step walk (run.cc:94).
-    std::vector<uint32_t> eligible_targets;
-    for (size_t k = 0; k < nt; ++k) if (eligible[k]) eligible_targets.push_back(targets[k]);
-    if (!eligible_targets.empty()) {
-        hermite_eval_group(sim, eligible_targets, ax, ay, az, jk);
-        size_t s = 0;
-        for (size_t k = 0; k < nt; ++k) {
-            const uint32_t i = targets[k];
-            if (!eligible[k]) { sim.herm_valid[i] = 0; continue; }
-            sim.herm_pos[i] = sim.P.pos(i);  sim.herm_vel[i] = vel_true[k];
-            sim.herm_acc[i] = Vec3d{ax[s], ay[s], az[s]};
-            sim.herm_jerk[i] = jk[s];
-            ++s;
-            sim.herm_tick[i] = sim.clock_ticks;  sim.herm_valid[i] = 1;
-        }
-    } else {
-        for (size_t k = 0; k < nt; ++k) sim.herm_valid[targets[k]] = 0;
-    }
+    // NO Phase D walk. The snapshot for the next interval is taken by hermite_snapshot at the
+    // START of that step -- the reference's HermiteOnlyFlag=1 pass -- which is after the drift
+    // has moved everything else, so a0/j0 see the configuration the interval actually begins in.
+    for (size_t k = 0; k < nt; ++k) if (!eligible[k]) sim.herm_valid[targets[k]] = 0;
+
     // Phase E: hand the leapfrog state back (pending_half_kick is already 0.5*dt_new): stored
     // velocity is half-kicked into the next step, for the drift prediction and any KDK fallback.
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < nt; ++k) {
         const uint32_t i = targets[k];
-        const Vec3d vel_store = vel_true[k] + sim.a_grav[i] * (0.5 * dt_of[i]);
-        sim.vx[i] = vel_store[0]; sim.vy[i] = vel_store[1]; sim.vz[i] = vel_store[2];
+        if (!stepping[k]) continue;
+        // The corrector already produced the END-of-step velocity, so nothing is owed: zero the
+        // pending half kick rather than adding one that the next step would apply again with a
+        // different acceleration. Leaving it doubled measured a uniform 1.57x in the energy error.
+        sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
+        sim.pending_half_kick[i] = 0.0;
+        // SHMEM_HERMITE_NOPENDING: probe for a double-applied deferred half kick. Phase E adds
+        // a_N*0.5*dt_N explicitly, and pending_half_kick makes the NEXT step's kick loop add it
+        // again with a_{N+1}; Phase A then removes only 0.5*dt_{N+1}*a_{N+1}, leaving
+        // 0.5*dt_N*(a_N + a_{N+1}) on v0. Zeroing the pending for a sink that actually took a
+        // Hermite step removes one of the two.
+        static const bool no_pending = getenv("SHMEM_HERMITE_NOPENDING") != nullptr;
+        if (no_pending && stepping[k]) sim.pending_half_kick[i] = 0.0;
     }
 }
 
@@ -3101,6 +3192,8 @@ double mfm_step(Sim& sim, double dt_max) {
     static const bool swallow_at_sync = getenv("SHMEM_SWALLOW_AT_SYNC") != nullptr;
     if (sim.gravity_on) {
         sim.pending_half_kick.resize(n_part, 0.0);
+        // Start-of-step snapshot + the Hermite-only gravity pass, BEFORE the kick (run.cc:150-153).
+        hermite_snapshot(sim, active, dt_of);
         // Split the kick's own momentum injection by type. sum_active m a dt is not zero for a
         // SUBSET of particles even in an exactly antisymmetric force field -- the rest collect
         // their share later -- so this is bookkeeping, not error, but its SIZE says which
@@ -3149,9 +3242,8 @@ double mfm_step(Sim& sim, double dt_max) {
         // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
         // scale and adds no jump across a face).
 
-        // Hermite overwrite for eligible sinks, on top of the kicks just applied -- the same
-        // ordering as GIZMO's run loop (kicks, then prediction/correction, run.cc:167-177).
-        hermite_pass(sim, active, dt_of);
+        // The Hermite predict/correct has MOVED to after the drift, where the reference does it
+        // (run.cc:237-241, past find_next_sync_point_and_drift at :156).
         probe("hermite");
     probeL("hermite");
         probeL("hermite");
@@ -3289,6 +3381,11 @@ double mfm_step(Sim& sim, double dt_max) {
             drift_particle_to(sim, active[k], drift_target);
     } else {
         drift_all_to(sim, drift_target);
+    }
+    {
+        // HERMITE PREDICT / EVALUATE / CORRECT, after the drift -- run.cc:237-241. The corrector's
+        // output is the FINAL end-of-step state; nothing moves these particles afterwards.
+        hermite_pass(sim, active, dt_of);
     }
     // Feed this step's velocity changes into the per-node bound -- GIZMO's force_kick_node
     // (forcetree_update.cc:78), climbing the parent chain with a max. Only ACTIVE particles can

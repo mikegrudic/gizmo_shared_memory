@@ -756,6 +756,7 @@ int main(int argc, char** argv) {
             // hierarchy evolves as the run proceeds.
             if (sim.individual_timesteps) print_timebins(sim, dt_taken, time);
         }
+        energy_log_step(sim, time);   // SHMEM_ENERGY_LOG; no-op unless the env var is set
         // OUTPUT. A step may now overshoot -- or leap clean over -- one or more output times,
         // so this is a loop, and each snapshot is written at its OWN requested time by drifting
         // positions there rather than at wherever the step happened to land. Velocities are
