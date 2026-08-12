@@ -266,6 +266,24 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     // SHMEM_NGB_DIAG: how many tree traversals the h solve costs per target. Each Newton
     // iteration is a full traversal, so this is the multiplier on the density phase and it
     // decides whether grouping the solve is worth more than grouping the single-pass consumers.
+    if (getenv("SHMEM_NGB_COUNT") && !active.empty()) {
+        // Candidates EXAMINED against neighbours KEPT. The kept count should be ~DesNumNgb per
+        // traversal; a large ratio means the search is opening nodes that hold nothing it wants,
+        // which is a prune problem (the per-node vmax pad, or tree quality) rather than a cost
+        // inherent to clustering.
+        long long calls, nodes, examined, kept, pad_nodes;
+        ngb_counters(calls, nodes, examined, kept, pad_nodes, /*reset=*/true);
+        static int shown_c = 0;
+        if (calls > 0 && shown_c < 6) {
+            ++shown_c;
+            fprintf(stderr, "[ngb-count] nact=%zu  calls=%lld  nodes/call=%.1f  examined/call=%.1f"
+                            "  kept/call=%.1f  examined/kept=%.1f  pad-only nodes=%.1f/call "
+                            "(%.1f%% of visits)\n",
+                    active.size(), calls, (double)nodes/calls, (double)examined/calls,
+                    (double)kept/calls, kept ? (double)examined/kept : 0.0,
+                    (double)pad_nodes/calls, nodes ? 100.0*pad_nodes/nodes : 0.0);
+        }
+    }
     if (getenv("SHMEM_NGB_DIAG") && !active.empty()) {
         long long sum = 0; int worst = 0;
         std::vector<int> hist(8, 0);

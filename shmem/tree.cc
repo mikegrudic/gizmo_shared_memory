@@ -214,6 +214,9 @@ int build_node(Tree& T, const Particles& P, const std::vector<uint32_t>& order,
     }
     double dx = sx - cxi, dy = sy - cyi, dz = sz_ - czi;
     T.delta[me] = std::sqrt(dx*dx + dy*dy + dz*dz);
+    // The GEOMETRIC centre, kept for the neighbour search's box test (see SNode). Free here --
+    // it is what this node was constructed around.
+    if (!T.gcx.empty()) { T.gcx[me] = cxi; T.gcy[me] = cyi; T.gcz[me] = czi; }
     return me;
 }
 
@@ -348,6 +351,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     for (;;) {
         T.cx.assign(cap, 0.0); T.cy.assign(cap, 0.0); T.cz.assign(cap, 0.0);
         T.mass.assign(cap, 0.0); T.size.assign(cap, 0.0); T.delta.assign(cap, 0.0);
+        T.gcx.assign(cap, 0.0); T.gcy.assign(cap, 0.0); T.gcz.assign(cap, 0.0);
         T.soft.assign(cap, 0.0);
         T.first.assign(cap, -1); T.next.assign(cap, -1);
         T.plo.assign(cap, 0); T.phi.assign(cap, 0);
@@ -370,6 +374,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         size_t nn = (size_t)T.nalloc;
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
+        T.gcx.resize(nn); T.gcy.resize(nn); T.gcz.resize(nn);
         T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
         if (!T.nsink.empty()) T.nsink.resize(nn);
         if (!T.vcom_x.empty()) {
@@ -389,7 +394,24 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     for (size_t r = 0; r < n; ++r) T.rank[T.orderbuf[r]] = (uint32_t)r;
 
     if(bt) { bt->links = now_ms()-t_a; } t_a = now_ms();
-    // Pack the traversal copy: one 64-byte line per node instead of 9 scattered arrays.
+    // Pack the traversal copies. WNode (64 B) serves the gravity walk; SNode (32 B) serves the
+    // neighbour search, which needs the node's box rather than its centre of mass.
+    //
+    // SAFETY EPSILON on the search node's half-side. Its centre is float, so |centre - target| can
+    // be off by ~2 ulp of the box extent; inflating `half` by 1e-6 of the root size covers that by
+    // orders of magnitude while costing ~0.05% in prune radius at h ~ 1e-3. The prune must only
+    // ever err towards opening -- rejecting a node that holds a true neighbour is a silent wrong
+    // answer, not a slow one.
+    const double snode_eps = 1e-6 * (T.nnodes() ? T.size[T.root] : 1.0);
+    T.sn.resize(T.nnodes());
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < T.nnodes(); ++i) {
+        SNode& sq = T.sn[i];
+        sq.cx = (float)T.gcx[i]; sq.cy = (float)T.gcy[i]; sq.cz = (float)T.gcz[i];
+        sq.half  = (float)(0.5 * T.size[i] + snode_eps);
+        sq.first = T.first[i]; sq.next = T.next[i];
+        sq.plo = T.plo[i]; sq.phi = T.phi[i];
+    }
     T.wn.resize(T.nnodes());
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < T.nnodes(); ++i) {
@@ -645,8 +667,16 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             // Newtonian on both softenings, so the gas-gas kernel average degenerates to the
             // single evaluation the multipole applies, and the zeta corrections (r < h only) are
             // identically zero. Accepting a leaf therefore drops nothing that was contributing.
+            // SHMEM_NO_LEAF_ACCEPT restores the pre-0f0ae23d behaviour: leaves are always opened
+            // and direct-summed rather than being offered to the criterion. Diagnostic only --
+            // it is here to attribute the plummer_binaries Lagrange drift, since that change was
+            // measured at +17% median force error and nothing protects a pc-scale collisional
+            // N-body test from it (SINGLE_STAR_DIRECT_GRAVITY_RADIUS is 1000 AU = 0.005 pc, three
+            // orders below this system's r_10).
+            static const bool no_leaf_accept = (getenv("SHMEM_NO_LEAF_ACCEPT") != nullptr);
             bool accept = !open_node(rmin2, w.len, w.s, w.mass, w.soft, emax, aold_min,
                                      theta2, dx, dy, dz);
+            if (no_leaf_accept && w.first < 0) accept = false;
             // SINK-SINK DIRECT SUMMATION (forcetree.cc:1975). A sink looking at a node that holds
             // sinks within sink_direct_radius opens it, so star-star pairs are always summed
             // exactly. Applied after the general criterion because it only ever ADDS opening.

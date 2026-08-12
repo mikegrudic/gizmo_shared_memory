@@ -203,12 +203,35 @@ struct alignas(64) WNode {
     int    plo, phi;     //  8  leaf particle range
 };                       // = 64 bytes exactly (the len field fills what used to be padding)
 
+// The NEIGHBOUR SEARCH's own node, 32 bytes -- half of WNode, and it holds different geometry.
+//
+// The search wants the node's BOX (geometric centre, half side), which is what GIZMO prunes
+// against (system/ngb_codeblock_checknode.h). The gravity walk wants the CENTRE OF MASS, because
+// that is where the multipole sits. Sharing one node forced the search to test a sphere centred on
+// the COM with radius size+delta, which admits ~2x the volume the reference's box test does
+// (bench_nodegeom on the 3.5e6-cell state: 1.54x from using the full side where the circumsphere
+// is 0.866*len, another ~1.3x from delta). Splitting them fixes the geometry and halves the bytes
+// touched per visit -- and the traversal is 75% of the density solve, at ~12 ns per node visit
+// against an 80 MB node array, so the bytes matter as much as the count.
+//
+// Positions are float. The box is O(1) and h is O(1e-3), so a float centre is accurate to ~2e-7
+// absolute; `half` carries a conservative epsilon (see the pack loop) that swamps it by an order of
+// magnitude, keeping the prune strictly one-sided. It can never drop a true neighbour.
+struct SNode {
+    float cx, cy, cz;    // 12  GEOMETRIC centre of the node, NOT the centre of mass
+    float half;          //  4  half the side length, plus the float-safety epsilon
+    int   first;         //  4  first child, or -1 for a leaf
+    int   next;          //  4  where to go when the node is rejected
+    int   plo, phi;      //  8  leaf particle range
+};                       // = 32 bytes
+
 struct Tree {
     // node arrays, indexed by node id; leaves store a particle range instead of children
     std::vector<double> cx, cy, cz;     // centre of mass
     std::vector<double> mass;           // total mass
     std::vector<double> size;           // side length
     std::vector<double> delta;          // |COM - geometric centre|, for the opening criterion
+    std::vector<double> gcx, gcy, gcz;  // geometric centre; build-time only, packed into sn
     std::vector<double> soft;           // max softening in the node
     std::vector<int>    first;          // first child node, or -1 for a leaf
     std::vector<int>    next;           // next node to visit when this one is NOT opened
@@ -220,6 +243,7 @@ struct Tree {
     // hierarchy is the dominant per-step cost. Built with orderbuf, so the two never disagree.
     std::vector<uint32_t> rank;
     std::vector<WNode>  wn;             // packed traversal copy, built once after the tree
+    std::vector<SNode>  sn;             // packed neighbour-search copy; see SNode
     int root = 0;
     int nalloc = 0;                     // bump allocator cursor for lock-free node claiming
 

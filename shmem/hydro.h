@@ -66,6 +66,10 @@ static inline double kernel_dwdh(double r, double h, int dim = 3) {   // dW/dh a
 // Prune: every particle in a node lies within (node.s) of the node COM by construction of
 // s = size + delta, plus vmax * t_since_build for motion since the tree was built, so a node can be
 // skipped when dist(COM, centre) > radius + tree.open_radius(node).
+// SHMEM_NGB_COUNT diagnostic totals; see the definition in hydro.cc.
+void ngb_counters(long long& calls, long long& nodes, long long& examined, long long& kept,
+                  long long& pad_nodes, bool reset);
+
 void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centre,
                 double radius, std::vector<uint32_t>& found, double box = 0.0,
                 const LazyDrift* lazy = nullptr);

@@ -1,29 +1,77 @@
 #include "hydro.h"
 #include <omp.h>
+#include <atomic>
 
 namespace shmem {
+
+// SHMEM_NGB_COUNT: nodes visited and particles EXAMINED per target, against the ~DesNumNgb
+// actually kept. The neighbour analogue of SHMEM_COUNT_WALK, and here for the same reason: a
+// traversal that examines hundreds of candidates to keep 32 is doing the wrong work, and no
+// per-phase timer can tell you that. Accumulated locally and flushed with one atomic per call, so
+// a counting run is still fast enough to be worth running.
+std::atomic<long long> g_ngb_nodes{0}, g_ngb_examined{0}, g_ngb_kept{0}, g_ngb_calls{0};
+// Nodes visited ONLY because of the per-node vmax*elapsed pad. Measured 0.0% of visits on the
+// M50 state at every step type, so a stale tree is NOT what the search is paying for -- kept
+// because that is a property of the problem's velocities, not a guarantee.
+std::atomic<long long> g_ngb_pad_nodes{0};
+static bool ngb_counting() {
+    static const bool v = (getenv("SHMEM_NGB_COUNT") != nullptr);
+    return v;
+}
+void ngb_counters(long long& calls, long long& nodes, long long& examined, long long& kept,
+                  long long& pad_nodes, bool reset) {
+    calls = g_ngb_calls.load(); nodes = g_ngb_nodes.load();
+    examined = g_ngb_examined.load(); kept = g_ngb_kept.load();
+    pad_nodes = g_ngb_pad_nodes.load();
+    if (reset) { g_ngb_calls = 0; g_ngb_nodes = 0; g_ngb_examined = 0; g_ngb_kept = 0;
+                 g_ngb_pad_nodes = 0; }
+}
 
 void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centre,
                 double radius, std::vector<uint32_t>& found, double box,
                 const LazyDrift* lazy) {
-    const WNode* __restrict nodes = tree.wn.data();
+    // Prunes against the node's BOX, as the reference does (system/ngb_codeblock_checknode.h):
+    // three per-axis comparisons with early exit, then the circumsphere test only for survivors.
+    // Was a single sphere centred on the node's CENTRE OF MASS with radius size+delta, which admits
+    // ~2x the volume (bench_nodegeom) and computes a full 3D norm for every node visited. The
+    // traversal is 75% of the density solve at ~12 ns per node visit, so both the count and the
+    // bytes per visit are worth this.
+    const SNode* __restrict nodes = tree.sn.data();
     const float* __restrict node_vmax = tree.vmax.data();
     const double elapsed = tree.t_since_build;
     const double radius_sq = radius * radius;
+    const bool counting = ngb_counting();
+    long long c_nodes = 0, c_examined = 0;
+    long long c_pad = 0;   // nodes admitted only by the staleness pad; see below
+    const size_t found0 = found.size();
     int node_id = tree.root;
     while (node_id >= 0) {
-        const WNode& node = nodes[node_id];
-        const Vec3d to_com = min_image(Vec3d{node.cx, node.cy, node.cz} - centre, box);
-        // Conservative: every particle in the node lies within node.s of the node's centre of mass
-        // as it was AT BUILD TIME, and none can have moved further than this node's own vmax in the
-        // time since. Per node rather than a single global pad -- one fast particle must not
-        // inflate the prune for the whole box (see Tree::vmax).
-        const double keep_within = radius + node.s + (double)node_vmax[node_id] * elapsed;
-        if (to_com.norm_sq() > keep_within * keep_within) { node_id = node.next; continue; }
+        const SNode& node = nodes[node_id];
+        if (counting) ++c_nodes;
+        // Half the side, plus this node's own vmax bound on how far its particles can have moved
+        // since the build. Per node rather than a global pad -- one fast particle must not inflate
+        // the prune for the whole box (see Tree::vmax). Skipped entirely on a fresh tree.
+        double dist = radius + (double)node.half;
+        if (elapsed > 0) dist += (double)node_vmax[node_id] * elapsed;
+        const double dx = min_image((double)node.cx - centre[0], box);
+        if (dx > dist || -dx > dist) { node_id = node.next; continue; }
+        const double dy = min_image((double)node.cy - centre[1], box);
+        if (dy > dist || -dy > dist) { node_id = node.next; continue; }
+        const double dz = min_image((double)node.cz - centre[2], box);
+        if (dz > dist || -dz > dist) { node_id = node.next; continue; }
+        // Only now the sphere: the box's circumsphere is sqrt(3)/2 * len = 1.732 * half, i.e.
+        // dist + (sqrt(3)-1) * half on top of the per-axis bound (CUBE_EDGEFACTOR_1 * len).
+        dist += 0.7320508075688772 * (double)node.half;
+        if (dx*dx + dy*dy + dz*dz > dist*dist) { node_id = node.next; continue; }
+        if (counting && elapsed > 0) {
+            const double nopad = radius + 1.7320508075688772 * (double)node.half;
+            if (dx*dx + dy*dy + dz*dz > nopad * nopad) ++c_pad;
+        }
         if (node.first < 0) {
             // Two spellings of the same loop so the common (nothing stale) path keeps exactly the
             // instructions it had before lazy drift existed.
             if (lazy) {
+                if (counting) c_examined += node.phi - node.plo;
                 for (int slot = node.plo; slot < node.phi; ++slot) {
                     const uint32_t j = tree.orderbuf[slot];
                     // catch up BEFORE the distance test, as GIZMO does: testing a stale position
@@ -33,6 +81,7 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
                         found.push_back(j);
                 }
             } else {
+                if (counting) c_examined += node.phi - node.plo;
                 for (int slot = node.plo; slot < node.phi; ++slot) {
                     const uint32_t j = tree.orderbuf[slot];
                     if (min_image(particles.pos(j) - centre, box).norm_sq() < radius_sq)
@@ -43,6 +92,10 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
         } else {
             node_id = node.first;
         }
+    }
+    if (counting) {
+        g_ngb_calls += 1; g_ngb_nodes += c_nodes; g_ngb_examined += c_examined;
+        g_ngb_kept += (long long)(found.size() - found0); g_ngb_pad_nodes += c_pad;
     }
 }
 
