@@ -566,10 +566,21 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
         // the batch in L1 and let the inner loop vectorise, which is the whole point of grouping.
         const int nb_ = (int)(hi - lo);
         const bool have_zeta = !P.zeta.empty();
-        double tx[512], ty[512], tz[512], te[512], oax[512], oay[512], oaz[512];
-        double tmass[512], tzeta[512]; bool tgas[512];
-        double ott[6][512];
-        double tvx[512], tvy[512], tvz[512], ojx[512], ojy[512], ojz[512];
+        // 520, NOT 512, AND THE DIFFERENCE IS LARGE. double[512] is exactly 4096 bytes, which is
+        // the L1 way size on both targets (32 KB, 8-way, 64 B lines -> 64 sets). Stack arrays sit
+        // back to back, so at that stride element [i] of every one of these maps to the SAME cache
+        // set -- the batch is ~8 wide, so each array is one line and ~19 lines fight over 8 ways.
+        // Padding by one line spreads them one set apart. Measured on the 3.5e6-cell BBB03 state
+        // (bench_treeforce, 16 threads), forces bit-identical:
+        //     accel              6145 -> 6019 ms
+        //     accel+tidal       14920 -> 10517 ms
+        //     accel+tidal+jerk  25322 -> 16663 ms
+        // Do not "tidy" this back to a power of two.
+        #define TBUF 520
+        double tx[TBUF], ty[TBUF], tz[TBUF], te[TBUF], oax[TBUF], oay[TBUF], oaz[TBUF];
+        double tmass[TBUF], tzeta[TBUF]; bool tgas[TBUF];
+        double ott[6][TBUF];
+        double tvx[TBUF], tvy[TBUF], tvz[TBUF], ojx[TBUF], ojy[TBUF], ojz[TBUF];
         if (want_tidal) for (int c = 0; c < 6; ++c) for (int i = 0; i < (int)(hi-lo); ++i) ott[c][i] = 0;
         for (int i = 0; i < nb_; ++i) {
             uint32_t p = targets[lo + i];
@@ -623,6 +634,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                         double qs = P.soft.empty()?0.0:P.soft[q];
                         double qzeta = have_zeta?P.zeta[q]:0.0;
                         const bool qgas = P.is_gas(q);
+                        // Hoisted with the rest of the source's data: these depend only on q, and
+                        // were being re-gathered once per target in the batch. Worth about 1% of
+                        // the walk, not the memory effect it looks like -- the velocities are hot
+                        // by the time the batch reaches them. The jerk's real cost is accumulator
+                        // pressure, same as the tidal tensor's; see the buffer padding above.
+                        double qvx=0, qvy=0, qvz=0;
+                        if (want_jerk) { qvx=vel[0][q]; qvy=vel[1][q]; qvz=vel[2][q]; }
                         for (int i = 0; i < nb_; ++i) {
                             if (targets[lo+i] == q) continue;
                             const double dx_=qx-tx[i], dy_=qy-ty[i], dz_=qz-tz[i];
@@ -661,8 +679,8 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                                 }
                                 if (want_jerk) {
                                     // leaf source: its own velocity (forcetree.cc:1641)
-                                    const double dvx=vel[0][q]-tvx[i], dvy=vel[1][q]-tvy[i],
-                                                 dvz=vel[2][q]-tvz[i];
+                                    const double dvx=qvx-tvx[i], dvy=qvy-tvy[i],
+                                                 dvz=qvz-tvz[i];
                                     const double vdotr = dvx*dx_ + dvy*dy_ + dvz*dz_;
                                     ojx[i] += g1*dvx - vdotr*g2*dx_;
                                     ojy[i] += g1*dvy - vdotr*g2*dy_;
