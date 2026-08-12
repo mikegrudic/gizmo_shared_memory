@@ -527,7 +527,32 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
     if (want_tidal) tidal->assign(nt, SymTensor3d{0,0,0,0,0,0});
     if (jerk) jerk->assign(nt, Vec3d{0,0,0});
     const double theta2 = theta * theta;
-    const int nb = (int)((nt + batch - 1) / batch);
+    // NODE-ALIGNED GROUPING (batch <= 0) instead of fixed-size windows. Fixed windows chunk the
+    // Morton-sorted target list blindly, so a window can straddle a high-level Morton boundary and
+    // get a bounding box far larger than any member needs -- every member then pays for the
+    // over-opening. That is rare when everything is active and near-universal when the active set
+    // is sparse, since consecutive ACTIVE targets are then far apart in Morton order.
+    //
+    // Grouping on the leaf instead bounds a group's extent by the leaf's extent, by construction.
+    // It also self-adapts: a dense active set fills leaves and gives groups of ~LEAF_MAX, a sparse
+    // one leaves a handful per leaf and gives small groups, with no threshold to tune.
+    //
+    // Targets are in Morton order and a leaf owns a contiguous orderbuf range, so a leaf's active
+    // targets are already contiguous here -- the grouping is one linear scan, no sort.
+    std::vector<size_t> gstart;
+    const bool node_grouped = (batch <= 0) && !T.leaf_of.empty();
+    if (node_grouped) {
+        gstart.reserve(nt / 4 + 2);
+        gstart.push_back(0);
+        for (size_t i = 1; i < nt; ++i) {
+            const int li = T.leaf_of[targets[i]], lp = T.leaf_of[targets[i-1]];
+            // A target with no leaf gets its own group rather than joining a neighbour's box.
+            if (li != lp || li < 0) gstart.push_back(i);
+        }
+        gstart.push_back(nt);
+    }
+    const int nb = node_grouped ? (int)(gstart.size() - 1)
+                                : (int)((nt + std::max(batch,1) - 1) / std::max(batch,1));
 
     // SHMEM_COUNT_WALK: node visits and pair interactions per target. Counts, not times, so the
     // frequency scaling that makes wall-clock comparisons here unreliable does not touch them.
@@ -537,7 +562,9 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
     #pragma omp parallel for schedule(dynamic, 1) \
             reduction(+:n_nodes_visited,n_multipole,n_pairs)
     for (int b = 0; b < nb; ++b) {
-        size_t lo = (size_t)b * batch, hi = std::min(lo + batch, nt);
+        size_t lo, hi;
+        if (node_grouped) { lo = gstart[b]; hi = gstart[b+1]; }
+        else { lo = (size_t)b * batch; hi = std::min(lo + (size_t)batch, nt); }
         // batch bounding box
         double bx0=1e300,by0=1e300,bz0=1e300,bx1=-1e300,by1=-1e300,bz1=-1e300, emax=0;
         for (size_t i = lo; i < hi; ++i) {

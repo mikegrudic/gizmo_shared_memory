@@ -24,6 +24,8 @@ bench_postsink: bench_postsink.cc tree.cc tree.h
 	$(CXX) $(CXXFLAGS) -o $@ bench_postsink.cc tree.cc
 bench_treeforce: bench_treeforce.cc tree.cc tree.h
 	$(CXX) $(CXXFLAGS) -o $@ bench_treeforce.cc tree.cc
+bench_activeset: bench_activeset.cc tree.cc tree.h
+	$(CXX) $(CXXFLAGS) -o $@ bench_activeset.cc tree.cc
 step_overhead: step_overhead.cc
 	$(CXX) $(CXXFLAGS) -o $@ step_overhead.cc
 clean:

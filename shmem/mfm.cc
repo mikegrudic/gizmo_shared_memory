@@ -615,14 +615,25 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     // whatever momentum the gravity kick still injects is the force LAW and the timestep
     // structure, not the walk. Diagnostic: it is O(N_active * N) and only affordable because the
     // active set is small for most of a collapse.
-    // KEEP batch=8 even when that leaves threads idle. Shrinking the batch to buy parallelism on
-    // small steps was tried and is a large net LOSS: measured nact=8 going 2.4 ms -> 16.1 ms at
-    // batch=1. The active particles of a deep bin all sit in the same dense clump, so a batch of 8
-    // opens very nearly the same nodes as a batch of 1 -- batching there saves close to the full
-    // 8x in traversal work, far more than the 1.71x it is worth on an all-active step, and no
-    // amount of extra threads pays that back.
+    // NODE-ALIGNED GROUPING (0), not a fixed batch. Fixed windows of 8 are catastrophic once the
+    // active set is sparse: 32 random targets out of 3.5e6 span the whole cloud, so all four
+    // windows open essentially the entire tree. Measured on the M50 state, accel+tidal+jerk:
+    //
+    //     nactive  layout       b=1     b=8    node     <- ms, 16 threads
+    //     32       scattered    2.7   563.4     2.3
+    //     512      scattered   18.3  1034.9    18.0
+    //     35000    scattered  427.5  1160.1   426.7
+    //     24776    compact    147.7    97.4   105.8
+    //     3500000  all      23178.7 15008.2 15845.7
+    //
+    // Grouping on the leaf is within ~10% of the best fixed batch everywhere (worst case 5.6% on
+    // the all-active step, where b=8 wins) and up to 245x better where the run actually spends its
+    // steps. The old comment here recorded that shrinking the batch was a loss, measured at nact=8
+    // on a DENSE clump -- true, and the reason the answer is grouping rather than a smaller batch:
+    // it keeps the amortisation when targets really are close and drops it when they are not,
+    // with nothing to tune.
     static const int grav_batch = getenv("SHMEM_GRAV_BATCH")
-                                ? atoi(getenv("SHMEM_GRAV_BATCH")) : 8;   // diagnostic override
+                                ? atoi(getenv("SHMEM_GRAV_BATCH")) : 0;   // diagnostic override
     // The jerk is what makes a skipped force usable: the cached acceleration is advanced as
     // a += j*dt rather than merely reused stale. It costs extra work in every walk that DOES run,
     // which is why the reference gates the whole scheme behind a flag.
@@ -1785,7 +1796,7 @@ static void hermite_eval_group(Sim& sim, const std::vector<uint32_t>& targets,
                                std::vector<double>& az, std::vector<Vec3d>& jerk) {
     const double* vel_arrays[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
     const LazyDrift ld = lazy_drift_hook(sim);
-    accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, 8, ax, ay, az,
+    accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, 0, ax, ay, az,
                   nullptr, nullptr, sim.lazy_drift_on ? &ld : nullptr, &jerk, vel_arrays);
 }
 
