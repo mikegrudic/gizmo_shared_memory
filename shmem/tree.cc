@@ -76,10 +76,9 @@ static inline double pair_force_over_r(double r, double mass_source,
     return fac;
 }
 
-// Component form, for the grouped walk ONLY. That loop keeps its batch in SoA scratch buffers on
-// purpose -- contiguous per-component arrays are what let the inner loop over the batch vectorise,
-// which is the entire reason grouping wins. Feeding it Vec3d would make the batch AoS and give that
-// back, so the one hot loop that wants components gets them.
+// Component form, for the grouped walk ONLY. That loop keeps its batch in SoA scratch buffers, so
+// it wants components rather than a Vec3d it would immediately take apart. Note this is NOT a
+// vectorisation argument -- see the gather comment in the walk; the pair loop does not vectorise.
 static inline void kick(double offset_x, double offset_y, double offset_z,
                         double mass, double softening,
                         double& accel_x, double& accel_y, double& accel_z) {
@@ -562,8 +561,14 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
         if (aold) for (size_t i = lo; i < hi; ++i) aold_min = std::min(aold_min, aold[i]);
         // Gather the batch into contiguous local buffers. Without this the inner loop gathers
         // P.x[targets[i]] for every node, replacing one node fetch per target with `batch` scattered
-        // particle fetches -- measured 3-10x SLOWER than the per-target walk. Contiguous buffers keep
-        // the batch in L1 and let the inner loop vectorise, which is the whole point of grouping.
+        // particle fetches -- measured 3-10x SLOWER than the per-target walk.
+        //
+        // Do NOT defend this layout on vectorisation: the pair loop below does not vectorise and
+        // will not. -fopt-info-vec reports nothing for it under gcc 8.5 -O2 (our build) or gcc 13.3
+        // -O3 -- only the tree build and the trivial write-back at the end of this function. The
+        // continue, the sqrt and the type-dependent branches in pair_force_over_r see to that. What
+        // grouping actually buys is one traversal and one opening decision per batch instead of per
+        // target, plus gathering each target's data once per batch rather than per interaction.
         const int nb_ = (int)(hi - lo);
         const bool have_zeta = !P.zeta.empty();
         // 520, NOT 512, AND THE DIFFERENCE IS LARGE. double[512] is exactly 4096 bytes, which is
