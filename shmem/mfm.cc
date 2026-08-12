@@ -3299,6 +3299,23 @@ double mfm_step(Sim& sim, double dt_max) {
         c_tree+=t_tree; c_dens+=t_dens; c_grad+=t_grad; c_grav+=t_grav;
         c_bins+=t_bins; c_flux+=t_flux; c_drift+=t_drift; ++c_steps;
         const double tot = c_tree+c_dens+c_grad+c_grav+c_bins+c_flux+c_drift;
+        // BUCKETED BY ACTIVE FRACTION. A single mean does not say where the time goes, because
+        // gravity is strongly super-linear per target: measured 0.57 us/target with the whole set
+        // active against ~500 us/target at 600 active. A scattered active set walks nearly as much
+        // tree per target as a full one with none of the sharing, so the run's cost can sit in the
+        // middle buckets while both ends look fine. Accumulated EVERY step -- sampled per-step
+        // lines cannot answer this, and the two sampled views in this file disagreed by 15x when
+        // they were all we had.
+        static const int NBUCK = 5;
+        static const char* bname[NBUCK] = {"<0.1%", "0.1-1%", "1-10%", "10-50%", ">50%"};
+        static double b_grav[NBUCK]={0}, b_tot[NBUCK]={0};
+        static long long b_n[NBUCK]={0};
+        {
+            const double afrac = n_part ? (double)active.size()/(double)n_part : 0.0;
+            const int b = afrac < 1e-3 ? 0 : afrac < 1e-2 ? 1 : afrac < 0.1 ? 2 : afrac < 0.5 ? 3 : 4;
+            b_n[b]++; b_grav[b] += t_grav;
+            b_tot[b] += t_tree+t_dens+t_grad+t_grav+t_bins+t_flux+t_drift;
+        }
         if (getenv("SHMEM_PROFILE_TOTALS") && tot > 0 && (c_steps % 100) == 0) {
             // tree_builds is what makes the `tree` column readable: a large number there is either
             // many cheap checks or a few expensive REBUILDS, and only the count distinguishes them.
@@ -3308,7 +3325,17 @@ double mfm_step(Sim& sim, double dt_max) {
                             " time)\n",
                     c_steps, sim.tree_builds, c_tree*1e-3, c_dens*1e-3, c_grad*1e-3, c_grav*1e-3,
                     c_bins*1e-3, c_flux*1e-3, c_drift*1e-3, 100.0*c_drift/tot);
+            for (int b = 0; b < NBUCK; ++b) {
+                if (!b_n[b]) continue;
+                fprintf(stderr, "[prof-bucket] active %-7s %6lld steps  grav %7.1f s (%4.1f%% of "
+                                "run, %6.0f ms/step)  all phases %7.1f s (%4.1f%%)\n",
+                        bname[b], b_n[b], b_grav[b]*1e-3, 100.0*b_grav[b]/tot,
+                        b_grav[b]/(double)b_n[b], b_tot[b]*1e-3, 100.0*b_tot[b]/tot);
+            }
         }
+        // The FIRST 8 steps, not a sample of the run -- they are the least representative steps
+        // there are, taken before the timestep hierarchy has developed. Use [prof-bucket] for
+        // anything about where a run's time actually goes.
         static int shown = 0;
         if (shown < 8) {
             ++shown;
