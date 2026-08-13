@@ -322,10 +322,25 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
             H5Dclose(dataset); H5Sclose(space);
         };
         write_vector_field("Coordinates", sim.P.x, sim.P.y, sim.P.z);
+        // Raw stored velocity, exactly as the reference writes it (file_io/io.cc:230 -- "note
+        // this is -not- the exact velocity in-code b/c we're alternating drifts and kicks!").
+        // The half-kick offset this carries is the reference's own snapshot convention.
         write_vector_field("Velocities", sim.vx, sim.vy, sim.vz);
         write_scalar_field("Masses", sim.P.m);
         if (t == 0) {
-            write_scalar_field("InternalEnergy", sim.u);
+            // PREDICTED internal energy, as the reference outputs (io.cc:276 writes
+            // InternalEnergyPred): the stored u is half-kicked like the velocity, and completing
+            // the owed half with the particle's own rate synchronises it. Exact at a particle's
+            // own sync point; mid-step it is the same first-order prediction the reference makes.
+            if (sim.du_dt.size() == n_part && sim.pending_half_kick.size() == n_part) {
+                std::vector<double> u_pred(sim.u);
+                for (size_t q = 0; q < n_part && q < sim.n_gas; ++q)
+                    u_pred[q] = std::max(u_pred[q] + sim.du_dt[q] * sim.pending_half_kick[q],
+                                         1e-30);
+                write_scalar_field("InternalEnergy", u_pred);
+            } else {
+                write_scalar_field("InternalEnergy", sim.u);
+            }
             write_scalar_field("Density", sim.rho);
             write_scalar_field("SmoothingLength", sim.h);
         }

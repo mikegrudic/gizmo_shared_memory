@@ -68,6 +68,65 @@ explained.
 
 ## Status
 
-Branch `hermite_step_order`, forked from omp_shmem at 40dfdcbf. Contains this session's Hermite
-work (snapshot pass, predict/correct moved after the drift, pending-half-kick fix, h = dt_of,
-SHMEM_ENERGY_LOG). Item 5 NOT started.
+Branch `hermite_step_order`, forked from omp_shmem at 40dfdcbf. THE ROTATION IS IN: mfm_step now
+runs GIZMO's phasing exactly --
+
+    top:   gather actives(t)  ->  dt/bins from the PREVIOUS evaluation  ->  hermite snapshot
+           ->  fused kick (kick#2 of the ended step + kick#1 of the new one, same rates)
+    drift: everyone to t', t_since_build += dt, CLOCK ADVANCES (find_next_sync_point_and_drift)
+    tail:  gather actives(t') -- a DIFFERENT set -- ->  evaluate_forces at the drifted positions
+           ->  sinks  ->  hermite predict / pass#2 / correct  ->  node-bound top-up
+
+Consequences that landed with it, all reference-mandated:
+
+  * HYDRO RATES GO THROUGH THE KICKS (kicks.cc: HydroAccel and DtInternalEnergy times
+    dt_hydrokick). The all-at-once conserved update is gone; fluxes() output is converted to
+    a_hydro + du_dt per particle (hydro_final_operations_and_cleanup) and applied trapezoidally
+    by the same pending-half-kick machinery gravity uses. The internal energy moves LINEARLY by
+    its rate -- the reference linearises the same way, not an exact conserved-quantity solve.
+  * predict_half is GONE. The reference's face reconstruction is spatial only
+    (hydro_core_meshless.h); time centring comes from the two rate evaluations at the interval's
+    ends. set_predicted_states publishes current primitives, and the kick refreshes them.
+  * The position time-centring correction is GONE: the drift now uses the half-kicked velocity,
+    which is the leapfrog's own time centring.
+  * hermite_pass takes h from clock - herm_tick, which after the rotation IS the particle's own
+    completed step (the clock advances before the pass). This also removed a real bug: Phase A
+    stamped last_drift with the pre-advance clock while writing post-drift positions, so every
+    corrected sink was over-drifted by one system step on its next touch -- candidate for the
+    13x prefactor regression measured on the partial restructure.
+  * Bootstrap: sim.forces_valid gates one evaluation at t=0 (GIZMO's init), so the first dt
+    decision has forces.
+
+suite_runner.cc was already broken before this work (stale density() call) and stays broken.
+
+## Measured results
+
+Binary (e=0.9, 10 orbits, scratchpad/binary/sweep.sh): Hermite error per halving of dt falls
+46-110x => order ~5-6, matching the methods paper's "fifth order with these time-step criteria".
+At eta=0.00125: 6.9e-9/orbit, below the reference's documented 1e-6. KDK bit-identical to its
+pre-rotation values (the control). The old 13x prefactor and the order-2 ceiling are both gone;
+the prefactor was Phase A stamping last_drift with the pre-advance clock, over-drifting every
+corrected sink by one system step.
+
+Soundwave convergence vs N (1D, one crossing, L1 against the IC, scratchpad/swconv/):
+
+    N       ours rho    ref rho     ours u      ref u       ours v      ref v
+    512     1.58e-4     7.66e-5     1.59e-4     7.66e-5     4.36e-4     4.30e-4
+    2048    1.65e-5     5.03e-6     1.68e-5     5.86e-6     1.18e-4     1.18e-4
+
+rho and u converge at ~2nd order in both codes (pre-rotation, rho was FIRST order). v shows
+slope 1 in BOTH -- that is the snapshot kick-phase artifact, not integration error: io.cc:230
+writes the raw half-kicked velocity on purpose, and our L1v matches the reference's to four
+digits. Three Pred-machinery pieces were needed to get here, all reference-mandated:
+  * set_predicted_states completes the owed half-kick with the stored rates (= VelPred);
+    publishing the raw stored state instead measured 83x worse on the soundwave return.
+  * gradients read the predicted fields on both sides, like every other hydro input.
+  * snapshots write the PREDICTED internal energy (io.cc:276) while velocity stays raw.
+
+OPEN: our rho/u error coefficient is ~3x the reference's at N=2048 (same order). Localised to
+the h-solve's FIXED POINT, not the step scheme: with MaxNumNgbDeviation loosened to 0.05 we
+reproduce the reference's coefficient (5.2e-6 vs its 5.0e-6), while tightening to 1e-10 makes it
+WORSE (3.0e-5) -- yet the reference runs the same 1e-6 the suite sets and gets 5e-6. So the
+neighbour-number functional our iteration converges to deviates from the reference's
+(density.cc's kernel-weighted target + dhsml/Omega corrections are the place to diff). The
+harder we converge onto our functional, the further we land from the reference's answer.

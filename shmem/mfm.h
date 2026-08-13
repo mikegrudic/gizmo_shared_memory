@@ -251,10 +251,16 @@ struct Sim {
     std::vector<uint32_t> doomed_cells;
     std::vector<char>     doomed_mask;
     Vec3d acc_audit_baseline{0, 0, 0};
-    // Hydro acceleration retained from each particle's own last update, so the drift can keep its
-    // PREDICTED velocity current -- see drift_particle_to. Not used by the kick, which integrates
-    // the live flux accumulators.
+    // Hydro flux RATES from each particle's own last evaluation: the momentum rate as an
+    // acceleration, and the internal-energy rate per unit mass (the total-energy rate minus the
+    // kinetic part at the flux-time velocity -- GIZMO's HydroAccel and DtInternalEnergy). Applied
+    // by the half-kicks exactly like a_grav, and read by the drift's velocity prediction.
     std::vector<Vec3d> a_hydro;
+    std::vector<double> du_dt;
+    // False until the first force evaluation. The timestep is decided from the PREVIOUS step's
+    // forces (GIZMO decides dt at the top of the step, before any walk), so the first step needs
+    // a bootstrap evaluation at t=0 -- the reference's init does the same before its main loop.
+    bool forces_valid = false;
     // SHMEM_SINK_PINNED scratch: where each sink formed, and whether that has been recorded.
     std::vector<double> sink_pin_x, sink_pin_y, sink_pin_z;
     std::vector<char>   sink_pinned;

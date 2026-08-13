@@ -368,7 +368,11 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
             const Vec3d pos_i = sim.P.pos(i);
-            const Vec3d vel_i{sim.vx[i], sim.vy[i], sim.vz[i]};
+            // PREDICTED velocity, not stored: the stored one is leapfrog bookkeeping, half a
+            // step behind the state this pass is evaluating (see set_predicted_states). The
+            // reference's gradient loop reads VelPred for the same reason.
+            const Vec3d vel_i{work.predicted[FIELD_VX][i], work.predicted[FIELD_VY][i],
+                              work.predicted[FIELD_VZ][i]};
             get_neighbours(sim, tree, k, pos_i, sim.h[i], neighbours);
 
             SymTensor3d moments{0,0,0,0,0,0};     // E_i = sum_j (dx ox dx) W_ij
@@ -393,7 +397,9 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                     // Getting this backwards costs the velocity term exactly where it matters --
                     // converging flow, i.e. every shock front and every collapse -- and leaves
                     // those cells on a sound-crossing step they cannot resolve.
-                    const Vec3d rel_vel = vel_i - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
+                    const Vec3d rel_vel = vel_i - Vec3d{work.predicted[FIELD_VX][j],
+                                                        work.predicted[FIELD_VY][j],
+                                                        work.predicted[FIELD_VZ][j]};
                     const double approach_speed = dot(rel_vel, offset) / separation;
                     const double csound_j = sound_speed(sim, j);
                     signal_speed = std::max(signal_speed,
@@ -430,7 +436,12 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                 work.face_closure[i] = (denom > 0) ? sum_abs / denom : 0.0;
             }
 
-            const PrimitiveState field_i{sim.rho[i], sim.vx[i], sim.vy[i], sim.vz[i], sim.press[i]};
+            // gradients of the PREDICTED fields on both sides, like every other hydro input
+            const PrimitiveState field_i{work.predicted[FIELD_DENSITY][i],
+                                         work.predicted[FIELD_VX][i],
+                                         work.predicted[FIELD_VY][i],
+                                         work.predicted[FIELD_VZ][i],
+                                         work.predicted[FIELD_PRESSURE][i]};
             std::array<Vec3d, NUM_FIELDS> weighted_diff_sum{};
             // widest rise and fall seen across the neighbour set, for the slope limiter below
             PrimitiveState largest_rise{}, largest_drop{};
@@ -440,8 +451,11 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double weight = kernel_w(offset.norm(), sim.h[i], sim.dim);
                 max_ngb_distance = std::max(max_ngb_distance, offset.norm());
-                const PrimitiveState field_j{sim.rho[j], sim.vx[j], sim.vy[j], sim.vz[j],
-                                             sim.press[j]};
+                const PrimitiveState field_j{work.predicted[FIELD_DENSITY][j],
+                                             work.predicted[FIELD_VX][j],
+                                             work.predicted[FIELD_VY][j],
+                                             work.predicted[FIELD_VZ][j],
+                                             work.predicted[FIELD_PRESSURE][j]};
                 for (int f = 0; f < NUM_FIELDS; ++f) {
                     const double diff = field_j[f] - field_i[f];
                     weighted_diff_sum[f] += offset * (diff * weight);
@@ -473,31 +487,53 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                             max_ngb_distance, field_i[f], a_lim);
                 work.gradient[f][i] = gradient;
             }
+            // kept for the drift-time prediction of INACTIVE particles
+            work.div_vel[i] = work.gradient[FIELD_VX][i][0]
+                            + work.gradient[FIELD_VY][i][1]
+                            + work.gradient[FIELD_VZ][i][2];
         }
     }
 }
 
-// Lagrangian half-step prediction of primitives (MUSCL-Hancock predictor).
-static void predict_half(Sim& sim, const std::vector<uint32_t>& active,
-                         const std::vector<double>& dt_of) {
+// Publish each active particle's PREDICTED primitives -- its best estimate of the true state at
+// the current time -- as its face states. The STORED velocity and internal energy are leapfrog
+// bookkeeping: after the fused kick they sit half a step ahead of the state they were evaluated
+// at, and the half owed back (pending_half_kick) completes only at the next kick. The gradient
+// and flux passes must never see that half-stale state: the reference reads VelPred and
+// InternalEnergyPred everywhere in its hydro loops, and predict.cc advances those to the current
+// time with the SAME rates the kick will use -- which is exactly stored + rate * owed. Publishing
+// the stored state instead feeds an O(dt) input into an otherwise second-order scheme, and
+// measurably drops the soundwave's convergence below second order.
+// There is no half-step time extrapolation beyond this: the reference's face reconstruction is
+// spatial only (hydro_core_meshless.h), and time centring comes from splitting the flux rate
+// across the two half-kicks.
+static void set_predicted_states(Sim& sim, const std::vector<uint32_t>& active) {
     Work& work = sim.work;
     work.resize(sim.size());
+    const size_t n = sim.size();
+    const bool have_pend = sim.pending_half_kick.size() == n;
+    const bool have_grav = sim.gravity_on && sim.a_grav.size() == n;
+    const bool have_hyd = sim.a_hydro.size() == n;
+    const bool have_du = sim.du_dt.size() == n;
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < active.size(); ++k) {
         const uint32_t i = active[k];
-        const double dt = dt_of[i];
-        const double div_vel = work.gradient[FIELD_VX][i][0]
-                             + work.gradient[FIELD_VY][i][1]
-                             + work.gradient[FIELD_VZ][i][2];
-        work.div_vel[i] = div_vel;   // kept for the drift-time prediction of INACTIVE particles
-        const double inv_density = 1.0 / sim.rho[i], half_dt = 0.5 * dt;
-        const Vec3d& grad_pressure = work.gradient[FIELD_PRESSURE][i];
-        work.predicted[FIELD_DENSITY][i] = std::max(sim.rho[i] * (1.0 - half_dt*div_vel), 1e-30);
-        work.predicted[FIELD_VX][i] = sim.vx[i] - half_dt * inv_density * grad_pressure[0];
-        work.predicted[FIELD_VY][i] = sim.vy[i] - half_dt * inv_density * grad_pressure[1];
-        work.predicted[FIELD_VZ][i] = sim.vz[i] - half_dt * inv_density * grad_pressure[2];
-        work.predicted[FIELD_PRESSURE][i] =
-            std::max(sim.press[i] * (1.0 - sim.gamma*half_dt*div_vel), 1e-30);
+        const double owed = have_pend ? sim.pending_half_kick[i] : 0.0;
+        Vec3d a = have_grav ? sim.a_grav[i] : Vec3d{0, 0, 0};
+        if (have_hyd) a += sim.a_hydro[i];
+        work.predicted[FIELD_VX][i] = sim.vx[i] + a[0] * owed;
+        work.predicted[FIELD_VY][i] = sim.vy[i] + a[1] * owed;
+        work.predicted[FIELD_VZ][i] = sim.vz[i] + a[2] * owed;
+        // density is genuinely current -- the h/volume solve just ran at the drifted positions
+        work.predicted[FIELD_DENSITY][i] = sim.rho[i];
+        // pressure follows the predicted internal energy under an ideal EOS; the density-driven
+        // laws depend on rho alone, and the stored pressure already carries the fresh rho
+        double press = sim.press[i];
+        if (sim.eos_law == Sim::EosLaw::IDEAL && have_du) {
+            const double u_pred = std::max(sim.u[i] + sim.du_dt[i] * owed, 1e-30);
+            press = (sim.gamma - 1.0) * sim.rho[i] * u_pred;
+        }
+        work.predicted[FIELD_PRESSURE][i] = press;
     }
 }
 
@@ -787,14 +823,13 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
 // asymmetric pairs, so: i owns the pair when (i < j) and r < max(h_i, h_j); every pair is then
 // found exactly once because both sides search with max(h_i, h_j) coverage via the union below.
 static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active,
-                   const std::vector<double>& dt_of,
                    std::vector<double>& dmom_x, std::vector<double>& dmom_y,
                    std::vector<double>& dmom_z, std::vector<double>& denergy) {
     const Work& work = sim.work;
     const size_t n_part = sim.size();
-    // NOT cleared here. The accumulators are left zeroed by the update pass that consumes them
-    // (see mfm_step), which already touches every particle for the drift -- so the zeroing rides
-    // along in a pass that has to happen anyway instead of costing a separate sweep of the arrays.
+    // NOT cleared here. The accumulators are left zeroed by the rate-conversion pass that
+    // consumes them (see evaluate_forces), so the zeroing rides along in a loop over the same
+    // actives instead of costing a separate sweep of the arrays.
     if (dmom_x.size() != n_part) {
         dmom_x.assign(n_part, 0); dmom_y.assign(n_part, 0);
         dmom_z.assign(n_part, 0); denergy.assign(n_part, 0);
@@ -1263,7 +1298,8 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.P.type);
     sw(sim.vx); sw(sim.vy); sw(sim.vz); sw(sim.u);
     sw(sim.h); sw(sim.ninv); sw(sim.rho); sw(sim.press); sw(sim.omega); sw(sim.csnd);
-    sw(sim.phi); sw(sim.a_grav); sw(sim.a_hydro); sw(sim.tidal); sw(sim.pending_half_kick);
+    sw(sim.phi); sw(sim.a_grav); sw(sim.a_hydro); sw(sim.du_dt); sw(sim.tidal);
+    sw(sim.pending_half_kick);
     sw(sim.sink_pin_x); sw(sim.sink_pin_y); sw(sim.sink_pin_z); sw(sim.sink_pinned);
     sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
     sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.sink_reservoir); sw(sim.id);
@@ -1284,7 +1320,8 @@ static void pop_particle(Sim& sim) {
     pop(sim.P.type);
     pop(sim.vx); pop(sim.vy); pop(sim.vz); pop(sim.u);
     pop(sim.h); pop(sim.ninv); pop(sim.rho); pop(sim.press); pop(sim.omega); pop(sim.csnd);
-    pop(sim.phi); pop(sim.a_grav); pop(sim.a_hydro); pop(sim.tidal); pop(sim.pending_half_kick);
+    pop(sim.phi); pop(sim.a_grav); pop(sim.a_hydro); pop(sim.du_dt); pop(sim.tidal);
+    pop(sim.pending_half_kick);
     pop(sim.sink_pin_x); pop(sim.sink_pin_y); pop(sim.sink_pin_z); pop(sim.sink_pinned);
     pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
     pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.sink_reservoir); pop(sim.id);
@@ -1329,12 +1366,15 @@ static void remove_gas_particle(Sim& sim, size_t j) {
 static Vec3d audit_total_p(const Sim& sim) {
     const size_t n = sim.size();
     const bool have = sim.pending_half_kick.size() == n && sim.a_grav.size() == n;
+    const bool have_hyd = have && sim.a_hydro.size() == n;
     double px = 0, py = 0, pz = 0;
     for (size_t i = 0; i < n; ++i) {
         const double owed = have ? sim.pending_half_kick[i] : 0.0;
-        px += sim.P.m[i] * (sim.vx[i] - (have ? sim.a_grav[i][0]*owed : 0.0));
-        py += sim.P.m[i] * (sim.vy[i] - (have ? sim.a_grav[i][1]*owed : 0.0));
-        pz += sim.P.m[i] * (sim.vz[i] - (have ? sim.a_grav[i][2]*owed : 0.0));
+        Vec3d a = have ? sim.a_grav[i] : Vec3d{0, 0, 0};
+        if (have_hyd && i < sim.n_gas) a += sim.a_hydro[i];   // the kick owes the hydro rate too
+        px += sim.P.m[i] * (sim.vx[i] - a[0]*owed);
+        py += sim.P.m[i] * (sim.vy[i] - a[1]*owed);
+        pz += sim.P.m[i] * (sim.vz[i] - a[2]*owed);
     }
     return Vec3d{px, py, pz};
 }
@@ -1353,13 +1393,16 @@ void energy_log_step(Sim& sim, double t) {
     if (!on) return;
     const size_t n = sim.size();
     const bool have = sim.pending_half_kick.size() == n && sim.a_grav.size() == n;
+    const bool have_hyd = have && sim.a_hydro.size() == n;
     compute_potential(sim);
     double ke = 0, pe = 0;
     for (size_t i = 0; i < n; ++i) {
         const double owed = have ? sim.pending_half_kick[i] : 0.0;
-        const double ux = sim.vx[i] - (have ? sim.a_grav[i][0] * owed : 0.0);
-        const double uy = sim.vy[i] - (have ? sim.a_grav[i][1] * owed : 0.0);
-        const double uz = sim.vz[i] - (have ? sim.a_grav[i][2] * owed : 0.0);
+        Vec3d a = have ? sim.a_grav[i] : Vec3d{0, 0, 0};
+        if (have_hyd && i < sim.n_gas) a += sim.a_hydro[i];
+        const double ux = sim.vx[i] - a[0] * owed;
+        const double uy = sim.vy[i] - a[1] * owed;
+        const double uz = sim.vz[i] - a[2] * owed;
         ke += 0.5 * sim.P.m[i] * (ux*ux + uy*uy + uz*uz);
         pe += 0.5 * sim.P.m[i] * sim.phi[i];   // 0.5 so each pair is counted once
     }
@@ -1988,13 +2031,12 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
         }
         if (sim.herm_valid[i] && eligible[k] && h_elapsed > 0) {
             stepping[k] = 1;
-            // THE STEP'S OWN dt, not a Hermite-specific elapsed time. The reference keeps no
-            // separate Hermite timeline: find_timesteps picks dt once at the top of the step and
-            // both the KDK kick and the Hermite predictor/corrector use that same value.
-            // Deriving h from a stored herm_tick makes it the PREVIOUS interval, since the clock
-            // does not advance until the end of mfm_step -- equal on a power-of-two ladder except
-            // when a particle CHANGES BIN, which on an eccentric orbit happens at periapsis.
-            const double h = dt_of[i];
+            // The interval since the snapshot, from the CLOCK. This pass runs after the drift has
+            // advanced clock_ticks (GIZMO's find_next_sync_point_and_drift precedes run.cc:237),
+            // so clock - herm_tick is exactly the step this particle just completed -- including
+            // the case where its own bin is coarser than the system step, which dt_of cannot
+            // represent once the caps differ between the sync it started at and this one.
+            const double h = h_elapsed;
             const Vec3d x0 = sim.herm_pos[i], v0 = sim.herm_vel[i];
             const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
             // predictor (kicks.cc:147-148)
@@ -2023,7 +2065,8 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
         for (size_t k = 0; k < nt; ++k) {
             if (!stepping[k]) continue;
             const uint32_t i = targets[k];
-            const double h = dt_of[i];   // same dt the predictor used, and the kick
+            // same interval the predictor used
+            const double h = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
             const Vec3d v0 = sim.herm_vel[i], x0 = sim.herm_pos[i];
             const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
             const Vec3d a1{ax[s], ay[s], az[s]}, j1 = jk[s];
@@ -2835,14 +2878,13 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
 // one it recorded for itself. Without this, a strong blast propagates into stale, long-binned
 // material and the solution is wrong rather than merely inaccurate.
 
-double mfm_step(Sim& sim, double dt_max) {
+// Fill sim.active (and sim.active_gas when the layout is mixed) with the particles due at the
+// current clock tick -- GIZMO's make_list_of_active_particles. Called at BOTH ends of mfm_step:
+// the set whose steps BEGIN at a sync point and the set whose steps END at the next one differ
+// whenever more than one timebin is occupied; conflating them puts every force evaluation at
+// the wrong end of the step.
+static void gather_active(Sim& sim) {
     const size_t n_part = sim.size();
-    Work& work = sim.work;
-    const auto step_start = std::chrono::steady_clock::now();
-
-    if (sim.a_hydro.size() != n_part) sim.a_hydro.resize(n_part, Vec3d{0, 0, 0});
-
-    // ---- active set ----
     // Global scheme: everyone, every step. Individual: whoever the integer clock says is due.
     if (sim.individual_timesteps && sim.bin.size() != n_part) sim.bin.assign(n_part, 0);
     sim.active.clear();
@@ -2875,20 +2917,26 @@ double mfm_step(Sim& sim, double dt_max) {
         sim.active.resize(n_part);
         for (size_t i = 0; i < n_part; ++i) sim.active[i] = (uint32_t)i;
     }
-    const std::vector<uint32_t>& active = sim.active;
-
     // Hydro passes take only the GAS particles; with the gas-first layout that is the ascending
-    // prefix of the (sorted) active list. All-gas sims (n_gas = SIZE_MAX) skip the copy entirely.
-    const std::vector<uint32_t>* hydro_actives = &active;
-    if (sim.n_gas < n_part) {
-        sim.active_gas.assign(active.begin(),
-                              std::lower_bound(active.begin(), active.end(),
+    // prefix of the (sorted) active list. All-gas sims skip the copy entirely (the caller aliases
+    // sim.active instead).
+    if (sim.n_gas < n_part)
+        sim.active_gas.assign(sim.active.begin(),
+                              std::lower_bound(sim.active.begin(), sim.active.end(),
                                                (uint32_t)sim.n_gas));
-        hydro_actives = &sim.active_gas;
-    }
-    const std::vector<uint32_t>& active_gas = *hydro_actives;
+}
 
-    const bool profile = getenv("SHMEM_PROFILE") != nullptr;
+// One full force evaluation at the CURRENT positions and clock for the given active set: tree
+// maintenance, density/volumes, gradients, gravity with the sink timestep quantities, face
+// states, and the hydro flux RATES. This is the reference's post-drift force block: it runs at
+// the TAIL of every step -- so forces are evaluated at the drifted positions, for the particles
+// whose steps end there -- and once before the first step as the bootstrap (GIZMO's init computes
+// forces at t=0 before the main loop). Everything it stores (signal speeds, a_grav, a_hydro,
+// du_dt, sink approach times) is consumed by the NEXT step's timestep decision and opening kick.
+struct EvalTimers { double tree = 0, dens = 0, grad = 0, grav = 0, flux = 0; };
+static void evaluate_forces(Sim& sim, const std::vector<uint32_t>& active,
+                            const std::vector<uint32_t>& active_gas, EvalTimers* et) {
+    const size_t n_part = sim.size();
     auto mark = std::chrono::steady_clock::now();
     auto lap = [&]() {
         const auto now = std::chrono::steady_clock::now();
@@ -2900,12 +2948,10 @@ double mfm_step(Sim& sim, double dt_max) {
     // Reuse the tree across syncs. Particles drift every sync, but only by a small fraction of a
     // kernel radius, so the SHAPE of the tree stays good for many steps; Tree::pad keeps the
     // neighbour prune conservative in the meantime, which is what makes reuse exact rather than
-    // approximate. Rebuild once the accumulated drift is a noticeable fraction of a typical h,
-    // because past that the padded prune starts opening nodes it does not need.
-    // Scale for "has drift degraded this tree": the mean h over ALL gas, recorded when the tree was
-    // built. Taking it from one ACTIVE particle instead ties the threshold to whoever is awake, and
-    // on a deep-bin step that is a core cell whose h is orders of magnitude below the box -- which
-    // rebuilt the whole 3.5e6-particle tree nearly every step for no benefit.
+    // approximate. Scale for "has drift degraded this tree": the mean h over ALL gas, recorded
+    // when the tree was built -- taking it from one ACTIVE particle instead ties the threshold to
+    // whoever is awake, and on a deep-bin step that is a core cell whose h is orders of magnitude
+    // below the box.
     double typical_h = sim.tree_typical_h;
     if (typical_h <= 0.0 && !sim.h.empty())
         typical_h = sim.h[active.empty() ? 0 : active[0]];
@@ -2925,44 +2971,120 @@ double mfm_step(Sim& sim, double dt_max) {
     if (must_rebuild) rebuild_tree(sim);
     // Make the ACTIVE set current before anything reads a position -- GIZMO's core/run.cc:588,
     // "drift the active timebins at each sync". Parallel over a list with no duplicates, so no
-    // lock; a particle that was also active last step is already current and this is a no-op.
-    // Everyone else is caught up on touch, by the hook below.
+    // lock. Everyone else is caught up on touch, by the hook below.
+    sim.lazy_drift = lazy_drift_hook(sim);
+    sim.lazy_drift_on = sim.sparse_drift;
     if (sim.sparse_drift) {
         #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < active.size(); ++k)
             drift_particle_to(sim, active[k], sim.clock_ticks);
     }
-    sim.lazy_drift = lazy_drift_hook(sim);
-    sim.lazy_drift_on = sim.sparse_drift;
     const Tree& tree = sim.tree;
-    const double t_tree = profile ? lap() : 0.0;
+    if (et) et->tree += lap();
 
     // Actives only. A halo refresh is NOT needed: with rate accumulation an inactive particle is
     // never written to, so the h, V and B it carries are exactly the self-consistent set from its
-    // own last sync. Refreshing its neighbours as well would cost a whole extra neighbour-search
-    // pass per sync -- and this loop runs the same three passes as the global scheme, so any extra
-    // one shows up directly as the individual-timestep scheme being SLOWER than global on a
-    // uniform problem where it should merely match it.
+    // own last sync.
     solve_h_and_volumes(sim, tree, active_gas);
-    const double t_dens = profile ? lap() : 0.0;
+    if (et) et->dens += lap();
 
-    // Gradients first: they need no dt, and their neighbour loop is where the signal speed
-    // comes from.
+    // The predicted states must be current BEFORE the gradient pass: gradients, like every
+    // other hydro input, are taken of the predicted fields.
+    set_predicted_states(sim, active_gas);
+
+    // Gradients: their neighbour loop is where the signal speed for the NEXT step's CFL
+    // criterion comes from.
     gradients(sim, tree, active_gas);
-    const double t_grad = profile ? lap() : 0.0;
+    if (et) et->grad += lap();
 
-    // Gravity at the CURRENT positions, one walk per step. Done before dt so the acceleration
-    // can constrain it.
     if (sim.gravity_on) compute_gravity(sim, tree, active);
     sink_accel_check(sim);
     sink_dt_report(sim);
-    const double t_grav = profile ? lap() : 0.0;
-
-    // Refresh the sink approach/freefall minima for the actives before dt is chosen -- same
-    // ordering as GIZMO, where these ride along in the gravity walk that precedes get_timestep.
+    // Refresh the sink approach/freefall minima -- same placement as GIZMO, where these ride
+    // along in the gravity walk that precedes the next get_timestep.
     if (sim.gravity_on) sink_timestep_pass(sim, active);
+    if (et) et->grav += lap();
 
-    // ---- timestep ----
+    // Hydro flux RATES for the actives. SHMEM_NO_HYDRO skips the exchange entirely, leaving pure
+    // gravitational free-fall (diagnostic; separates tree asymmetry from hydro asymmetry).
+    if (sim.a_hydro.size() != n_part) sim.a_hydro.assign(n_part, Vec3d{0, 0, 0});
+    if (sim.du_dt.size() != n_part) sim.du_dt.assign(n_part, 0.0);
+    static const bool no_hydro = getenv("SHMEM_NO_HYDRO") != nullptr;
+    if (no_hydro) {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active_gas.size(); ++k) {
+            const uint32_t i = active_gas[k];
+            sim.a_hydro[i] = Vec3d{0, 0, 0};
+            sim.du_dt[i] = 0.0;
+        }
+    } else {
+        fluxes(sim, tree, active_gas, sim.dmom_x, sim.dmom_y, sim.dmom_z, sim.denergy);
+        // Rates -> per-particle records, GIZMO's hydro_final_operations_and_cleanup: the momentum
+        // rate becomes an acceleration and the internal-energy rate is the total-energy rate minus
+        // the kinetic part at the flux-time velocity. Nothing is integrated here -- the half-kicks
+        // apply these, half closing the step that ends at this sync and half opening the next.
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active_gas.size(); ++k) {
+            const uint32_t i = active_gas[k];
+            const double mass = sim.P.m[i];
+            const Vec3d rate{sim.dmom_x[i], sim.dmom_y[i], sim.dmom_z[i]};
+            sim.a_hydro[i] = rate / mass;
+            // the kinetic part at the PREDICTED velocity, the same state the fluxes were
+            // computed at (hydro_toplevel.cc:734, vel_phys = VelPred)
+            sim.du_dt[i] = (sim.denergy[i]
+                            - (sim.work.predicted[FIELD_VX][i]*rate[0]
+                             + sim.work.predicted[FIELD_VY][i]*rate[1]
+                             + sim.work.predicted[FIELD_VZ][i]*rate[2])) / mass;
+            sim.dmom_x[i] = 0; sim.dmom_y[i] = 0; sim.dmom_z[i] = 0; sim.denergy[i] = 0;
+        }
+    }
+    if (et) et->flux += lap();
+}
+
+double mfm_step(Sim& sim, double dt_max) {
+    const size_t n_part = sim.size();
+    Work& work = sim.work;
+    const auto step_start = std::chrono::steady_clock::now();
+
+    if (sim.a_hydro.size() != n_part) sim.a_hydro.resize(n_part, Vec3d{0, 0, 0});
+    if (sim.du_dt.size() != n_part) sim.du_dt.resize(n_part, 0.0);
+
+    // ---- BEGIN-OF-STEP: the particles whose steps end AND begin at this sync point ----
+    gather_active(sim);
+    const std::vector<uint32_t>& active = sim.active;
+    const std::vector<uint32_t>& active_gas =
+        (sim.n_gas < n_part) ? sim.active_gas : sim.active;
+
+    const bool profile = getenv("SHMEM_PROFILE") != nullptr;
+    EvalTimers et;
+
+    // Positions of the actives must be current before the Hermite snapshot reads them; under
+    // sparse drift everyone else is caught up on touch, via the hook.
+    sim.lazy_drift = lazy_drift_hook(sim);
+    sim.lazy_drift_on = sim.sparse_drift;
+    if (sim.sparse_drift) {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k)
+            drift_particle_to(sim, active[k], sim.clock_ticks);
+    }
+
+    // BOOTSTRAP. The timestep below is decided from the forces of the PREVIOUS evaluation
+    // ("decide timestep based upon state from last timestep"), which the first step does not
+    // have: evaluate once at t=0, exactly as the reference's init does before its main loop.
+    if (!sim.forces_valid) {
+        evaluate_forces(sim, active, active_gas, profile ? &et : nullptr);
+        sim.forces_valid = true;
+    }
+
+    auto mark = std::chrono::steady_clock::now();
+    auto lap = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - mark).count();
+        mark = now;
+        return ms;
+    };
+
+    // ---- timestep, from the state the last step left behind ----
     std::vector<double>& dt_of = sim.dt_of;      // reused: allocating N doubles per sync is not free
     dt_of.resize(n_part);
     double dt;                                   // the interval this call advances the system by
@@ -3095,13 +3217,16 @@ double mfm_step(Sim& sim, double dt_max) {
         const size_t n_part = sim.size();
         const bool have = sync && sim.pending_half_kick.size() == n_part
                                && sim.a_grav.size() == n_part;
+        const bool have_hyd = have && sim.a_hydro.size() == n_part;
         double px = 0, py = 0, pz = 0;
         #pragma omp parallel for schedule(static) reduction(+:px,py,pz)
         for (size_t i = 0; i < n_part; ++i) {
             const double owed = have ? sim.pending_half_kick[i] : 0.0;
-            px += sim.P.m[i] * (sim.vx[i] - (have ? sim.a_grav[i][0]*owed : 0.0));
-            py += sim.P.m[i] * (sim.vy[i] - (have ? sim.a_grav[i][1]*owed : 0.0));
-            pz += sim.P.m[i] * (sim.vz[i] - (have ? sim.a_grav[i][2]*owed : 0.0));
+            Vec3d a = have ? sim.a_grav[i] : Vec3d{0, 0, 0};
+            if (have_hyd && i < sim.n_gas) a += sim.a_hydro[i];   // the kick owes this rate too
+            px += sim.P.m[i] * (sim.vx[i] - a[0]*owed);
+            py += sim.P.m[i] * (sim.vy[i] - a[1]*owed);
+            pz += sim.P.m[i] * (sim.vz[i] - a[2]*owed);
         }
         return Vec3d{px, py, pz};
     };
@@ -3180,20 +3305,73 @@ double mfm_step(Sim& sim, double dt_max) {
                 active.size(), bmin, bmax);
     }
 
-    // GRAVITY KICK. a_grav is the acceleration at this sync point, which is BOTH the end of the
-    // previous step and the start of this one -- so the half-kick the previous step still owes and
-    // this step's opening half-kick use the same acceleration and are applied together. That is
-    // what keeps the scheme a proper leapfrog on one tree walk per step rather than two.
+    // KICK. a_grav and the hydro rates were evaluated at this sync point -- the tail of the
+    // previous step, at exactly these positions -- which is BOTH the end of the previous step and
+    // the start of this one. So the half-kick the previous step still owes and this step's opening
+    // half-kick use the same rates and are applied together: each evaluation serves kick #2 of one
+    // step and kick #1 of the next, which is what keeps the scheme a proper leapfrog on one
+    // evaluation per step. The hydro rate rides in the SAME kick, exactly as the reference applies
+    // it (kicks.cc: HydroAccel and DtInternalEnergy times dt_hydrokick) -- the internal energy
+    // moves LINEARLY by its rate, not by an exact conserved-quantity solve; the reference
+    // linearises the same way, and the time-centring comes from the two rate evaluations at the
+    // interval's ends, not from any half-step face prediction.
     // SHMEM_SWALLOW_AT_SYNC splits the two halves apart and swallows between them, which is where
     // the reference does it: do_second_halfstep_kick then calculate_non_standard_physics
-    // (run.cc:167-169). At that instant every active particle is exactly AT the sync point -- the
-    // same a_grav serves both halves, so nothing else changes -- whereas the fused kick leaves
-    // them half a step ahead, and the swallow absorbs a mid-step velocity.
+    // (run.cc:167-169). At that instant every active particle is exactly AT the sync point,
+    // whereas the fused kick leaves them half a step ahead.
     static const bool swallow_at_sync = getenv("SHMEM_SWALLOW_AT_SYNC") != nullptr;
-    if (sim.gravity_on) {
+    {
         sim.pending_half_kick.resize(n_part, 0.0);
         // Start-of-step snapshot + the Hermite-only gravity pass, BEFORE the kick (run.cc:150-153).
-        hermite_snapshot(sim, active, dt_of);
+        if (sim.gravity_on) hermite_snapshot(sim, active, dt_of);
+        const bool have_grav = sim.gravity_on && sim.a_grav.size() == n_part;
+        const bool have_pred = work.predicted[FIELD_VX].size() == n_part;
+        auto rate_of = [&](uint32_t i) {
+            Vec3d a = have_grav ? sim.a_grav[i] : Vec3d{0, 0, 0};
+            if (i < sim.n_gas) a += sim.a_hydro[i];
+            return a;
+        };
+        // close_dt finishes the particle's PREVIOUS step; open_dt starts its next one. In
+        // between, the state is the particle's TRUE synchronised state -- and that is what the
+        // predicted fields anchor to (the reference's kicks reset VelPred/InternalEnergyPred
+        // there, and the drift advances them by the rates until the next anchor). Anchoring the
+        // fully-kicked state instead puts the anchor half a step ahead of the trajectory.
+        auto kick_one = [&](uint32_t i, double close_dt, double open_dt, const Vec3d& a_tot) {
+            // the reference's floor (kicks.cc:340), per half-kick as it applies it: a kick may
+            // at most halve the internal energy
+            auto kick_u = [&](double kdt) {
+                const double dEnt = sim.u[i] + sim.du_dt[i] * kdt;
+                sim.u[i] = (dEnt < 0.5 * sim.u[i]) ? 0.5 * sim.u[i] : dEnt;
+            };
+            sim.vx[i] += a_tot[0] * close_dt;
+            sim.vy[i] += a_tot[1] * close_dt;
+            sim.vz[i] += a_tot[2] * close_dt;
+            double u_true = 0.0;
+            if (i < sim.n_gas) {
+                kick_u(close_dt);
+                u_true = sim.u[i];
+                if (have_pred) {
+                    work.predicted[FIELD_VX][i] = sim.vx[i];
+                    work.predicted[FIELD_VY][i] = sim.vy[i];
+                    work.predicted[FIELD_VZ][i] = sim.vz[i];
+                }
+            }
+            sim.vx[i] += a_tot[0] * open_dt;
+            sim.vy[i] += a_tot[1] * open_dt;
+            sim.vz[i] += a_tot[2] * open_dt;
+            if (i < sim.n_gas) {
+                kick_u(open_dt);
+                // Pressure follows u immediately; under a density-driven EOS this RESETS u from
+                // P(rho) instead -- the energy equation's answer is discarded on purpose, which
+                // is what makes the law stand in for cooling.
+                eos_apply(sim, i);
+                if (have_pred)
+                    work.predicted[FIELD_PRESSURE][i] =
+                        (sim.eos_law == Sim::EosLaw::IDEAL)
+                            ? (sim.gamma - 1.0) * sim.rho[i] * std::max(u_true, 1e-30)
+                            : sim.press[i];
+            }
+        };
         // Split the kick's own momentum injection by type. sum_active m a dt is not zero for a
         // SUBSET of particles even in an exactly antisymmetric force field -- the rest collect
         // their share later -- so this is bookkeeping, not error, but its SIZE says which
@@ -3202,15 +3380,15 @@ double mfm_step(Sim& sim, double dt_max) {
         #pragma omp parallel for schedule(static) reduction(+:gx,gy,gz,sx,sy,sz)
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
-            const double kick_dt = swallow_at_sync ? sim.pending_half_kick[i]
-                                                   : sim.pending_half_kick[i] + 0.5 * dt_of[i];
-            sim.vx[i] += sim.a_grav[i][0] * kick_dt;
-            sim.vy[i] += sim.a_grav[i][1] * kick_dt;
-            sim.vz[i] += sim.a_grav[i][2] * kick_dt;
+            const Vec3d a_tot = rate_of(i);
+            const double close_dt = sim.pending_half_kick[i];
+            const double open_dt = swallow_at_sync ? 0.0 : 0.5 * dt_of[i];
+            const double kick_dt = close_dt + open_dt;
+            kick_one(i, close_dt, open_dt, a_tot);
             if (momaudit) {
-                const double dpx = sim.P.m[i] * sim.a_grav[i][0] * kick_dt;
-                const double dpy = sim.P.m[i] * sim.a_grav[i][1] * kick_dt;
-                const double dpz = sim.P.m[i] * sim.a_grav[i][2] * kick_dt;
+                const double dpx = sim.P.m[i] * a_tot[0] * kick_dt;
+                const double dpy = sim.P.m[i] * a_tot[1] * kick_dt;
+                const double dpz = sim.P.m[i] * a_tot[2] * kick_dt;
                 if (i < sim.n_gas) { gx += dpx; gy += dpy; gz += dpz; }
                 else               { sx += dpx; sy += dpy; sz += dpz; }
             }
@@ -3228,96 +3406,96 @@ double mfm_step(Sim& sim, double dt_max) {
             #pragma omp parallel for schedule(static)
             for (size_t k = 0; k < active.size(); ++k) {
                 const uint32_t i = active[k];
-                sim.vx[i] += sim.a_grav[i][0] * (0.5 * dt_of[i]);
-                sim.vy[i] += sim.a_grav[i][1] * (0.5 * dt_of[i]);
-                sim.vz[i] += sim.a_grav[i][2] * (0.5 * dt_of[i]);
+                kick_one(i, 0.0, 0.5 * dt_of[i], rate_of(i));
                 sim.pending_half_kick[i] = 0.5 * dt_of[i];
             }
         }
-        probe("gravity-kick");
-    probeL("gravity-kick");
-        probeL("gravity-kick");
-        sinkv_probe(sim, "gravity-kick");
-        // The predicted primitives carry velocity, so re-predict after the kick rather than
-        // before it; the gradients themselves are unaffected (gravity is smooth on the kernel
-        // scale and adds no jump across a face).
+        probe("kick");
+        probeL("kick");
+        sinkv_probe(sim, "kick");
+    }
 
-        // The Hermite predict/correct has MOVED to after the drift, where the reference does it
-        // (run.cc:237-241, past find_next_sync_point_and_drift at :156).
-        probe("hermite");
-    probeL("hermite");
-        probeL("hermite");
-        sinkv_probe(sim, "hermite");
+    // Feed this step's velocity changes into the per-node bounds -- GIZMO's force_kick_node
+    // (forcetree_update.cc:78), placed where GIZMO places it: in the kick, which is now the ONLY
+    // point a gas particle's velocity changes. (Hermite-corrected sinks get the same feed after
+    // the corrector, below.) The climb stops at the first ancestor that already covers the speed,
+    // so in steady state this is one relaxed load per active particle.
+    if (sim.tree_valid && !sim.tree.leaf_of.empty()) {
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k) {
+            const uint32_t i = active[k];
+            const int leaf = sim.tree.leaf_of[i];
+            if (leaf < 0) continue;
+            const Vec3d v_now{sim.vx[i], sim.vy[i], sim.vz[i]};
+            sim.tree.raise_vmax(leaf, (float)v_now.norm());
+            // ... and the node MOMENTUM, the other half of force_kick_node: node_vel() reads
+            // vcom + dp/mass, so the jerk sees where a node's mass is actually going rather
+            // than where it was going at build time.
+            if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == n_part)
+                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i]);
+            if (sim.vel_at_last_kick.size() == n_part) sim.vel_at_last_kick[i] = v_now;
+        }
     }
 
     const double t_bins = profile ? lap() : 0.0;
 
-    predict_half(sim, active_gas, dt_of);
+    // Why this sync happened and how big it was -- captured NOW, before the end-of-step gather
+    // below overwrites sim.active (which `active` references).
+    const size_t n_active_top = active.size();
+    int longest_active_bin = 0;
+    if (sim.individual_timesteps && !active.empty()) {
+        longest_active_bin = Sim::MAX_BINS;
+        for (uint32_t i : active) longest_active_bin = std::min(longest_active_bin, sim.bin[i]);
+    }
 
-    std::vector<double>& dmom_x = sim.dmom_x;  std::vector<double>& dmom_y = sim.dmom_y;
-    std::vector<double>& dmom_z = sim.dmom_z;  std::vector<double>& denergy = sim.denergy;
-    // SHMEM_NO_HYDRO: skip the flux exchange entirely, leaving pure gravitational free-fall. A
-    // spherically symmetric IC must then collapse symmetrically, so ANY asymmetry that survives
-    // this is gravity's -- it separates "the tree breaks symmetry" from "the hydro does" without
-    // relying on either being made exact. Not a physical configuration; diagnostic only.
-    static const bool no_hydro = getenv("SHMEM_NO_HYDRO") != nullptr;
-    if (no_hydro) {
-        // assign, not fill: sizing these is fluxes()' job, so skipping it leaves them EMPTY and
-        // the conserved update below indexes off the end.
-        dmom_x.assign(n_part, 0.0); dmom_y.assign(n_part, 0.0);
-        dmom_z.assign(n_part, 0.0); denergy.assign(n_part, 0.0);
+    // ---- DRIFT to the next sync point, then advance the clock ----
+    // Every kicked particle moves with its half-kicked velocity -- the leapfrog's time-centred
+    // drift, with no correction terms. A long-binned particle is drifted in several sub-steps
+    // rather than one long one; its velocity is constant between its own kicks, so the sub-steps
+    // sum to the same displacement. A wrapping particle needs no special handling: ngb_search
+    // prunes on the MIN-IMAGE distance to a node's centre of mass, so a leaf sitting at x ~ box
+    // is min-image-adjacent to a query at x ~ 0 and still gets opened.
+    const long long drift_target = sim.clock_ticks + step_ticks;
+    if (sim.sparse_drift) {
+        // Only the ACTIVE particles. Everyone else keeps a stale position and a last_drift tick,
+        // and is caught up exactly when something first looks at it -- which is what makes this
+        // cost scale with the work rather than with the size of the box. Parallel over a duplicate
+        // free list, so no lock is needed here.
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < active.size(); ++k)
+            drift_particle_to(sim, active[k], drift_target);
     } else {
-        fluxes(sim, tree, active_gas, dt_of, dmom_x, dmom_y, dmom_z, denergy);
+        drift_all_to(sim, drift_target);
     }
-    const double t_flux = profile ? lap() : 0.0;
+    // Motion since the build is bounded per node by Tree::vmax * this elapsed time; incremented
+    // WITH the drift so the evaluation's rebuild check below already covers it.
+    sim.tree.t_since_build += dt;
+    // The clock advances BEFORE the end-of-step evaluation (GIZMO's find_next_sync_point_and_
+    // drift precedes the force computation): the lazy catch-ups, the is_active test inside the
+    // flux ownership rule, and the Hermite elapsed interval must all see the NEW time. No
+    // rounding and no minimum: step_ticks was derived FROM the tick grid above, so the clock and
+    // the dt every particle was integrated over agree exactly.
+    if (sim.individual_timesteps) sim.clock_ticks += step_ticks;
+    const double t_drift = profile ? lap() : 0.0;
 
-    // Conserved update. This runs over ALL particles, not just the active ones: an inactive
-    // neighbour of an active particle still receives its half of the pair's momentum and energy,
-    // and dropping that would break conservation exactly where the timebins meet.
-    // Pass 1, over the ACTIVE particles only -- which is now the complete set of particles the
-    // flux loop can have touched, since inactive ones are deliberately left alone. Each integrates
-    // its OWN accumulated rate over its OWN timestep, which is what makes the scheme independent
-    // of any per-pair history.
-    #pragma omp parallel for schedule(static)
-    for (size_t k = 0; k < active_gas.size(); ++k) {
-        const uint32_t i = active_gas[k];
-        // Already merged into a sink this step and awaiting removal: its post-flux state is about
-        // to be discarded, and its mass now lives in the sink, so updating it would double-count.
-        if (!sim.doomed_mask.empty() && i < sim.doomed_mask.size() && sim.doomed_mask[i]) continue;
-        const double dt_i = dt_of[i];
-        const double mass = sim.P.m[i];
-        const Vec3d vel_old{sim.vx[i], sim.vy[i], sim.vz[i]};
-        // rate * own dt -- the accumulators hold dP/dt and dE/dt, not amounts
-        const Vec3d momentum = vel_old * mass + Vec3d{dmom_x[i], dmom_y[i], dmom_z[i]} * dt_i;
-        const double energy = mass * (sim.u[i] + 0.5*vel_old.norm_sq()) + denergy[i] * dt_i;
-        // Kept for drift_particle_to's velocity prediction: the accumulators are cleared next line,
-        // and this is the only surviving record of the rate this particle last saw.
-        sim.a_hydro[i] = Vec3d{dmom_x[i], dmom_y[i], dmom_z[i]} / mass;
-        dmom_x[i] = 0; dmom_y[i] = 0; dmom_z[i] = 0; denergy[i] = 0;
+    // ---- END-OF-STEP: forces at the drifted positions, for the steps that END here ----
+    // A DIFFERENT set from the one kicked above whenever more than one bin is occupied. These
+    // particles' rates close the steps they just finished (via the pending half-kick, applied at
+    // their next activation) and feed the next timestep decision -- "density + gradients + hydro
+    // force" between the drift and the closing kick, as the reference orders it.
+    gather_active(sim);
+    const std::vector<uint32_t>& active2 = sim.active;
+    const std::vector<uint32_t>& active2_gas =
+        (sim.n_gas < sim.size()) ? sim.active_gas : sim.active;
+    evaluate_forces(sim, active2, active2_gas, profile ? &et : nullptr);
 
-        const Vec3d vel_new = momentum / mass;
-        sim.vx[i] = vel_new[0]; sim.vy[i] = vel_new[1]; sim.vz[i] = vel_new[2];
-        sim.u[i] = std::max(energy/mass - 0.5*vel_new.norm_sq(), 1e-30);
-        // Pressure follows u immediately. Only ACTIVE particles reach here now, so this is simply
-        // keeping a particle's own state self-consistent within its own update. Under a
-        // density-driven EOS this instead RESETS u from P(rho) -- the energy equation's answer is
-        // discarded on purpose, which is what makes the law stand in for cooling.
-        eos_apply(sim, i);
-
-        // TIME-CENTRING correction. Pass 2 below drifts everything with the POST-flux velocity,
-        // which alone is backward Euler on position -- it produced a clean systematic phase lag in
-        // the soundwave and capped convergence at ~order 1. Pre-subtracting half the velocity
-        // change makes the net displacement (v_old + v_new)/2 * dt exactly, while keeping the
-        // full-N pass free of any flux data.
-        const Vec3d correction = (vel_new - vel_old) * (0.5 * dt);
-        sim.P.x[i] -= correction[0]; sim.P.y[i] -= correction[1]; sim.P.z[i] -= correction[2];
-    }
-
+    // ---- sinks: after the closing rates are in place, before the Hermite pass ----
+    // GIZMO runs calculate_non_standard_physics after do_second_halfstep_kick and before the
+    // Hermite prediction (run.cc:230).
     // SHMEM_SINK_PINNED nails every sink to the position it formed at and holds its velocity at
     // zero. Deliberately unphysical -- it breaks momentum conservation by construction -- and the
     // point is exactly that: if a spurious second sink still forms with the first one immovable,
-    // then the fragmentation is something the GAS does, and the sink's trajectory (and the
-    // momentum error that drives it) is not what causes it.
+    // then the fragmentation is something the GAS does.
     static const bool pin_sinks = getenv("SHMEM_SINK_PINNED") != nullptr;
     if (pin_sinks && sim.n_gas < n_part) {
         if (sim.sink_pin_x.size() != n_part) {
@@ -3337,11 +3515,11 @@ double mfm_step(Sim& sim, double dt_max) {
         }
     }
 
-    // Sink formation, once the cells' own updates for this step are complete. Serial and after
-    // the flux pass because it reorders the particle arrays.
+    // Sink formation, once the fluxes for this sync are in. Serial and after the flux pass
+    // because it reorders the particle arrays.
     probe("hydro-flux");
     probeL("hydro-flux");
-    sink_formation_pass(sim, active_gas, dt_of);
+    sink_formation_pass(sim, active2_gas, dt_of);
     probe("sink-form");
     probeL("sink-form");
     sinkv_probe(sim, "sink-form");
@@ -3359,71 +3537,36 @@ double mfm_step(Sim& sim, double dt_max) {
     probe("sink-accrete");
     probeL("sink-accrete");
 
-    // Pass 2: drift EVERY particle over the system interval dt. A long-binned particle is drifted
-    // in several sub-steps rather than one long one; its velocity is constant between its own
-    // kicks, so the sub-steps sum to the same displacement, while any momentum it picked up as an
-    // inactive neighbour takes effect immediately.
-    // A wrapping particle needs no special handling: ngb_search prunes on the MIN-IMAGE distance to
-    // a node's centre of mass, so a leaf sitting at x ~ box is min-image-adjacent to a query at
-    // x ~ 0 and still gets opened, and the leaf test then uses the particle's live folded position.
-    // Only the drift magnitude has to be tracked, and a wrap does not change that.
-    // Compare SQUARED displacements and take the one square root at the end: this loop is over
-    // every particle every sync, and a per-particle sqrt bought nothing but a rank ordering that
-    // squaring already preserves.
-    const long long drift_target = sim.clock_ticks + step_ticks;
-    if (sim.sparse_drift) {
-        // Only the ACTIVE particles. Everyone else keeps a stale position and a last_drift tick,
-        // and is caught up exactly when something first looks at it -- which is what makes this
-        // cost scale with the work rather than with the size of the box. Parallel over a duplicate
-        // free list, so no lock is needed here.
-        #pragma omp parallel for schedule(static)
-        for (size_t k = 0; k < active.size(); ++k)
-            drift_particle_to(sim, active[k], drift_target);
-    } else {
-        drift_all_to(sim, drift_target);
-    }
     {
-        // HERMITE PREDICT / EVALUATE / CORRECT, after the drift -- run.cc:237-241. The corrector's
-        // output is the FINAL end-of-step state; nothing moves these particles afterwards.
-        hermite_pass(sim, active, dt_of);
+        // HERMITE PREDICT / EVALUATE / CORRECT for the steps that END here -- run.cc:237-241.
+        // The corrector's output is the FINAL end-of-step state; nothing moves these particles
+        // afterwards.
+        hermite_pass(sim, active2, dt_of);
     }
-    // Feed this step's velocity changes into the per-node bound -- GIZMO's force_kick_node
-    // (forcetree_update.cc:78), climbing the parent chain with a max. Only ACTIVE particles can
-    // have changed velocity (the gravity kick and the conserved update both cover actives only),
-    // and the climb stops at the first ancestor that already covers the speed, so in steady state
-    // this is one relaxed load per active particle.
-    if (sim.tree_valid && !sim.tree.leaf_of.empty()) {
+    // Hermite-corrected sinks changed velocity after the kick's node feed: top up the bounds.
+    if (sim.tree_valid && !sim.tree.leaf_of.empty() && sim.n_gas < sim.size()) {
         #pragma omp parallel for schedule(static)
-        for (size_t k = 0; k < active.size(); ++k) {
-            const uint32_t i = active[k];
+        for (size_t k = 0; k < active2.size(); ++k) {
+            const uint32_t i = active2[k];
+            if (i < sim.n_gas) continue;
             const int leaf = sim.tree.leaf_of[i];
             if (leaf < 0) continue;
             const Vec3d v_now{sim.vx[i], sim.vy[i], sim.vz[i]};
             sim.tree.raise_vmax(leaf, (float)v_now.norm());
-            // ... and the node MOMENTUM, the other half of force_kick_node: node_vel() reads
-            // vcom + dp/mass, so the jerk sees where a node's mass is actually going rather
-            // than where it was going at build time.
-            if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == n_part)
+            if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == sim.size())
                 sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i]);
-            if (sim.vel_at_last_kick.size() == n_part) sim.vel_at_last_kick[i] = v_now;
+            if (sim.vel_at_last_kick.size() == sim.size()) sim.vel_at_last_kick[i] = v_now;
         }
     }
-    // Motion since the build is bounded per node by Tree::vmax * this elapsed time; see the prune
-    // in ngb_search. A wrapping particle needs no special handling: the prune is on the MIN-IMAGE
-    // distance to a node's centre of mass, so a leaf at x ~ box is min-image-adjacent to a query
-    // at x ~ 0 and still gets opened, and the leaf test then reads the live folded position.
-    sim.tree.t_since_build += dt;
 
     if (profile) {
-        const double t_drift = lap();
         // Cumulative totals as well as the per-step lines: the per-step view is dominated by the
         // opening all-active step, but a run's cost is dominated by the many cheap deep-bin steps
-        // after it, where the O(N) drift is most of the work. Only the totals answer "what would
-        // fixing this phase actually buy".
+        // after it. Only the totals answer "what would fixing this phase actually buy".
         static double c_tree=0, c_dens=0, c_grad=0, c_grav=0, c_bins=0, c_flux=0, c_drift=0;
         static long long c_steps = 0;
-        c_tree+=t_tree; c_dens+=t_dens; c_grad+=t_grad; c_grav+=t_grav;
-        c_bins+=t_bins; c_flux+=t_flux; c_drift+=t_drift; ++c_steps;
+        c_tree+=et.tree; c_dens+=et.dens; c_grad+=et.grad; c_grav+=et.grav;
+        c_bins+=t_bins; c_flux+=et.flux; c_drift+=t_drift; ++c_steps;
         const double tot = c_tree+c_dens+c_grad+c_grav+c_bins+c_flux+c_drift;
         // BUCKETED BY ACTIVE FRACTION. A single mean does not say where the time goes, because
         // gravity is strongly super-linear per target: measured 0.57 us/target with the whole set
@@ -3437,10 +3580,10 @@ double mfm_step(Sim& sim, double dt_max) {
         static double b_grav[NBUCK]={0}, b_tot[NBUCK]={0};
         static long long b_n[NBUCK]={0};
         {
-            const double afrac = n_part ? (double)active.size()/(double)n_part : 0.0;
+            const double afrac = n_part ? (double)n_active_top/(double)n_part : 0.0;
             const int b = afrac < 1e-3 ? 0 : afrac < 1e-2 ? 1 : afrac < 0.1 ? 2 : afrac < 0.5 ? 3 : 4;
-            b_n[b]++; b_grav[b] += t_grav;
-            b_tot[b] += t_tree+t_dens+t_grad+t_grav+t_bins+t_flux+t_drift;
+            b_n[b]++; b_grav[b] += et.grav;
+            b_tot[b] += et.tree+et.dens+et.grad+et.grav+t_bins+et.flux+t_drift;
         }
         if (getenv("SHMEM_PROFILE_TOTALS") && tot > 0 && (c_steps % 100) == 0) {
             // tree_builds is what makes the `tree` column readable: a large number there is either
@@ -3467,8 +3610,8 @@ double mfm_step(Sim& sim, double dt_max) {
             ++shown;
             fprintf(stderr, "[prof] nact=%zu/%zu  tree=%.1f dens=%.1f grad=%.1f grav=%.1f "
                             "bins=%.1f flux=%.1f drift=%.1f  (ms)\n",
-                    active.size(), n_part, t_tree, t_dens, t_grad, t_grav,
-                    t_bins, t_flux, t_drift);
+                    n_active_top, n_part, et.tree, et.dens, et.grad, et.grav,
+                    t_bins, et.flux, t_drift);
         }
     }
 
@@ -3477,22 +3620,12 @@ double mfm_step(Sim& sim, double dt_max) {
     {
         sim.bin_cpu_sum.resize(Sim::MAX_BINS + 1, 0.0);
         sim.bin_cpu_n.resize(Sim::MAX_BINS + 1, 0);
-        int longest_active = 0;
-        if (sim.individual_timesteps && !active.empty()) {
-            longest_active = Sim::MAX_BINS;
-            for (uint32_t i : active) longest_active = std::min(longest_active, sim.bin[i]);
-        }
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start).count();
-        sim.bin_cpu_sum[longest_active] += elapsed;
-        sim.bin_cpu_n[longest_active]   += 1;
+        sim.bin_cpu_sum[longest_active_bin] += elapsed;
+        sim.bin_cpu_n[longest_active_bin]   += 1;
     }
     ++sim.sync_point;
-
-    // Advance the integer clock by exactly the ticks this step covered. No rounding and no
-    // minimum: step_ticks was derived FROM the tick grid above, so the clock and the dt every
-    // particle was integrated over agree exactly, and the hierarchy stays aligned indefinitely.
-    if (sim.individual_timesteps) sim.clock_ticks += step_ticks;
     return dt;
 }
 
@@ -3532,6 +3665,7 @@ double linear_gradient_error(Sim& sim) {
         sim.press[i] = field_offset[FIELD_PRESSURE] + dot(exact_gradient[FIELD_PRESSURE], pos);
     }
 
+    set_predicted_states(sim, all_particles);   // gradients read the predicted fields
     gradients(sim, tree, all_particles);
     const Work& work = sim.work;
 
@@ -3577,6 +3711,7 @@ double face_closure(Sim& sim, int nsample) {
     std::vector<uint32_t> all_particles(sim.size());
     for (size_t i = 0; i < all_particles.size(); ++i) all_particles[i] = (uint32_t)i;
     solve_h_and_volumes(sim, tree, all_particles);
+    set_predicted_states(sim, all_particles);   // gradients read the predicted fields
     gradients(sim, tree, all_particles);
     const Work& work = sim.work;
 
