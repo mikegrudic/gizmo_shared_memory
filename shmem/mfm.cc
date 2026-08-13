@@ -2878,6 +2878,21 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
 // one it recorded for itself. Without this, a strong blast propagates into stale, long-binned
 // material and the solution is wrong rather than merely inaccurate.
 
+// Apply the timestep-limiter wake requests the flux loop staged (Saitoh & Makino demotions).
+// MUST run before anything reorders the particle arrays: the requests hold INDICES, and sink
+// formation and accretion swap particles between slots -- a request applied after a reorder
+// lands on whoever moved into the slot, and near a new sink that mis-delivery seeds a wake
+// cascade that ratchets the neighbourhood toward MAX_BINS in generations of wake_offset.
+// Staging the writes outside the flux loop itself is still required: sim.bin is read by every
+// thread while that loop runs. Deepening away from a particle's own sync point is always legal
+// (see assign_bins).
+static void apply_wake_requests(Sim& sim) {
+    if (!sim.individual_timesteps) return;   // global scheme: fluxes() clears the list itself
+    for (const auto& [j, floor_bin] : sim.wake_requests)
+        if (sim.bin[j] < floor_bin) sim.bin[j] = std::min(floor_bin, Sim::MAX_BINS);
+    sim.wake_requests.clear();
+}
+
 // Fill sim.active (and sim.active_gas when the layout is mixed) with the particles due at the
 // current clock tick -- GIZMO's make_list_of_active_particles. Called at BOTH ends of mfm_step:
 // the set whose steps BEGIN at a sync point and the set whose steps END at the next one differ
@@ -3073,6 +3088,7 @@ double mfm_step(Sim& sim, double dt_max) {
     // have: evaluate once at t=0, exactly as the reference's init does before its main loop.
     if (!sim.forces_valid) {
         evaluate_forces(sim, active, active_gas, profile ? &et : nullptr);
+        apply_wake_requests(sim);
         sim.forces_valid = true;
     }
 
@@ -3095,13 +3111,6 @@ double mfm_step(Sim& sim, double dt_max) {
                         ? sim.time_of_ticks(sim.ticks_floor(dt_max)) : dt_max;
     if (sim.individual_timesteps) {
         assign_bins(sim, active);
-        // Wake requests raised by the PREVIOUS sync's flux loop are applied here, before this
-        // sync's dt is chosen, so a particle a shock is about to reach has already been moved to a
-        // short enough bin. Deferring them out of the flux loop keeps that loop free of writes to
-        // sim.bin while other threads are reading it.
-        for (const auto& [j, floor_bin] : sim.wake_requests)
-            if (sim.bin[j] < floor_bin) sim.bin[j] = std::min(floor_bin, Sim::MAX_BINS);
-        sim.wake_requests.clear();
         // An EMPTY active set has exactly one legitimate cause: accretion. Removing a particle
         // can empty the bins that alone were aligned with the current clock (the swallowed cells
         // near a sink are precisely the deepest-bin ones), leaving a tick no survivor syncs on.
@@ -3488,6 +3497,7 @@ double mfm_step(Sim& sim, double dt_max) {
     const std::vector<uint32_t>& active2_gas =
         (sim.n_gas < sim.size()) ? sim.active_gas : sim.active;
     evaluate_forces(sim, active2, active2_gas, profile ? &et : nullptr);
+    apply_wake_requests(sim);   // while the indices are still the flux loop's -- see the helper
 
     // ---- sinks: after the closing rates are in place, before the Hermite pass ----
     // GIZMO runs calculate_non_standard_physics after do_second_halfstep_kick and before the
