@@ -14,6 +14,13 @@ std::atomic<long long> g_ngb_nodes{0}, g_ngb_examined{0}, g_ngb_kept{0}, g_ngb_c
 // M50 state at every step type, so a stale tree is NOT what the search is paying for -- kept
 // because that is a property of the problem's velocities, not a guarantee.
 std::atomic<long long> g_ngb_pad_nodes{0};
+// Iteration-count histogram for the h solve, same gate: slot i = targets that took i+1
+// iterations (last slot = 8 or more, which includes the non-converged 100-iteration escape).
+// The MEAN multiplier hides a fat tail; this is the tail check.
+std::atomic<long long> g_hiter_hist[8] = {};
+void hiter_counters(long long out[8], bool reset) {
+    for (int i = 0; i < 8; ++i) { out[i] = g_hiter_hist[i].load(); if (reset) g_hiter_hist[i] = 0; }
+}
 static bool ngb_counting() {
     static const bool v = (getenv("SHMEM_NGB_COUNT") != nullptr);
     return v;
@@ -228,6 +235,10 @@ DensityResult density(const Tree& tree, const Particles& particles,
                     if (r < h) ++n_inside;
                     rho += particles.m[j] * kernel_w(r, h, n_dims);
                 }
+            }
+            if (ngb_counting()) {
+                const int used = converged ? iter + 1 : 100;
+                g_hiter_hist[std::min(used, 8) - 1].fetch_add(1, std::memory_order_relaxed);
             }
             if (cache) {
                 local_index[tid].emplace_back(t, local_flat[tid].size());

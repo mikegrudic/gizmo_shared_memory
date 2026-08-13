@@ -707,6 +707,26 @@ int main(int argc, char** argv) {
         append(sim.vz, h5_read(group, "Velocities", 2));
         if (t == 0) append(sim.u, h5_read(group, "InternalEnergy", -1));
         else        sim.u.insert(sim.u.end(), n_type, 0.0);
+        // Per-particle h guesses for the initial solve. Without them density() falls back to ONE
+        // global-mean spacing, and on a restart of an evolved state (6+ decades of density) that
+        // guess is ~7x too large for the typical particle: the init h-solve then burns ~7 full
+        // searches per target at ~350x the right neighbour count -- measured as an HOUR of
+        // startup at 3.5e6 cells. Prefer the snapshot's own SmoothingLength; fall back to the
+        // density-derived scale (also right everywhere); only a bare IC gets the global default.
+        if (t == 0) {
+            if (H5Lexists(group, "SmoothingLength", H5P_DEFAULT) > 0) {
+                append(sim.h, h5_read(group, "SmoothingLength", -1));
+            } else if (H5Lexists(group, "Density", H5P_DEFAULT) > 0) {
+                const std::vector<double> rho0 = h5_read(group, "Density", -1);
+                const size_t base = sim.h.size();
+                sim.h.resize(base + n_type, 0.0);
+                for (size_t q = 0; q < n_type; ++q) {
+                    const double m_q = sim.P.m[base + q];
+                    if (rho0[q] > 0 && m_q > 0)
+                        sim.h[base + q] = std::cbrt(3.0 * 32.0 * m_q / (4.0 * M_PI * rho0[q]));
+                }
+            }
+        }
         const std::vector<double> ids_as_double = h5_read(group, "ParticleIDs", -1);
         for (double id : ids_as_double) particle_ids.push_back((long long)id);
         loaded_types.insert(loaded_types.end(), n_type, (uint8_t)t);

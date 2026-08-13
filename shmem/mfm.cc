@@ -282,6 +282,13 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
                     active.size(), calls, (double)nodes/calls, (double)examined/calls,
                     (double)kept/calls, kept ? (double)examined/kept : 0.0,
                     (double)pad_nodes/calls, nodes ? 100.0*pad_nodes/nodes : 0.0);
+        long long hh[8]; hiter_counters(hh, true);
+        long long tot = 0; for (int q = 0; q < 8; ++q) tot += hh[q];
+        if (tot > 0)
+            fprintf(stderr, "[hiter] 1:%.1f%% 2:%.1f%% 3:%.1f%% 4:%.1f%% 5:%.1f%% 6:%.1f%% "
+                    "7:%.1f%% 8+:%.1f%% of %lld solves\n",
+                    100.0*hh[0]/tot, 100.0*hh[1]/tot, 100.0*hh[2]/tot, 100.0*hh[3]/tot,
+                    100.0*hh[4]/tot, 100.0*hh[5]/tot, 100.0*hh[6]/tot, 100.0*hh[7]/tot, tot);
         }
     }
     if (getenv("SHMEM_NGB_DIAG") && !active.empty()) {
