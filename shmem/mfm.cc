@@ -3590,10 +3590,20 @@ double mfm_step(Sim& sim, double dt_max) {
         static double b_grav[NBUCK]={0}, b_tot[NBUCK]={0};
         static long long b_n[NBUCK]={0};
         {
+            // The evaluation phases belong to the set gathered AFTER the drift, not the one this
+            // call closed -- bucket them by the EVALUATED set's fraction, and only the closing
+            // work (kick/dt bookkeeping, drift) by the top set's. Keying everything on the top
+            // set shifted every evaluation into the adjacent bucket on a multi-bin hierarchy.
             const double afrac = n_part ? (double)n_active_top/(double)n_part : 0.0;
-            const int b = afrac < 1e-3 ? 0 : afrac < 1e-2 ? 1 : afrac < 0.1 ? 2 : afrac < 0.5 ? 3 : 4;
-            b_n[b]++; b_grav[b] += et.grav;
-            b_tot[b] += et.tree+et.dens+et.grad+et.grav+t_bins+et.flux+t_drift;
+            const double afrac2 = sim.size() ? (double)active2.size()/(double)sim.size() : 0.0;
+            auto bucket_of = [](double f) {
+                return f < 1e-3 ? 0 : f < 1e-2 ? 1 : f < 0.1 ? 2 : f < 0.5 ? 3 : 4;
+            };
+            const int b = bucket_of(afrac), b2 = bucket_of(afrac2);
+            b_n[b]++;
+            b_grav[b2] += et.grav;
+            b_tot[b2] += et.tree+et.dens+et.grad+et.grav+et.flux;
+            b_tot[b] += t_bins+t_drift;
         }
         if (getenv("SHMEM_PROFILE_TOTALS") && tot > 0 && (c_steps % 100) == 0) {
             // tree_builds is what makes the `tree` column readable: a large number there is either
