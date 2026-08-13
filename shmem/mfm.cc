@@ -3087,7 +3087,7 @@ double mfm_step(Sim& sim, double dt_max) {
     // ("decide timestep based upon state from last timestep"), which the first step does not
     // have: evaluate once at t=0, exactly as the reference's init does before its main loop.
     if (!sim.forces_valid) {
-        evaluate_forces(sim, active, active_gas, profile ? &et : nullptr);
+        evaluate_forces(sim, active, active_gas, &et);
         apply_wake_requests(sim);
         sim.forces_valid = true;
     }
@@ -3496,7 +3496,7 @@ double mfm_step(Sim& sim, double dt_max) {
     const std::vector<uint32_t>& active2 = sim.active;
     const std::vector<uint32_t>& active2_gas =
         (sim.n_gas < sim.size()) ? sim.active_gas : sim.active;
-    evaluate_forces(sim, active2, active2_gas, profile ? &et : nullptr);
+    evaluate_forces(sim, active2, active2_gas, &et);
     apply_wake_requests(sim);   // while the indices are still the flux loop's -- see the helper
 
     // ---- sinks: after the closing rates are in place, before the Hermite pass ----
@@ -3625,14 +3625,27 @@ double mfm_step(Sim& sim, double dt_max) {
         }
     }
 
-    // Charge this sync to its LONGEST-step active bin: that bin is why the step had to do as much
-    // work as it did, and it is the key the cpu-frac column is normalised against.
+    // Charge the cpu ledger. Since the rotation, one call does TWO sets' work: it closes the
+    // step of the set gathered at the top and EVALUATES the set gathered after the drift, and
+    // those differ on every tick of a multi-bin hierarchy. Charging the whole call to the first
+    // set's bin dressed the near-empty deep-bin rows in the shallow bins' evaluation costs (a
+    // 1-cell sync appeared to cost more than a full-box step). Charge the evaluation to the
+    // EVALUATED set's bin and everything else to the closing set's bin.
     {
         sim.bin_cpu_sum.resize(Sim::MAX_BINS + 1, 0.0);
         sim.bin_cpu_n.resize(Sim::MAX_BINS + 1, 0);
+        int longest_eval_bin = 0;
+        if (sim.individual_timesteps && !active2.empty()) {
+            longest_eval_bin = Sim::MAX_BINS;
+            for (uint32_t i : active2)
+                longest_eval_bin = std::min(longest_eval_bin, (int)sim.bin[i]);
+        }
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start).count();
-        sim.bin_cpu_sum[longest_active_bin] += elapsed;
+        const double t_eval = 1e-3 * (et.tree + et.dens + et.grad + et.grav + et.flux);
+        const double t_rest = std::max(elapsed - t_eval, 0.0);
+        sim.bin_cpu_sum[longest_eval_bin] += t_eval;
+        sim.bin_cpu_sum[longest_active_bin] += t_rest;
         sim.bin_cpu_n[longest_active_bin]   += 1;
     }
     ++sim.sync_point;
