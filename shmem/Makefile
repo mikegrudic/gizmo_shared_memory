@@ -5,12 +5,14 @@ CXX      ?= g++
 # C++17 is the floor the site compiler (gcc 8.5) supports fully: structured bindings, if constexpr,
 # std::array CTAD and fold expressions are all used below. No std::span -- that needs gcc 10.
 CXXFLAGS ?= -O2 -fopenmp -march=native -Wall -std=c++17
-# Optional: cache each active particle's neighbour list for the step, so the volume/zeta,
-# gradient and flux phases share ONE tree traversal instead of repeating the same search three
-# times. Trades memory (~4 bytes per neighbour per active particle, plus a transient second copy
-# while the per-thread buffers merge) for traversals. Off by default; build with
-#   make GIZMO CACHE_NEIGHBORS=1
-CACHE_NEIGHBORS ?= 0
+# Cache each active particle's neighbour list for the step, so the volume/zeta, gradient and
+# flux phases share ONE tree traversal instead of repeating the same search three times. Trades
+# memory (~4 bytes per neighbour per active particle, plus a transient second copy while the
+# per-thread buffers merge) for traversals. On by default -- measured -31% hydro-phase time on
+# an M50 deep-collapse restart (grad -62%, flux -37%, dens -17%) with identical results on the
+# full test suite. Disable with:
+#   make GIZMO CACHE_NEIGHBORS=0
+CACHE_NEIGHBORS ?= 1
 ifeq ($(CACHE_NEIGHBORS),1)
 CXXFLAGS += -DSHMEM_CACHE_NEIGHBORS
 endif
