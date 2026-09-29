@@ -264,7 +264,14 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
     const DensityResult solved =
         density(tree, sim.P, active, sim.des_ngb, sim.ngb_tol, h_guess, sim.box, sim.dim, ngb_cache,
                 sim.lazy());
-    for (size_t k = 0; k < active.size(); ++k) sim.h[active[k]] = solved.h[k];
+    const bool track_hmax = sim.tree_valid && !sim.tree.hmax.empty();
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < active.size(); ++k) {
+        const uint32_t i = active[k];
+        sim.h[i] = solved.h[k];
+        if (track_hmax && i < sim.n_gas && i < sim.tree.leaf_of.size())
+            sim.tree.raise_hmax(sim.tree.leaf_of[i], sim.h[i]);
+    }
 
     // SHMEM_NGB_DIAG: how many tree traversals the h solve costs per target. Each Newton
     // iteration is a full traversal, so this is the multiplier on the density phase and it
@@ -575,11 +582,13 @@ static void set_predicted_states(Sim& sim, const std::vector<uint32_t>& active) 
 static void update_softenings(Sim& sim, const std::vector<uint32_t>* active = nullptr) {
     const size_t n_part = sim.size();
     sim.P.soft.resize(n_part);
-    auto set_one = [&sim](size_t i) {
+    const bool track = sim.tree_valid && sim.tree.leaf_of.size() == n_part;
+    auto set_one = [&sim, track](size_t i) {
         if (i < sim.n_gas)
             sim.P.soft[i] = sim.adaptive_soft ? std::max(sim.h[i], sim.soft_min) : sim.soft_min;
         else
             sim.P.soft[i] = sim.soft_fixed[sim.P.type.empty() ? 1 : sim.P.type[i]];
+        if (track) sim.tree.raise_soft(sim.tree.leaf_of[i], sim.P.soft[i]);
     };
     const bool full = !active || sim.soft_valid_n != n_part || sim.soft_valid_ngas != sim.n_gas;
     if (full) {
@@ -867,9 +876,21 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
         #pragma omp for schedule(dynamic, 64) nowait
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
-            // search with h_i; pairs where h_j > r >= h_i are found from j's side (j also loops)
+            // Every pair with r < max(h_i, h_j), as the reference's pairs search finds them. The
+            // gather set covers r < h_i. Pairs with h_i <= r < h_j belong to j's own gather when j
+            // is active (it owns them below); when j is inactive nobody else will ever compute
+            // them, so i must, or the faces around i do not close.
             const Vec3d pos_i = sim.P.pos(i);
             get_neighbours(sim, tree, k, pos_i, sim.h[i], neighbours);
+            if (!tree.hmax.empty()) {
+                const size_t n_gather = neighbours.size();
+                ngb_search_reverse(tree, sim.P, sim.h.data(), sim.n_gas, pos_i, sim.h[i],
+                                   neighbours, sim.box, sim.lazy());
+                size_t w = n_gather;
+                for (size_t q = n_gather; q < neighbours.size(); ++q)
+                    if (!sim.is_active(neighbours[q])) neighbours[w++] = neighbours[q];
+                neighbours.resize(w);
+            }
             // MFM+GALSF signal velocity, accumulated HERE rather than in the density pass, because
             // the reference derives it from the Riemann solve: vsig = 2*S_M + max(0, dv_face)
             // (hydro_core_meshless.h:253), replacing the Monaghan cs_i+cs_j estimate. Only the
@@ -1202,6 +1223,8 @@ static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
             sim.h[i] *= (std::abs(divv_fac) < 0.15)
                         ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
                         : std::exp(divv_fac / sim.dim);
+            if (divv_fac > 0 && i < sim.tree.leaf_of.size())
+                sim.tree.raise_hmax(sim.tree.leaf_of[i], sim.h[i]);
             sim.work.predicted[FIELD_DENSITY][i]  = sim.rho[i];
             sim.work.predicted[FIELD_PRESSURE][i] = sim.press[i];
         }
@@ -1257,6 +1280,7 @@ static void rebuild_tree(Sim& sim) {
     sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0,
                      sim.randomize_gravtree ? sim.tree_builds : -1);
     sim.tree.t_since_build = 0.0;
+    sim.tree.init_hmax(sim.h, sim.n_gas);
     // One O(N) pass per REBUILD (not per step), dwarfed by the O(N log N) build it follows. Mean
     // over gas rather than a median: the point is a scale for "has anything moved appreciably",
     // and sorting 3.5e6 values to refine that would cost more than it is worth.

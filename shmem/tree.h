@@ -266,6 +266,10 @@ struct Tree {
     std::vector<int>   parent;          // parent node index, -1 at the root; for the kick climb
     std::vector<int>   leaf_of;         // per PARTICLE, the leaf holding it -- GIZMO's Father[]
     std::vector<float> vmax;            // max |v| over the node's particles, since the build
+    // Upper bound on gas kernel radius h within the node, for searches that must find every j
+    // whose OWN kernel reaches the target (GIZMO's SEARCHBOTHWAYS, Extnodes[].hmax). Only ever
+    // raised between rebuilds, so it stays conservative when h shrinks.
+    std::vector<float> hmax;
     // Sinks contained in the node, for the direct-summation criterion (see open_node). A separate
     // array rather than a WNode field: WNode is exactly one cache line, and this is only read when
     // the target itself is a sink, which is a vanishing fraction of walks.
@@ -295,6 +299,12 @@ struct Tree {
     // construction >= all its children's, so once one covers it they all do. In steady state that
     // breaks at the first test, which is what keeps this affordable on an all-active step.
     void raise_vmax(int leaf_node, float speed);
+    // Same climb for hmax. init_hmax resets it from the current h of every gas particle.
+    void raise_hmax(int leaf_node, double h);
+    void init_hmax(const std::vector<double>& h, size_t n_gas);
+    // Node max softening is a build-time reduction; raise it when a particle's softening grows
+    // so the softening force-open test never trusts a stale, too-small value.
+    void raise_soft(int leaf_node, double soft);
     // Accumulate a particle's momentum change into every ancestor node (GIZMO's force_kick_node).
     // No-op unless the build produced vcom, so runs that never ask for a jerk pay nothing.
     void kick_node(int leaf_node, const Vec3d& dp);

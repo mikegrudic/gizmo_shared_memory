@@ -106,6 +106,45 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
     }
 }
 
+void ngb_search_reverse(const Tree& tree, const Particles& particles, const double* h,
+                        size_t n_gas, const Vec3d& centre, double h_i,
+                        std::vector<uint32_t>& found, double box, const LazyDrift* lazy) {
+    const SNode* __restrict nodes = tree.sn.data();
+    const float* __restrict node_vmax = tree.vmax.data();
+    const float* __restrict node_hmax = tree.hmax.data();
+    const double elapsed = tree.t_since_build;
+    const double h_i_sq = h_i * h_i;
+    int node_id = tree.root;
+    while (node_id >= 0) {
+        const SNode& node = nodes[node_id];
+        // no particle here has h_j > h_i, so none can satisfy h_i <= r < h_j
+        const double hm = (double)node_hmax[node_id];
+        if (hm <= h_i) { node_id = node.next; continue; }
+        double dist = hm + (double)node.half;
+        if (elapsed > 0) dist += (double)node_vmax[node_id] * elapsed;
+        const double dx = min_image((double)node.cx - centre[0], box);
+        if (dx > dist || -dx > dist) { node_id = node.next; continue; }
+        const double dy = min_image((double)node.cy - centre[1], box);
+        if (dy > dist || -dy > dist) { node_id = node.next; continue; }
+        const double dz = min_image((double)node.cz - centre[2], box);
+        if (dz > dist || -dz > dist) { node_id = node.next; continue; }
+        dist += 0.7320508075688772 * (double)node.half;
+        if (dx*dx + dy*dy + dz*dz > dist*dist) { node_id = node.next; continue; }
+        if (node.first < 0) {
+            for (int slot = node.plo; slot < node.phi; ++slot) {
+                const uint32_t j = tree.orderbuf[slot];
+                if (j >= n_gas) continue;
+                if (lazy && lazy->last[j] < lazy->target) lazy->catch_up(lazy->ctx, j);
+                const double r2 = min_image(particles.pos(j) - centre, box).norm_sq();
+                if (r2 >= h_i_sq && r2 < h[j] * h[j]) found.push_back(j);
+            }
+            node_id = node.next;
+        } else {
+            node_id = node.first;
+        }
+    }
+}
+
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box, int n_dims,

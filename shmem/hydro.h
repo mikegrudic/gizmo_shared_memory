@@ -75,6 +75,15 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
                 double radius, std::vector<uint32_t>& found, double box = 0.0,
                 const LazyDrift* lazy = nullptr);
 
+// The other half of GIZMO's pairs search (ngb_treefind_pairs, SEARCHBOTHWAYS): gas particles j
+// with h_i <= r < h[j], i.e. whose own kernel reaches `centre` although the target's does not.
+// Together with ngb_search(radius = h_i) this is every pair with r < max(h_i, h_j). APPENDS to
+// `found`. Needs tree.hmax.
+void ngb_search_reverse(const Tree& tree, const Particles& particles, const double* h,
+                        size_t n_gas, const Vec3d& centre, double h_i,
+                        std::vector<uint32_t>& found, double box = 0.0,
+                        const LazyDrift* lazy = nullptr);
+
 struct DensityResult {
     std::vector<double> h;        // converged support radius
     std::vector<double> rho;      // sum m_j W(r_ij, h_i)

@@ -230,6 +230,49 @@ void Tree::raise_vmax(int leaf_node, float speed) {
     }
 }
 
+// Rounded UP to float so the prune stays one-sided.
+static inline float h_as_bound(double h) {
+    float f = (float)h;
+    return ((double)f < h) ? std::nextafter(f, 1e30f) : f;
+}
+
+void Tree::raise_hmax(int leaf_node, double h) {
+    if (hmax.empty() || leaf_node < 0) return;
+    const float hf = h_as_bound(h);
+    uint32_t want; std::memcpy(&want, &hf, sizeof want);
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        const uint32_t* bits = reinterpret_cast<const uint32_t*>(&hmax[no]);
+        if (__atomic_load_n(bits, __ATOMIC_RELAXED) >= want) return;
+        atomic_max_nonneg(&hmax[no], hf);
+    }
+}
+
+static inline void atomic_max_double(double* slot, double value) {
+    double seen; __atomic_load(slot, &seen, __ATOMIC_RELAXED);
+    while (seen < value &&
+           !__atomic_compare_exchange(slot, &seen, &value, true,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { /* seen reloaded */ }
+}
+
+void Tree::raise_soft(int leaf_node, double soft) {
+    if (leaf_node < 0 || wn.empty()) return;
+    const float sf = h_as_bound(soft);
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        float cur; __atomic_load(&wn[no].soft, &cur, __ATOMIC_RELAXED);
+        if (cur >= sf) return;
+        atomic_max_nonneg(&wn[no].soft, sf);
+        atomic_max_double(&this->soft[no], soft);
+    }
+}
+
+void Tree::init_hmax(const std::vector<double>& h, size_t n_gas) {
+    hmax.assign(nnodes(), 0.0f);
+    const size_t n = std::min(std::min(n_gas, h.size()), leaf_of.size());
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i)
+        if (h[i] > 0) raise_hmax(leaf_of[i], h[i]);
+}
+
 void setup_walk(Tree& T, int node, int next_sibling) {
     T.next[node] = next_sibling;
     int c = T.first[node];
