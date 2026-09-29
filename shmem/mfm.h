@@ -434,6 +434,9 @@ void sync_all_positions(Sim& sim);
 //   cumulative particles in this bin and every shorter one -- the count actually being integrated
 //              at that level and below
 void hermite_report();
+// IO_HERMITE_SYNC: the (x, v) of particle i at time_now() + dt_offset from its Hermite predictor,
+// a mutually consistent pair. False for particles not integrated by Hermite (use plain values).
+bool hermite_sync_state(const Sim& sim, size_t i, double dt_offset, Vec3d& x, Vec3d& v);
 void print_timebins(const Sim& sim, double systemstep, double time);
 
 // Diagnostics used by the tests.

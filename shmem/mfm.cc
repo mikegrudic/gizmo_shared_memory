@@ -20,6 +20,9 @@ namespace shmem {
 // The reference applies X to n_H only at the opacity-limit sites (sfr_eff.cc:238,611, sink.cc:134),
 // not in the EOS, the density threshold or the Jeans mass.
 static constexpr double HYDROGEN_MASSFRAC = 0.76;
+// KDK margin on the sink gravity timestep, shared by the tidal and 2-body criteria so they stay
+// comparable; the Hermite path divides it out of both (timestep.cc, SINK_TIMESTEP_SAFETY_FACTOR).
+static constexpr double SINK_TIMESTEP_SAFETY_FACTOR = 0.3;
 // Neighbour-list access for the three hydro phases. With SHMEM_CACHE_NEIGHBORS the list is built
 // once per step (in solve_h_and_volumes) and the later phases read it back; without it, each
 // phase searches the tree as before. Both paths hand the caller the same `neighbours` vector, so
@@ -1918,13 +1921,52 @@ static inline bool hermite_eligible(const Sim& sim, size_t i, double dt) {
 // but it cost O(N_target * N_total) per sync against the walk's O(N_target log N) -- ~10x on
 // 512 particles and unusable for a run with real gas counts, since every sink would sum over
 // every cell twice per step.
+//
+// SOURCE PREDICTION (starforge_dev b74a8d35, ee75ab82, 60998ef5). An INACTIVE Hermite source is
+// mid-step: its stored position is KDK-drifted with a velocity that is not the Hermite one, so it
+// is O(dt^2) wrong in position and O(dt) wrong in the velocity the jerk uses. For the duration of
+// the pass it is presented at its own Hermite prediction from the start-of-step snapshot, then
+// restored exactly -- nothing is written back. Gated on the span: the snapshot polynomial is an
+// interpolant over the source's OWN step, and extrapolated past it is biased along the orbit, so
+// outside [0, step] the KDK state is used instead (lower order, unbiased).
+//
+// Sink-sink pairs within sink_direct_radius are summed exactly in these passes too, as the
+// reference's direct star-star path does under HermiteOnlyFlag.
 static void hermite_eval_group(Sim& sim, const std::vector<uint32_t>& targets,
                                std::vector<double>& ax, std::vector<double>& ay,
                                std::vector<double>& az, std::vector<Vec3d>& jerk) {
+    struct Saved { uint32_t i; double x, y, z, vx, vy, vz; long long last; };
+    std::vector<Saved> saved;
+    if (sim.herm_valid.size() == sim.size() && sim.last_drift.size() == sim.size()) {
+        for (size_t i = sim.n_gas; i < sim.size(); ++i) {
+            if (!sim.herm_valid[i] || sim.is_active(i) || !hermite_type_ok(sim, i)) continue;
+            const long long d_ticks = sim.clock_ticks - sim.herm_tick[i];
+            const long long step_ticks = sim.ticks_in_bin(sim.bin[i]);
+            if (d_ticks < 0 || d_ticks > step_ticks) continue;
+            if (!hermite_eligible(sim, i, sim.time_of_ticks(step_ticks))) continue;
+            saved.push_back({(uint32_t)i, sim.P.x[i], sim.P.y[i], sim.P.z[i],
+                             sim.vx[i], sim.vy[i], sim.vz[i], sim.last_drift[i]});
+            const double D = sim.time_of_ticks(d_ticks);
+            const Vec3d x0 = sim.herm_pos[i], v0 = sim.herm_vel[i];
+            const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
+            Vec3d xp = x0 + (v0 + (a0 + j0 * (D / 3.0)) * (D / 2.0)) * D;
+            const Vec3d vp = v0 + (a0 + j0 * (D / 2.0)) * D;
+            if (sim.box > 0) xp = fold_into_box(xp, sim.box);
+            sim.P.x[i] = xp[0]; sim.P.y[i] = xp[1]; sim.P.z[i] = xp[2];
+            sim.vx[i] = vp[0];  sim.vy[i] = vp[1];  sim.vz[i] = vp[2];
+            sim.last_drift[i] = sim.clock_ticks;   // current: the walk must not catch it up
+        }
+    }
     const double* vel_arrays[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
     const LazyDrift ld = lazy_drift_hook(sim);
     accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, 0, ax, ay, az,
-                  nullptr, nullptr, sim.lazy_drift_on ? &ld : nullptr, &jerk, vel_arrays);
+                  nullptr, nullptr, sim.lazy_drift_on ? &ld : nullptr, &jerk, vel_arrays,
+                  sim.sink_direct_radius);
+    for (const Saved& q : saved) {
+        sim.P.x[q.i] = q.x; sim.P.y[q.i] = q.y; sim.P.z[q.i] = q.z;
+        sim.vx[q.i] = q.vx; sim.vy[q.i] = q.vy; sim.vz[q.i] = q.vz;
+        sim.last_drift[q.i] = q.last;
+    }
 }
 
 // Runs immediately after the gravity kick loop. KDK ran for EVERYONE, exactly as in GIZMO,
@@ -1941,6 +1983,18 @@ static void hermite_eval_group(Sim& sim, const std::vector<uint32_t>& targets,
 static long long hermite_h_mismatch = 0, hermite_h_match = 0;
 static double hermite_h_mismatch_max = 0.0;
 static const bool hermite_diag = getenv("SHMEM_HERMITE_DIAG") != nullptr;
+
+bool hermite_sync_state(const Sim& sim, size_t i, double dt_offset, Vec3d& x, Vec3d& v) {
+    if (sim.herm_valid.size() != sim.size() || !sim.herm_valid[i] || sim.P.m[i] <= 0) return false;
+    if (!hermite_eligible(sim, i, sim.time_of_ticks(sim.ticks_in_bin(sim.bin[i])))) return false;
+    const double D = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]) + dt_offset;
+    const Vec3d x0 = sim.herm_pos[i], v0 = sim.herm_vel[i];
+    const Vec3d a0 = sim.herm_acc[i], j0 = sim.herm_jerk[i];
+    x = x0 + (v0 + (a0 + j0 * (D / 3.0)) * (D / 2.0)) * D;
+    v = v0 + (a0 + j0 * (D / 2.0)) * D;
+    if (sim.box > 0) x = fold_into_box(x, sim.box);
+    return true;
+}
 
 void hermite_report() {
     if (!hermite_diag) return;
@@ -2745,6 +2799,11 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                 // the self-gravity floor, exactly where the reference stores it.
                 if (sim.atu_frac > 0 && sim.tdyn_for_treeforce.size() == sim.size())
                     sim.tdyn_for_treeforce[i] = dt_tidal;
+                // Divide out the 2nd-order margin as the 2-body criterion does (starforge_dev
+                // 024dc272). The tidal term keys on the companion's mass, so with only the 2-body
+                // margin removed it undercuts the symmetric 2-body step for the lighter member of
+                // a bound pair and splits the pair across timebins.
+                if (!gas && hermite_eligible(sim, i, dt)) dt_tidal /= SINK_TIMESTEP_SAFETY_FACTOR;
                 dt = std::min(dt, dt_tidal);
                 // SHMEM_ATU_PROBE: what ADAPTIVE_TREEFORCE_UPDATE would be worth here, measured
                 // before building it. The reference refreshes a gas cell's tree force once it has
@@ -2779,11 +2838,11 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
         // define SINGLE_STAR_FB_TIMESTEPLIMIT via the STARFORGE feedback bundle).
         if (sim.min_sink_tapp.size() == sim.size() && sim.min_sink_tapp[i] < 1e299) {
             if (!gas && !sim.P.type.empty() && sim.P.type[i] == 5) {
-                double dt_2body = std::sqrt(2.0 * sim.eta_grav) * 0.3
+                double dt_2body = std::sqrt(2.0 * sim.eta_grav) * SINK_TIMESTEP_SAFETY_FACTOR
                     / (1.0 / sim.min_sink_tapp[i] + 1.0 / sim.min_sink_tff[i]);
-                // Hermite tolerates a longer 2-body step (timestep.cc:456): the 0.3 safety
-                // factor is a leapfrog need, not a Hermite one.
-                if (hermite_eligible(sim, i, dt)) dt_2body /= 0.3;
+                // Hermite tolerates a longer 2-body step (timestep.cc:456): the safety factor is
+                // a leapfrog need, not a Hermite one.
+                if (hermite_eligible(sim, i, dt)) dt_2body /= SINK_TIMESTEP_SAFETY_FACTOR;
                 if (parts) parts->sink2body = dt_2body;
                 dt = std::min(dt, dt_2body);
             }

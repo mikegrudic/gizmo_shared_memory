@@ -50,6 +50,9 @@ static std::map<std::string, std::string> parse_kv(const char* path) {
 }
 
 // EOS_GAMMA=(5.0/3.0) / BOX_SPATIAL_DIMENSION=2 out of whichever Config.sh the harness staged
+// IO_HERMITE_SYNC (starforge_dev b74a8d35): write HermiteSyncCoordinates/HermiteSyncVelocities.
+static bool g_io_hermite_sync = false;
+
 static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& adaptive_soft,
                          bool& output_potential, bool& tidal_criterion, bool& box_periodic,
                          double& eos_adiabat, int& baro_variant, bool& baro_soundspeed,
@@ -102,6 +105,7 @@ static void parse_config(int& n_dims, double& gamma, bool& gravity_on, bool& ada
                 known = true;
                 return true;
             };
+            if (flag("IO_HERMITE_SYNC"))          g_io_hermite_sync = true;
             if (flag("SELFGRAVITY_OFF"))          gravity_on = false;
             if (flag("ADAPTIVE_GRAVSOFT_FORGAS")) adaptive_soft = true;
             if (flag("OUTPUT_POTENTIAL"))         output_potential = true;
@@ -367,6 +371,19 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
         }
         if (sim.output_potential && sim.phi.size() == n_part)
             write_scalar_field("Potential", sim.phi);
+        if (g_io_hermite_sync && t != 0) {
+            // a mutually consistent (r, v) at the output time: the Hermite predictor for
+            // particles it integrates, the plain values otherwise (io.cc, IO_HERMITE_POS/VEL)
+            std::vector<double> hx(sim.P.x), hy(sim.P.y), hz(sim.P.z), hvx(sim.vx), hvy(sim.vy), hvz(sim.vz);
+            for (size_t q = at; q < at + n_type; ++q) {
+                Vec3d x, v;
+                if (hermite_sync_state(sim, q, time - sim.time_now(), x, v)) {
+                    hx[q] = x[0]; hy[q] = x[1]; hz[q] = x[2]; hvx[q] = v[0]; hvy[q] = v[1]; hvz[q] = v[2];
+                }
+            }
+            write_vector_field("HermiteSyncCoordinates", hx, hy, hz);
+            write_vector_field("HermiteSyncVelocities", hvx, hvy, hvz);
+        }
         {
             hsize_t dims = n_type;
             hid_t space = H5Screate_simple(1, &dims, nullptr);
