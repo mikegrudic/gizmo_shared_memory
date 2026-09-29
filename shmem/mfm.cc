@@ -2556,10 +2556,13 @@ void compute_potential(Sim& sim) {
 }
 
 void set_time_base(Sim& sim, double interval, double max_step) {
-    // n = how many equal pieces the snapshot interval must be cut into for each to fit inside
-    // max_step. Using interval/n rather than max_step itself is what makes the boundary exact.
-    const double n = std::ceil(interval / max_step - 1e-12);
-    sim.dt_base = interval / std::max(1.0, n);
+    // The reference's reachable steps are interval/2^k (Timebase_interval = interval/TIMEBASE, bins
+    // powers of two), with max_step only capping the bin. So dt_base is interval/2^k for the
+    // smallest k that fits under max_step -- not interval/n for an arbitrary integer n, which puts
+    // every rung of the ladder off the reference's by a constant factor.
+    double n = 1.0;
+    while (interval / n > max_step * (1.0 + 1e-12)) n *= 2.0;
+    sim.dt_base = interval / n;
     sim.clock_ticks = 0;
 }
 

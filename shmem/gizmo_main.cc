@@ -658,9 +658,8 @@ int main(int argc, char** argv) {
     // the SNAPSHOT interval instead -- which this used to do -- makes the reachable timesteps
     // depend on the output cadence: two runs of the same problem written at different
     // TimeBetSnapshot integrate on different ladders, and neither matches GIZMO's unless the
-    // snapshot interval happens to be a power-of-two fraction of the run. With TimeMax=0.02 and
-    // MaxSizeTimestep=0.005 this gives dt_base = 0.005 = 0.02/4, so the ladder is 0.02/2^k --
-    // identical to the reference's reachable set.
+    // snapshot interval happens to be a power-of-two fraction of the run. The ladder is
+    // TimeMax/2^k, as in the reference; see set_time_base.
     set_time_base(sim, time_max - 0.0, dt_max);
     printf("shmem-GIZMO: timesteps=%s dt_base=%g\n",
            sim.individual_timesteps ? "individual" : "global", sim.dt_base);
