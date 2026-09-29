@@ -190,7 +190,27 @@ def download_test_files(test_name: str):
         raise (FileNotFoundError(f"Could not find ICs and params for test {test_name}"))
 
 
-def run_test(test_name: str, num_mpi_ranks: int = 1, num_openmp_threads: int = 0, timeout: float | None = None):
+def write_params_with_overrides(paramsfile: str, overrides: dict) -> str:
+    """Write a sibling parameter file with overrides applied, and return its name."""
+    out = paramsfile.replace(".params", "_override.params")
+    remaining = dict(overrides)
+    lines = []
+    with open(paramsfile) as f:
+        for line in f:
+            key = line.split("%")[0].split()
+            if key and key[0] in remaining:
+                lines.append(f"{key[0]}    {remaining.pop(key[0])}\n")
+            else:
+                lines.append(line)
+    lines += [f"{k}    {v}\n" for k, v in remaining.items()]
+    with open(out, "w") as f:
+        f.write(f"% generated from {paramsfile}; overrides: {overrides}\n")
+        f.writelines(lines)
+    return out
+
+
+def run_test(test_name: str, num_mpi_ranks: int = 1, num_openmp_threads: int = 0, timeout: float | None = None,
+             param_overrides: dict | None = None, restart_flag: int = 0):
     """Runs the test. If num_openmp_threads > 0, sets OMP_NUM_THREADS for the run.
     If the GIZMO subprocess exceeds the timeout, it is killed and the test is skipped
     via pytest.skip. Timeout defaults to GIZMO_TEST_TIMEOUT env var or DEFAULT_TEST_TIMEOUT.
@@ -212,13 +232,15 @@ def run_test(test_name: str, num_mpi_ranks: int = 1, num_openmp_threads: int = 0
     environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     environ.setdefault("MKL_NUM_THREADS", "1")
     paramsfile = f"{test_name}.params"
+    if param_overrides:
+        paramsfile = write_params_with_overrides(paramsfile, param_overrides)
     if environ.get("SLURM_JOB_ID"):
         cmd = ["srun", "-n", str(num_mpi_ranks), "--cpu-bind=none"]
     else:
         cmd = ["mpirun", "-np", str(num_mpi_ranks), "--use-hwthread-cpus", "--oversubscribe"]
     if num_openmp_threads > 0 and not environ.get("SLURM_JOB_ID"):
         cmd += ["--bind-to", "none"]
-    cmd += ["./GIZMO", paramsfile, "0"]
+    cmd += ["./GIZMO", paramsfile, str(restart_flag)]
 
     effective_timeout = _resolve_test_timeout(timeout)
     with open(f"test_{test_name}.out", "w") as out, open(f"test_{test_name}.err", "w") as err:
