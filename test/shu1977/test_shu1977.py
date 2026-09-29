@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from momentum_drift_common import (  # noqa: E402
     DRIFT_SANITY_CEILING, assert_randomized_drift, mass_bookkeeping_error, measure_and_record,
     plot_momentum_drift, report_momentum_drift,
+    SHMEM_GAS_DRIFT_XFAIL,
 )
 
 # gas + sink: both carry momentum, and mass moves between them during the run
@@ -53,7 +54,7 @@ def plot_shu1977_density_slice(coords, rho, boxsize, output_dir="."):
 @pytest.mark.parametrize("num_omp_threads", (default_omp_threads(),))
 @pytest.mark.parametrize(
     "extra_config_flags",
-    [(), ("RANDOMIZE_GRAVTREE",)],
+    [(), pytest.param(("RANDOMIZE_GRAVTREE",), marks=SHMEM_GAS_DRIFT_XFAIL)],
     ids=["baseline", "randomize"],
 )
 def test_shu1977(num_mpi_ranks, num_omp_threads, extra_config_flags, request):

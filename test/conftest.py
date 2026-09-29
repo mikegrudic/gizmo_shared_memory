@@ -29,13 +29,12 @@ if str(PYTHON_SRC) not in sys.path:
 # of these on does not exercise the feature -- the engine's config parser simply ignores the flag
 # and runs the baseline -- so the run is wall-clock spent to reach a foregone failure against a
 # ceiling calibrated for the feature. Worse, a permanently-red test is a test nobody reads: five of
-# these were failing on every run, and one of them (RANDOMIZE_GRAVTREE) was correctly reporting a
+# these were failing on every run, and one of them (RANDOMIZE_GRAVTREE, since implemented) was correctly reporting a
 # real deficiency that went unnoticed for exactly that reason.
 #
 # Skipped only under GIZMO_PREBUILT; the full GIZMO build implements all of these and must still be
 # held to them. Delete an entry the moment the engine gains the feature -- the skip reason names it.
 PREBUILT_UNIMPLEMENTED = {
-    "RANDOMIZE_GRAVTREE": "no tree-origin randomisation (force errors stay correlated)",
     "PMGRID": "no particle-mesh long-range gravity",
     "BOX_PERIODIC": "no Ewald summation for periodic gravity",
     "ADAPTIVE_GRAVSOFT_FORALL": "adaptive softening is gas-only (ADAPTIVE_GRAVSOFT_FORGAS)",
