@@ -896,4 +896,89 @@ void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, doubl
     }
 }
 
+long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t n_gas,
+                     const double* vx, const double* vy, const double* vz, double box,
+                     char* msg, size_t msglen) {
+    long long bad = 0;
+    auto fail = [&](const char* fmt, auto... args) {
+        if (bad++ == 0 && msg) snprintf(msg, msglen, fmt, args...);
+    };
+    const size_t N = P.size(), nn = T.nnodes();
+    if (T.parent.size() != nn || T.leaf_of.size() != N || T.wn.size() != nn || T.sn.size() != nn) {
+        fail("array sizes: nodes %lld, particles %lld", (long long)nn, (long long)N);
+        return bad;
+    }
+
+    // 1. threading and topology, without trusting parent[]
+    std::vector<uint8_t> seen_node(nn, 0), seen_part(N, 0);
+    std::vector<int> stack{T.root};
+    if (T.parent[T.root] != -1) fail("root %d has parent %d", T.root, T.parent[T.root]);
+    size_t steps = 0;
+    while (!stack.empty()) {
+        const int X = stack.back(); stack.pop_back();
+        if (X < 0 || (size_t)X >= nn) { fail("node index %d out of range %zu", X, nn); continue; }
+        if (seen_node[X]++) { fail("node %d reached twice", X); continue; }
+        if (T.first[X] < 0) {
+            for (int slot = T.plo[X]; slot < T.phi[X]; ++slot) {
+                const uint32_t p = T.orderbuf[slot];
+                if (p >= N) { fail("leaf %d holds index %u", X, p); continue; }
+                if (seen_part[p]++) fail("particle %u reached twice, leaf %d", p, X);
+                if (T.leaf_of[p] != X) fail("leaf_of[%u]=%d, but threading reaches it in leaf %d", p, T.leaf_of[p], X);
+            }
+            continue;
+        }
+        for (int c = T.first[X]; c != T.next[X]; c = T.next[c]) {
+            if (c < 0 || (size_t)c >= nn || ++steps > 2 * nn) {
+                fail("child chain of node %d never reaches next[X]=%d", X, T.next[X]);
+                break;
+            }
+            if (T.parent[c] != X) fail("parent[%d]=%d, threading says %d", c, T.parent[c], X);
+            stack.push_back(c);
+        }
+    }
+    for (size_t p = 0; p < N; ++p)
+        if (!seen_part[p]) { fail("particle %zu unreachable from the root", p); break; }
+    if (bad) return bad;   // coverage checks below climb parent[], which is only now trusted
+
+    // 2. node mass, re-derived bottom-up (children are allocated after their parent)
+    std::vector<double> msum(nn, 0.0);
+    for (size_t p = 0; p < N; ++p) msum[T.leaf_of[p]] += P.m[p];
+    for (size_t no = nn; no-- > 0;) if (T.parent[no] >= 0) msum[T.parent[no]] += msum[no];
+    for (size_t no = 0; no < nn; ++no) {
+        const double tol = 1e-10 * std::max(msum[no], T.mass[no]) + 1e-300;
+        if (std::abs(msum[no] - T.mass[no]) > tol || std::abs(T.wn[no].mass - T.mass[no]) > tol) {
+            fail("node %zu mass %.17g, particles sum to %.17g", no, T.mass[no], msum[no]);
+            break;
+        }
+    }
+
+    // 3. every ancestor covers every particle
+    const float* hm = T.hmax.empty() ? nullptr : T.hmax.data();
+    for (size_t p = 0; p < N && bad < 1000; ++p) {
+        const double sp = P.soft.empty() ? 0.0 : P.soft[p];
+        const bool gas = p < n_gas && h;
+        const double v = vx ? std::sqrt(vx[p]*vx[p] + vy[p]*vy[p] + vz[p]*vz[p]) : 0.0;
+        for (int no = T.leaf_of[p]; no >= 0; no = T.parent[no]) {
+            if (gas && hm && (double)hm[no] < h[p])
+                fail("hmax[%d]=%.9g below h=%.9g of particle %zu", no, (double)hm[no], h[p], p);
+            if ((double)T.wn[no].soft * (1.0 + 1e-6) < sp)
+                fail("node %d soft %.9g below soft=%.9g of particle %zu", no, (double)T.wn[no].soft, sp, p);
+            if (vx && (double)T.vmax[no] * (1.0 + 1e-6) < v)
+                fail("vmax[%d]=%.9g below |v|=%.9g of particle %zu", no, (double)T.vmax[no], v, p);
+            const SNode& sn = T.sn[no];
+            const double reach = (double)sn.half + (double)T.vmax[no] * T.t_since_build
+                               + 1e-6 * (double)sn.half;
+            const double d[3] = {min_image(P.x[p] - (double)sn.cx, box),
+                                 min_image(P.y[p] - (double)sn.cy, box),
+                                 min_image(P.z[p] - (double)sn.cz, box)};
+            for (int a = 0; a < 3; ++a)
+                if (std::abs(d[a]) > reach) {
+                    fail("particle %zu outside node %d box: offset %.9g > reach %.9g", p, no, std::abs(d[a]), reach);
+                    break;
+                }
+        }
+    }
+    return bad;
+}
+
 }  // namespace shmem

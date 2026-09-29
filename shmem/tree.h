@@ -319,6 +319,18 @@ struct Tree {
     }
 };
 
+// Full structural and coverage audit (SHMEM_TREE_AUDIT; the analogue of starforge_dev's
+// force_tree_full_audit). The anchor is the walk threading, verified independently of parent[]:
+// a node's children are exactly the next-chain from first[X] up to next[X]. Against that it checks
+// parent[] and leaf_of[] (a moments re-derivation alone climbs the same parent chain it would be
+// checking, so it cannot see a corrupted one), every particle reached exactly once, node mass, and
+// that every ancestor of each particle still covers it: hmax >= h, soft >= soft, vmax >= |v|, and
+// the position inside the node box plus the vmax*t_since_build pad the searches prune on.
+// Returns the number of violations; the first is described in `msg`.
+long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t n_gas,
+                     const double* vx, const double* vy, const double* vz, double box,
+                     char* msg, size_t msglen);
+
 static const int LEAF_MAX = 16;        // particles per leaf; below this, direct summation is cheaper
 static const int MAX_LEVEL = 20;       // Morton keys carry 21 bits per axis
 

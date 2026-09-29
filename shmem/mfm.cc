@@ -23,6 +23,9 @@ static constexpr double HYDROGEN_MASSFRAC = 0.76;
 // KDK margin on the sink gravity timestep, shared by the tidal and 2-body criteria so they stay
 // comparable; the Hermite path divides it out of both (timestep.cc, SINK_TIMESTEP_SAFETY_FACTOR).
 static constexpr double SINK_TIMESTEP_SAFETY_FACTOR = 0.3;
+
+static void audit_tree_if_asked(const Sim& sim, const char* where);
+
 // Neighbour-list access for the three hydro phases. With SHMEM_CACHE_NEIGHBORS the list is built
 // once per step (in solve_h_and_volumes) and the later phases read it back; without it, each
 // phase searches the tree as before. Both paths hand the caller the same `neighbours` vector, so
@@ -624,6 +627,7 @@ static inline bool atu_needs_fresh(const Sim& sim, size_t i) {
 static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
     const size_t n_part = sim.size();
     update_softenings(sim, &active);
+    audit_tree_if_asked(sim, "pre-gravity");
 
     // BATCH SPATIAL COHERENCE. accel_grouped walks once per batch of 8 targets and opens the
     // UNION of what the batch needs, so a batch only pays off when its 8 targets are spatially
@@ -1276,6 +1280,29 @@ void sync_all_positions(Sim& sim) {
 
 // Rebuild the tree at the current positions, with the per-node velocity bound initialised from the
 // current velocities. Everything must be current first.
+// SHMEM_TREE_AUDIT=1: full tree audit (audit_tree) at every rebuild and before each consumer that
+// trusts the incrementally maintained node bounds. Fatal on any violation. Diagnostic only: it is
+// O(N * depth) per call.
+static void audit_tree_if_asked(const Sim& sim, const char* where) {
+    static const bool on = getenv("SHMEM_TREE_AUDIT") != nullptr;
+    if (!on || !sim.tree_valid || sim.tree.nnodes() == 0) return;
+    char msg[512] = "";
+    const bool have_v = sim.vx.size() == sim.size();
+    const long long bad = audit_tree(sim.tree, sim.P, sim.h.size() >= sim.n_gas ? sim.h.data() : nullptr,
+                                     sim.n_gas, have_v ? sim.vx.data() : nullptr,
+                                     have_v ? sim.vy.data() : nullptr, have_v ? sim.vz.data() : nullptr,
+                                     sim.box, msg, sizeof msg);
+    static long long audits = 0;
+    ++audits;
+    if (bad) {
+        fprintf(stderr, "[tree-audit] FAILED at %s (audit %lld, clock %lld): %lld violation(s); first: %s\n",
+                where, audits, (long long)sim.clock_ticks, bad, msg);
+        abort();
+    }
+    if ((audits & (audits - 1)) == 0)
+        fprintf(stderr, "[tree-audit] %lld audits clean (last at %s)\n", audits, where);
+}
+
 static void rebuild_tree(Sim& sim) {
     sync_all_positions(sim);
     const double* vel[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
@@ -1306,6 +1333,7 @@ static void rebuild_tree(Sim& sim) {
     }
     sim.tree_valid = true;
     ++sim.tree_builds;
+    audit_tree_if_asked(sim, "rebuild");
 }
 
 // Negative definite? Sylvester's criterion on the leading principal minors -- for a symmetric 3x3
@@ -3095,6 +3123,7 @@ static void evaluate_forces(Sim& sim, const std::vector<uint32_t>& active,
             drift_particle_to(sim, active[k], sim.clock_ticks);
     }
     const Tree& tree = sim.tree;
+    audit_tree_if_asked(sim, "pre-density");
     if (et) et->tree += lap();
 
     // Actives only. A halo refresh is NOT needed: with rate accumulation an inactive particle is
@@ -3133,6 +3162,7 @@ static void evaluate_forces(Sim& sim, const std::vector<uint32_t>& active,
             sim.du_dt[i] = 0.0;
         }
     } else {
+        audit_tree_if_asked(sim, "pre-flux");
         fluxes(sim, tree, active_gas, sim.dmom_x, sim.dmom_y, sim.dmom_z, sim.denergy);
         // Rates -> per-particle records, GIZMO's hydro_final_operations_and_cleanup: the momentum
         // rate becomes an acceleration and the internal-energy rate is the total-energy rate minus
