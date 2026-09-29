@@ -531,8 +531,10 @@ int main(int argc, char** argv) {
     // The barotropic constants are tabulated against n_H in cm^-3 and return cgs pressure, so
     // both conversions are precomputed from the unit system read above.
     const double unit_density_cgs = unit_mass_cgs / (unit_length_cgs*unit_length_cgs*unit_length_cgs);
-    const double PROTONMASS = 1.6726e-24, HYDROGEN_MASSFRAC = 0.76;
-    sim.nh_per_code_density = unit_density_cgs * HYDROGEN_MASSFRAC / PROTONMASS;
+    // UNIT_DENSITY_IN_NHCGS (constants.h:114) is rho/m_p with NO hydrogen mass fraction: the EOS
+    // and PhysDensThresh use it bare. The sites that do include X say so explicitly.
+    const double PROTONMASS = 1.6726e-24;
+    sim.nh_per_code_density = unit_density_cgs / PROTONMASS;
     sim.code_press_per_cgs  = 1.0 / (unit_density_cgs * unit_vel_cgs * unit_vel_cgs);
     if (baro_variant >= 0) {
         sim.eos_law = Sim::EosLaw::BAROTROPIC;

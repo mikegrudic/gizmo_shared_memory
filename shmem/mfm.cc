@@ -17,6 +17,9 @@ extern "C" void shmem_cuda_accel_bruteforce(
 
 namespace shmem {
 
+// The reference applies X to n_H only at the opacity-limit sites (sfr_eff.cc:238,611, sink.cc:134),
+// not in the EOS, the density threshold or the Jeans mass.
+static constexpr double HYDROGEN_MASSFRAC = 0.76;
 // Neighbour-list access for the three hydro phases. With SHMEM_CACHE_NEIGHBORS the list is built
 // once per step (in solve_h_and_volumes) and the later phases read it back; without it, each
 // phase searches the tree as before. Both paths hand the caller the same `neighbours` vector, so
@@ -1587,7 +1590,7 @@ static void sink_accretion_scan(Sim& sim) {
             // sink.cc:128: re-estimate vesc from the enclosed gas alone when the cell sits at
             // the bottom of a quasi-hydrostatic Larson core.
             if (sim.opacity_limit_physics && sim.nh_per_code_density > 0) {
-                const double nH = sim.rho[j] * sim.nh_per_code_density;
+                const double nH = HYDROGEN_MASSFRAC * sim.rho[j] * sim.nh_per_code_density;
                 if (nH > 1e13 && cs_sq > 0.01 * vrel_sq) {
                     const double m_gas = 4.0*M_PI * r*r*r * sim.rho[j];
                     vesc_sq = std::max(2.0 * sim.G * m_gas / r, vesc_sq);
@@ -2185,7 +2188,7 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
             // thermal support is capped at 0.2 km/s above n_H = 1e13. The reference writes that as
             // 0.2/UNIT_VEL_IN_KMS -- it is 0.2 KM/S, not 0.2 code units, and the two coincide only
             // because these runs happen to use km/s. A STARFORGE m/s run would cap 1000x too low.
-            if (rho * sim.nh_per_code_density > 1e13 && sim.vel_to_kms > 0)
+            if (HYDROGEN_MASSFRAC * rho * sim.nh_per_code_density > 1e13 && sim.vel_to_kms > 0)
                 v_fast = std::min(v_fast, 0.2 / sim.vel_to_kms);
         }
         const double k_cs = M_PI * v_fast / std::max(particle_size, 1e-300);
@@ -2355,7 +2358,7 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         // (sfr_eff.cc:604). An EOS_ENFORCE_ADIABAT run has neither, and applying it there
         // shrinks the Jeans term for no reason.
         if (sim.opacity_limit_physics && sim.nh_per_code_density > 0) {
-            const double nH = sim.rho[last_gas] * sim.nh_per_code_density;
+            const double nH = HYDROGEN_MASSFRAC * sim.rho[last_gas] * sim.nh_per_code_density;
             if (nH > 1e10) cs_sink *= std::pow(nH / 1e10, 0.2);
         }
         // The FLOOR is the sink's own force-softening kernel radius -- ForceSoftening_KernelRadius
