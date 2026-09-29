@@ -482,7 +482,7 @@ int main(int argc, char** argv) {
                                  ? atof(params["UnitMass_in_g"].c_str()) : 1.989e43;
     const double unit_vel_cgs    = params.count("UnitVelocity_in_cm_per_s")
                                  ? atof(params["UnitVelocity_in_cm_per_s"].c_str()) : 1.0e5;
-    const double GRAVITY_CGS = 6.674e-8;
+    const double GRAVITY_CGS = 6.672e-8;   // GRAVITY_G_CGS, declarations/constants.h:83
     double grav_const = params.count("GravityConstantInternal")
                       ? atof(params["GravityConstantInternal"].c_str()) : 0.0;
     if (!(grav_const > 0))
