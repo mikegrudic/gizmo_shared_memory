@@ -41,7 +41,7 @@ struct Particles {                 // SoA: the walk reads x/y/z/m for many parti
     std::vector<double> zeta;
     // Particle type, GIZMO numbering (0 = gas; sinks/stars/DM > 0). Empty means "all gas".
     // The gravity walks need it because the PAIR RULE depends on the types (see
-    // pair_force_over_r): kernel-averaging and the zeta terms apply to gas-gas pairs only.
+    // pair_force_over_r): the zeta terms apply to gas-gas pairs only.
     std::vector<uint8_t> type;
     size_t size() const { return m.size(); }
 

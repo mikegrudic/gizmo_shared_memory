@@ -339,7 +339,10 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
                 weight_sum += kernel_w(r, sim.h[i], sim.dim);
                 // both sums INCLUDE the self term (r = 0), as GIZMO's do
                 dn_dh += kernel_dwdh(r, sim.h[i], sim.dim);
-                if (want_zeta) dphi_dh_sum += sim.P.m[j] * grav_dphi_dh(r, sim.h[i]);
+                // FORGAS zeta (gradients.cc:1759-1766): no self term, and under max-softening a
+                // pair contributes to the side whose kernel sets the pair softening, h_i > h_j
+                if (want_zeta && r > 0 && sim.h[i] > sim.h[j])
+                    dphi_dh_sum += sim.P.m[j] * grav_dphi_dh(r, sim.h[i]);
             }
             sim.ninv[i]  = 1.0 / weight_sum;             // V_i: MFM volume from partition of unity
             sim.rho[i]   = sim.P.m[i] * weight_sum;      // rho_i = m_i / V_i
@@ -352,13 +355,14 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
             }
 
             if (want_zeta) {
-                // zeta_i = m_i^2 * Omega_i^-1 * [ 0.5 * (sum m_j dphi/dh) * h / (NDIMS m_i n_i) ],
-                // with Omega the usual grad-h factor 1 + (h / NDIMS n) dn/dh, guarded as GIZMO
-                // guards it. Zero when the softening floor is binding: then eps is CONSTANT and
-                // there is no dPhi/dh term to correct for.
+                // zeta_i = m_i h_i Omega_i^-1 (sum' m_j dphi/dh) / (NDIMS n_i), the FORGAS form
+                // (gradients.cc:1075-1082). Zero off the neighbour-number target (within 5%) and
+                // when the softening floor binds, since then eps has no h dependence.
                 double zeta = 0.0;
-                if (sim.h[i] > sim.soft_min && weight_sum > 0) {
-                    zeta = 0.5 * sim.P.m[i] * sim.omega[i] * dphi_dh_sum * sim.h[i]
+                const double n_eff = (4.0 * M_PI / 3.0) * std::pow(sim.h[i], 3) * weight_sum;
+                if (sim.h[i] > sim.soft_min && weight_sum > 0 &&
+                    std::abs(n_eff - sim.des_ngb) / sim.des_ngb < 0.05) {
+                    zeta = sim.P.m[i] * sim.omega[i] * dphi_dh_sum * sim.h[i]
                            / (3.0 * weight_sum);
                 }
                 sim.P.zeta[i] = zeta;

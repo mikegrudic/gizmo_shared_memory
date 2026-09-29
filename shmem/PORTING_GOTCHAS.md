@@ -209,13 +209,16 @@ one — hence GIZMO's throwaway `gravity_tree()` at `Ti_Current == 0` (`accel.cc
 skipping of the softening/relative block there. Scoring a walk at `Ti_Current == 0` therefore
 measures Barnes-Hut alone, not the production criterion.
 
-### Adaptive softening: symmetrise, and pair the zeta terms with the averaged kernel
+### Adaptive softening: the pair rule depends on FORGAS vs FORALL
 
-For gas–gas pairs the kernel is the **average** of the two softened kernels,
-`0.5·(g(r;h_i) + g(r;h_j))`, not the kernel of `max(h)`. The Price & Monaghan zeta corrections are
-*derived* for the averaged form — pairing them with a max-softening kernel mis-cancels. Divide the
-correction by the **target's** mass, which is what keeps the pair antisymmetric
-(`m_i a_i = −m_j a_j`). Zeta is gas–gas only; nodes get max-softening and no zeta.
+Under `ADAPTIVE_GRAVSOFT_FORGAS` (what STARFORGE uses) every pair is softened on `max(h_i, h_j)`.
+Kernel averaging, `0.5·(g(r;h_i) + g(r;h_j))`, is compiled only under `ADAPTIVE_GRAVSOFT_FORALL`
+(`precompiler_logic.h:124`), and the zeta formula differs with it: FORGAS excludes the self term,
+counts a neighbour only on the side whose h sets the pair softening, drops the 0.5, and zeroes zeta
+off the neighbour-number target (`gradients.cc:1075,1759`). An earlier version of this engine
+averaged under FORGAS. Averaging lets the smaller softening through, so kernel-scale gravity came
+out up to ~2x too strong in turbulent gas, on top of a ~30-40% zeta excess. Divide the correction
+by the **target's** mass. Zeta is gas–gas only; nodes get max-softening and no zeta.
 
 Related trap: evrard's central-density deficit looked like a zeta problem and was actually the
 **slope limiters** (`a_limiter` reach and face overshoot). Entropy was the tell.

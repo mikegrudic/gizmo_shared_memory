@@ -120,25 +120,16 @@ __global__ void accel_bruteforce_kernel(
                 const R r = sqrt(r2);
                 const R mj = shm[q], epsj = sheps[q];
 
-                R fac;
-                if (!(gasi && shgas[q] != 0)) {
-                    // any pair involving a non-gas particle: kernel of the LARGER softening,
-                    // no averaging and no zeta
-                    R e = epsi > epsj ? epsi : epsj;
-                    if (!(e > R(0))) e = R(1e-30);
-                    fac = mj * spline_force_over_r<R>(r, e);
-                } else {
-                    const R et = epsi > R(0) ? epsi : R(1e-30);
+                // every pair: kernel of the LARGER softening; gas-gas adds the zeta terms, the
+                // target's at the pair softening and the source's at its own
+                R e = epsi > epsj ? epsi : epsj;
+                if (!(e > R(0))) e = R(1e-30);
+                R fac = mj * spline_force_over_r<R>(r, e);
+                if (gasi && shgas[q] != 0 && mi > R(0)) {
                     const R es = epsj > R(0) ? epsj : R(1e-30);
-                    fac = R(0.5) * mj * (spline_force_over_r<R>(r, et)
-                                       + spline_force_over_r<R>(r, es));
-                    // Price & Monaghan zeta terms, each inside its own kernel support, divided by
-                    // the TARGET mass so the pair stays antisymmetric (m_t a_t = -m_s a_s)
-                    if (mi > R(0)) {
-                        const R zs = shzeta[q];
-                        if (zti != R(0) && r < et) fac -= (zti / mi) * kernel_dwdr<R>(r, et) / r;
-                        if (zs  != R(0) && r < es) fac -= (zs  / mi) * kernel_dwdr<R>(r, es) / r;
-                    }
+                    const R zs = shzeta[q];
+                    if (zti != R(0) && r < e)  fac -= (zti / mi) * kernel_dwdr<R>(r, e) / r;
+                    if (zs  != R(0) && r < es) fac -= (zs  / mi) * kernel_dwdr<R>(r, es) / r;
                 }
                 axi += fac * dx; ayi += fac * dy; azi += fac * dz;
             }

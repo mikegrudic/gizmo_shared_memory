@@ -24,55 +24,30 @@ static inline void kick(const Vec3d& offset, double mass, double softening, Vec3
     accel += offset * (mass * spline_force_over_r(r, std::max(softening, 1e-300)));
 }
 
-// Scalar force factor for a PARTICLE-PARTICLE pair, target <- source. The pair rule depends on
-// the TYPES, exactly as in GIZMO's forcetree.cc with adaptive softening enabled:
+// Scalar force factor for a PARTICLE-PARTICLE pair, target <- source, as GIZMO's forcetree.cc
+// computes it under ADAPTIVE_GRAVSOFT_FORGAS. Every pair uses the kernel of the LARGER softening:
+// the averaged kernel (ADAPTIVE_GRAVSOFT_SYMMETRIZE_FORCE_BY_AVERAGING) is compiled only under
+// ADAPTIVE_GRAVSOFT_FORALL (precompiler_logic.h:124). Averaging lets the smaller softening through
+// inside the kernel, i.e. stronger gravity below the hydro resolution.
 //
-//  * GAS-GAS: the pair kernel is the AVERAGE of the two softened kernels,
-//    0.5*(g(r;eps_t) + g(r;eps_s)), not the kernel of max(eps)
-//    (ADAPTIVE_GRAVSOFT_SYMMETRIZE_FORCE_BY_AVERAGING, on by default with AGS) -- plus the
-//    Price & Monaghan (2007) zeta correction, -(zeta_t W'(r;eps_t) + zeta_s W'(r;eps_s)) /
-//    (m_TARGET r), each term only inside its own kernel support. The zeta terms are DERIVED for
-//    the averaged kernel; pairing them with a max-softening kernel would mis-cancel. Dividing by
-//    the mass of the particle whose acceleration is being summed is what keeps the pair's
-//    correction antisymmetric -- m_t a_t = -m_s a_s -- so momentum survives the correction.
+// Gas-gas pairs add the zeta correction (forcetree.cc:2194-2214): the target's term uses the pair
+// softening max(et,es), the source's term its own softening, each gated on r inside that kernel,
+// both divided by the TARGET's mass. Nodes get max-softening and no zeta.
 //
-//  * ANY OTHER PAIR (gas-sink, sink-sink, gas-DM, ...): the kernel of the LARGER softening, no
-//    zeta. GIZMO restricts averaging to types sharing the AGS kernel structure, and under
-//    SINGLE_STAR_SINK_DYNAMICS explicitly excludes sink pairs from it ("can create very noisy
-//    interactions between tiny sink particles and diffuse gas"). Zeta terms are FORGAS gas-gas
-//    only.
-//
-// For r beyond both softenings every branch is exactly Newtonian. Node/monopole interactions get
-// the max-softening rule and no zeta: a node has no single zeta (GIZMO sets zeta=0 for
-// pseudo-particles), and any pair close enough for corrections to matter is inside a kernel
-// radius, which the opening criterion resolves down to actual particles anyway.
-// `base_out`, when non-null, receives the zeta-free force factor -- the same
-// 0.5*m*(W'(r,et)+W'(r,es)) the tidal tensor and the jerk need. Handing it back costs nothing and
-// saves recomputing both spline evaluations at the call site: with the tidal tensor on that was
-// four spline_force_over_r calls per gas-gas pair where two suffice.
+// `base_out`, when non-null, receives the zeta-free force factor the tidal tensor and jerk need.
 static inline double pair_force_over_r(double r, double mass_source,
                                        double eps_target, double eps_source,
                                        double zeta_target, double zeta_source,
                                        double mass_target, bool gas_gas,
                                        double* base_out = nullptr) {
-    if (!gas_gas) {
-        const double f = mass_source *
-            spline_force_over_r(r, std::max(std::max(eps_target, eps_source), 1e-300));
-        if (base_out) *base_out = f;
-        return f;
-    }
-    const double et = std::max(eps_target, 1e-300), es = std::max(eps_source, 1e-300);
-    // The symmetric average over BOTH softenings, not one evaluation at max(et,es): that is what
-    // keeps the gas-gas pair force antisymmetric under adaptive softening. Measured cost of the
-    // second evaluation is 7.8% of the acceleration walk -- cheap for what it guarantees.
-    const double base = 0.5 * mass_source *
-                        (spline_force_over_r(r, et) + spline_force_over_r(r, es));
+    const double e = std::max(std::max(eps_target, eps_source), 1e-300);
+    const double base = mass_source * spline_force_over_r(r, e);
     if (base_out) *base_out = base;
+    if (!gas_gas || mass_target <= 0) return base;
     double fac = base;
-    if (mass_target > 0) {
-        if (zeta_target != 0.0 && r < et) fac -= (zeta_target / mass_target) * kernel_dwdr(r, et, 3) / r;
-        if (zeta_source != 0.0 && r < es) fac -= (zeta_source / mass_target) * kernel_dwdr(r, es, 3) / r;
-    }
+    const double es = std::max(eps_source, 1e-300);
+    if (zeta_target != 0.0 && r < e)  fac -= (zeta_target / mass_target) * kernel_dwdr(r, e, 3) / r;
+    if (zeta_source != 0.0 && r < es) fac -= (zeta_source / mass_target) * kernel_dwdr(r, es, 3) / r;
     return fac;
 }
 
@@ -664,8 +639,8 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
             //
             // Safe because the softening-overlap arm of the criterion opens any node whose
             // particles could reach the target's kernel. Beyond that overlap the spline is
-            // Newtonian on both softenings, so the gas-gas kernel average degenerates to the
-            // single evaluation the multipole applies, and the zeta corrections (r < h only) are
+            // Newtonian, so the pair kernel equals the single evaluation the multipole
+            // applies, and the zeta corrections (r < h only) are
             // identically zero. Accepting a leaf therefore drops nothing that was contributing.
             // SHMEM_NO_LEAF_ACCEPT restores the pre-0f0ae23d behaviour: leaves are always opened
             // and direct-summed rather than being offered to the criterion. Diagnostic only --
@@ -718,19 +693,13 @@ void accel_grouped(const Tree& T, const Particles& P, const std::vector<uint32_t
                             oax[i] += dx_*fac; oay[i] += dy_*fac; oaz[i] += dz_*fac;
                             if (want_tidal || want_jerk) {
                                 // g1 (the zeta-free force factor) comes back from the force call
-                                // above rather than being recomputed -- it is the same average of
-                                // spline_force_over_r over the two softenings. Only the mode-2
+                                // above rather than being recomputed -- the same max-softening
+                                // spline_force_over_r. Only the mode-2
                                 // factor is new here. Shared by the tidal tensor and the jerk,
                                 // which is why the reference accumulates the jerk in this loop
                                 // rather than in a pass of its own.
-                                double g2;
-                                if (tgas[i] && qgas) {
-                                    const double et = std::max(te[i],1e-300), es = std::max(qs,1e-300);
-                                    g2 = 0.5*qm*(grav_tidal_factor(r,et)+grav_tidal_factor(r,es));
-                                } else {
-                                    const double e = std::max(std::max(te[i],qs),1e-300);
-                                    g2 = qm*grav_tidal_factor(r,e);
-                                }
+                                const double g2 =
+                                    qm*grav_tidal_factor(r, std::max(std::max(te[i],qs),1e-300));
                                 if (want_tidal) {
                                     ott[0][i] += -g1 + dx_*dx_*g2;   // xx
                                     ott[1][i] += -g1 + dy_*dy_*g2;   // yy
@@ -820,7 +789,6 @@ void potential(const Tree& tree, const Particles& particles, const std::vector<u
         const uint32_t target = targets[t];
         const Vec3d pos_target = particles.pos(target);
         const double soft_target = particles.soft.empty() ? 0.0 : particles.soft[target];
-        const bool gas_target = particles.is_gas(target);
         const double aold_t = aold ? aold[t] : 0.0;
         double sum = 0;
         const WNode* __restrict nodes = tree.wn.data();
@@ -839,17 +807,10 @@ void potential(const Tree& tree, const Particles& particles, const std::vector<u
                         if (j == target) continue;
                         const double r = (particles.pos(j) - pos_target).norm();
                         if (r <= 0) continue;
-                        // gas-gas: average of the two softened kernels, consistent with the pair
-                        // force; other pairs: kernel of the larger softening, same as the force
+                        // kernel of the larger softening, same as the pair force
                         const double soft_j = particles.soft.empty() ? 0.0 : particles.soft[j];
-                        if (gas_target && particles.is_gas(j)) {
-                            sum += particles.m[j] * 0.5 *
-                                   (spline_potential(r, std::max(soft_target, 1e-300)) +
-                                    spline_potential(r, std::max(soft_j, 1e-300)));
-                        } else {
-                            sum += particles.m[j] *
-                                   spline_potential(r, std::max(std::max(soft_target, soft_j), 1e-300));
-                        }
+                        sum += particles.m[j] *
+                               spline_potential(r, std::max(std::max(soft_target, soft_j), 1e-300));
                     }
                 } else {
                     const double soft = std::max(soft_target, (double)node.soft);
