@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cfloat>
 #include <parallel/algorithm>
 
 static double now_ms(){using c=std::chrono::steady_clock;
@@ -415,18 +416,19 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     // Pack the traversal copies. WNode (64 B) serves the gravity walk; SNode (32 B) serves the
     // neighbour search, which needs the node's box rather than its centre of mass.
     //
-    // SAFETY EPSILON on the search node's half-side. Its centre is float, so |centre - target| can
-    // be off by ~2 ulp of the box extent; inflating `half` by 1e-6 of the root size covers that by
-    // orders of magnitude while costing ~0.05% in prune radius at h ~ 1e-3. The prune must only
-    // ever err towards opening -- rejecting a node that holds a true neighbour is a silent wrong
-    // answer, not a slow one.
+    // SAFETY EPSILON on the search node's half-side. Its centre is float, so it is off by up to
+    // ~1 ulp of the COORDINATE's magnitude -- which for a compact system far from the origin can
+    // exceed any fraction of the root size. Inflate `half` by 1e-6 of the root size plus 4 float ulps
+    // of the centre's largest coordinate. The prune must only ever err towards opening --
+    // rejecting a node that holds a true neighbour is a silent wrong answer, not a slow one.
     const double snode_eps = 1e-6 * (T.nnodes() ? T.size[T.root] : 1.0);
     T.sn.resize(T.nnodes());
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < T.nnodes(); ++i) {
         SNode& sq = T.sn[i];
         sq.cx = (float)T.gcx[i]; sq.cy = (float)T.gcy[i]; sq.cz = (float)T.gcz[i];
-        sq.half  = (float)(0.5 * T.size[i] + snode_eps);
+        const double cmax = std::max(std::fabs(T.gcx[i]), std::max(std::fabs(T.gcy[i]), std::fabs(T.gcz[i])));
+        sq.half  = (float)(0.5 * T.size[i] + snode_eps + 4.0 * FLT_EPSILON * cmax);
         sq.first = T.first[i]; sq.next = T.next[i];
         sq.plo = T.plo[i]; sq.phi = T.phi[i];
     }
