@@ -657,7 +657,9 @@ static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32
     } else {
         targets.clear();
         targets.reserve(active.size());
-        for (size_t r = 0; r < n_part; ++r) {
+        // orderbuf holds only the particles in the tree (tombstones are left out), so it can be
+        // shorter than n_part
+        for (size_t r = 0; r < tree.orderbuf.size(); ++r) {
             const uint32_t i = tree.orderbuf[r];
             if (sim.is_active(i)) targets.push_back(i);
         }
