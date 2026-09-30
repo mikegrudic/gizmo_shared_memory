@@ -627,6 +627,7 @@ static inline bool atu_needs_fresh(const Sim& sim, size_t i) {
 static void compute_gravity(Sim& sim, const Tree& tree, const std::vector<uint32_t>& active) {
     const size_t n_part = sim.size();
     update_softenings(sim, &active);
+    sim.tree.refresh_walk_nodes(sim.tree.t_since_build);
     audit_tree_if_asked(sim, "pre-gravity");
 
     // BATCH SPATIAL COHERENCE. accel_grouped walks once per batch of 8 targets and opens the
@@ -1192,6 +1193,8 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
 static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
     const long long from = sim.last_drift[i];
     if (from >= target) return;
+    // a tombstone is parked outside the box; folding it would bring it back
+    if (sim.P.m[i] <= 0) { sim.last_drift[i] = target; return; }
     const double dt = sim.time_of_ticks(target - from);
     Vec3d pos_new = sim.P.pos(i) + Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]} * dt;
     if (sim.box > 0) pos_new = fold_into_box(pos_new, sim.box);
@@ -1288,10 +1291,17 @@ static void audit_tree_if_asked(const Sim& sim, const char* where) {
     if (!on || !sim.tree_valid || sim.tree.nnodes() == 0) return;
     char msg[512] = "";
     const bool have_v = sim.vx.size() == sim.size();
+    std::vector<double> dt_behind;
+    if (sim.last_drift.size() == sim.size()) {
+        dt_behind.resize(sim.size());
+        for (size_t i = 0; i < sim.size(); ++i)
+            dt_behind[i] = sim.time_of_ticks(sim.clock_ticks - sim.last_drift[i]);
+    }
     const long long bad = audit_tree(sim.tree, sim.P, sim.h.size() >= sim.n_gas ? sim.h.data() : nullptr,
                                      sim.n_gas, have_v ? sim.vx.data() : nullptr,
                                      have_v ? sim.vy.data() : nullptr, have_v ? sim.vz.data() : nullptr,
-                                     sim.box, msg, sizeof msg);
+                                     sim.box, dt_behind.empty() ? nullptr : dt_behind.data(),
+                                     msg, sizeof msg);
     static long long audits = 0;
     ++audits;
     if (bad) {
@@ -1306,8 +1316,8 @@ static void audit_tree_if_asked(const Sim& sim, const char* where) {
 static void rebuild_tree(Sim& sim) {
     sync_all_positions(sim);
     const double* vel[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
-    // Per-node centre-of-mass velocities only when a Hermite jerk will ask for them.
-    sim.tree = build(sim.P, nullptr, vel, sim.hermite_mask != 0,
+    // Node velocities feed the incremental moments that let the tree outlive a step.
+    sim.tree = build(sim.P, nullptr, vel, true,
                      sim.randomize_gravtree ? sim.tree_builds : -1);
     sim.tree.t_since_build = 0.0;
     sim.tree.init_hmax(sim.h, sim.n_gas);
@@ -1324,7 +1334,7 @@ static void rebuild_tree(Sim& sim) {
     }
     // vcom was just built from these velocities and the node dp accumulators are zero, so this
     // is the baseline every later kick is measured against.
-    if (sim.hermite_mask != 0) {
+    {
         const size_t n = sim.size();
         sim.vel_at_last_kick.resize(n);
         #pragma omp parallel for schedule(static)
@@ -1333,6 +1343,7 @@ static void rebuild_tree(Sim& sim) {
     }
     sim.tree_valid = true;
     ++sim.tree_builds;
+    sim.forces_since_build = 0;
     audit_tree_if_asked(sim, "rebuild");
 }
 
@@ -1566,6 +1577,23 @@ static double sink_mdot(const Sim& sim, size_t i, double dt) {
     return t_acc > 0 ? sim.sink_reservoir[i] / t_acc : 0.0;
 }
 
+// Tell the reused tree that particle i jumped from state 0 to state 1 outside a drift or kick
+// (an accretion merge). Moments get the exact change; the leaf's vmax absorbs the displacement,
+// so the node box plus vmax*tau still bounds the particle at every later tau.
+static void track_state_change(Sim& sim, size_t i, double m0, const Vec3d& x0, const Vec3d& v0,
+                               double m1, const Vec3d& x1, const Vec3d& v1) {
+    if (!sim.tree_valid || i >= sim.tree.leaf_of.size() || sim.tree.leaf_of[i] < 0) return;
+    const int leaf = sim.tree.leaf_of[i];
+    const double tau = sim.tree.t_since_build;
+    sim.tree.mass_event(leaf, -m0, x0, v0, tau, sim.box);
+    sim.tree.mass_event(leaf,  m1, x1, v1, tau, sim.box);
+    if (sim.vel_at_last_kick.size() == sim.size()) sim.vel_at_last_kick[i] = v1;
+    const double jump = min_image(x1 - x0, sim.box).norm();
+    if (jump > 0 && tau <= 0) { sim.tree_valid = false; return; }   // a pad cannot encode it at tau=0
+    const double v_bound = std::max((double)sim.tree.vmax[leaf], v1.norm()) + (jump > 0 ? jump / tau : 0.0);
+    sim.tree.raise_vmax(leaf, (float)(v_bound * (1.0 + 1e-6)));
+}
+
 static void sink_accretion_scan(Sim& sim) {
     if (!sim.sink_formation || sim.n_gas >= sim.size()) return;
     static const bool diag = getenv("SHMEM_SINK_DIAG") != nullptr;
@@ -1699,6 +1727,8 @@ static void sink_accretion_scan(Sim& sim) {
             const Vec3d vs_sync = Vec3d{sim.vx[sph], sim.vy[sph], sim.vz[sph]} - kick_s;
             const Vec3d vj_sync = Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]}
                                 - (have_debt ? sim.a_grav[j] * owed_j : Vec3d{0,0,0});
+            const double m_old = sim.P.m[sph];
+            const Vec3d x_old = sim.P.pos(sph), v_old{sim.vx[sph], sim.vy[sph], sim.vz[sph]};
             const double m_new = sim.P.m[sph] + sim.P.m[j];
             const Vec3d v_sync = (vs_sync * sim.P.m[sph] + vj_sync * sim.P.m[j]) / m_new;
             const Vec3d v_store = v_sync + kick_s;
@@ -1719,6 +1749,7 @@ static void sink_accretion_scan(Sim& sim) {
                 sim.P.x[sph] = pos_new[0]; sim.P.y[sph] = pos_new[1]; sim.P.z[sph] = pos_new[2];
             }
             sim.P.m[sph] = m_new;
+            track_state_change(sim, sph, m_old, x_old, v_old, m_new, sim.P.pos(sph), v_store);
             // Swallowed gas enters the unresolved disk, not the star. P.m already carries it --
             // this only records how much of that total has yet to drain, which is what sets Mdot.
             if (sim.sink_reservoir.size() == sim.size()) sim.sink_reservoir[sph] += sim.P.m[j];
@@ -1766,12 +1797,25 @@ static void sink_accretion_remove(Sim& sim) {
     // that can silently break the books. Check the total against t=0 every time it fires.
     // DESCENDING: removing index j swaps in the particle at n_gas-1, which is always >= j, so a
     // still-pending (smaller) index is never the one moved into place.
-    std::sort(doomed.begin(), doomed.end(), std::greater<uint32_t>());
-    for (uint32_t j : doomed) remove_gas_particle(sim, j);
+    // TOMBSTONE rather than delete, as the reference does (Mass = 0, sink_swallow_and_kick.cc:477):
+    // deleting reorders the arrays, which condemns the tree and forced a full rebuild on almost
+    // every deep-bin step. The cell leaves the node moments, is parked outside the box with no
+    // mass or velocity, and is compacted away between steps (compact_dead_cells).
+    for (uint32_t j : doomed) {
+        drift_particle_to(sim, j, sim.clock_ticks);
+        if (sim.tree_valid && j < sim.tree.leaf_of.size() && sim.tree.leaf_of[j] >= 0)
+            sim.tree.mass_event(sim.tree.leaf_of[j], -sim.P.m[j], sim.P.pos(j),
+                                Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]}, sim.tree.t_since_build,
+                                sim.box);
+        sim.P.m[j] = 0.0;
+        sim.vx[j] = sim.vy[j] = sim.vz[j] = 0.0;
+        sim.P.x[j] = sim.P.y[j] = sim.P.z[j] = 1e30;
+        if (!sim.P.zeta.empty()) sim.P.zeta[j] = 0.0;
+        ++sim.n_dead;
+    }
     doomed.clear();
     audit_step(sim, p_acc, "acc:removal");
-    // Every index the tree and the neighbour cache hold is now wrong.
-    sim.ngb_cache.clear(); sim.tree_valid = false;
+    sim.ngb_cache.clear();
     if (sim.mass_initial > 0) {
         double total = 0.0;
         for (size_t i = 0; i < sim.size(); ++i) total += sim.P.m[i];
@@ -1781,6 +1825,19 @@ static void sink_accretion_remove(Sim& sim) {
                     "gas=%zu sinks=%zu accreted=%lld\n", total, sim.mass_initial, err,
                     sim.n_gas, sim.size() - sim.n_gas, sim.cells_accreted);
     }
+}
+
+void compact_dead_cells(Sim& sim) {
+    if (sim.n_dead == 0) return;
+    std::vector<uint32_t> dead;
+    for (size_t j = 0; j < sim.n_gas; ++j) if (sim.P.m[j] <= 0) dead.push_back((uint32_t)j);
+    // descending: removing j moves the particle at n_gas-1 (>= j) into place
+    std::sort(dead.begin(), dead.end(), std::greater<uint32_t>());
+    for (uint32_t j : dead) remove_gas_particle(sim, j);
+    sim.n_dead = 0;
+    sim.ngb_cache.clear();
+    sim.tree_valid = false; sim.pending_rebuild_reason = Sim::REBUILD_INVALID;
+    ++sim.rebuilds_by[Sim::REBUILD_TOMBSTONES];
 }
 
 // SINGLE_STAR_TIMESTEPPING: per-particle minimum approach and freefall times to the SINK
@@ -1985,6 +2042,7 @@ static void hermite_eval_group(Sim& sim, const std::vector<uint32_t>& targets,
             sim.last_drift[i] = sim.clock_ticks;   // current: the walk must not catch it up
         }
     }
+    sim.tree.refresh_walk_nodes(sim.tree.t_since_build);
     const double* vel_arrays[3] = {sim.vx.data(), sim.vy.data(), sim.vz.data()};
     const LazyDrift ld = lazy_drift_hook(sim);
     accel_grouped(sim.tree, sim.P, targets, sim.theta, sim.G, 0, ax, ay, az,
@@ -2117,7 +2175,7 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
     // and post-correction states. The phasing also means every evaluation sees its partner at
     // the PREDICTED state, which is what the corrector's error analysis assumes.
     const size_t nt = targets.size();
-    std::vector<Vec3d> vel_true(nt);
+    std::vector<Vec3d> vel_true(nt), pos_kdk(nt);
     std::vector<uint8_t> stepping(nt, 0), eligible(nt, 0);
 
     // Phase A: undo the forward half-kick; write PREDICTED pos/vel for the stepping targets so
@@ -2130,6 +2188,7 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
         // find_next_sync_point_and_drift at :156). x0/v0/a0/j0 come from hermite_snapshot, taken
         // before the kick, so there is no half kick to undo here.
         vel_true[k] = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]};
+        pos_kdk[k] = sim.P.pos(i);
         eligible[k] = hermite_eligible(sim, i, dt_new) ? 1 : 0;
         // The interval is what the CLOCK says elapsed since the snapshot, never a stored dt.
         const double h_elapsed = sim.time_of_ticks(sim.clock_ticks - sim.herm_tick[i]);
@@ -2195,6 +2254,19 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
             Vec3d pos_c = x0 + (vel_true[k] + v0) * (h * 0.5) + (a0 - a1) * (h * h / 12.0);
             if (sim.box > 0) pos_c = fold_into_box(pos_c, sim.box);
             sim.P.x[i] = pos_c[0]; sim.P.y[i] = pos_c[1]; sim.P.z[i] = pos_c[2];
+            // The reused tree tracked this sink ballistically at its KDK position; the corrector
+            // moves it off that line. Velocity reaches the tree through the kick feed below.
+            if (sim.tree_valid && i < sim.tree.leaf_of.size() && sim.tree.leaf_of[i] >= 0) {
+                const int leaf = sim.tree.leaf_of[i];
+                const Vec3d dx = min_image(pos_c - pos_kdk[k], sim.box);
+                sim.tree.shift_node(leaf, sim.P.m[i], dx);
+                const double tau = sim.tree.t_since_build;
+                if (tau > 0)
+                    sim.tree.raise_vmax(leaf, (float)(((double)sim.tree.vmax[leaf] + dx.norm() / tau)
+                                                      * (1.0 + 1e-6)));
+                else
+                    sim.tree_valid = false;
+            }
             sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
         }
     }
@@ -2663,6 +2735,7 @@ void compute_potential(Sim& sim) {
     if (!sim.gravity_on) return;
     sync_all_positions(sim);        // GIZMO gravity/potential.cc:68 -- everyone, before the walk
     if (!sim.tree_valid || sim.tree.nnodes() == 0) rebuild_tree(sim);
+    sim.tree.refresh_walk_nodes(sim.tree.t_since_build);
     std::vector<uint32_t> all_particles(n_part);
     for (size_t i = 0; i < n_part; ++i) all_particles[i] = (uint32_t)i;
     potential(sim.tree, sim.P, all_particles, sim.theta, sim.G, sim.phi);
@@ -3047,7 +3120,7 @@ static void gather_active(Sim& sim) {
             mine.clear();
             #pragma omp for schedule(static) nowait
             for (size_t i = 0; i < n_part; ++i)
-                if ((sim.clock_ticks & (sim.ticks_in_bin(sim.bin[i]) - 1)) == 0)
+                if ((sim.clock_ticks & (sim.ticks_in_bin(sim.bin[i]) - 1)) == 0 && sim.P.m[i] > 0)
                     mine.push_back((uint32_t)i);
         }
         size_t total = 0;
@@ -3108,10 +3181,23 @@ static void evaluate_forces(Sim& sim, const std::vector<uint32_t>& active,
     // because past that the inflated prune starts opening nodes it does not need.
     const double max_drift = (sim.tree_valid && sim.tree.nnodes() > 0)
                            ? (double)sim.tree.vmax[sim.tree.root] * sim.tree.t_since_build : 0.0;
-    const bool must_rebuild = !sim.tree_valid || sim.tree.nnodes() == 0 ||
-                              typical_h <= 0.0 ||
-                              max_drift > sim.tree_rebuild_pad_frac * typical_h;
-    if (must_rebuild) rebuild_tree(sim);
+    // Otherwise the tree is REUSED with incremental moments, as the reference reuses it via
+    // force_update_tree. Beyond the drift pad, rebuild on the reference's cadence: forces since the
+    // build over TreeDomainUpdateFrequency of the particles (run.cc:164).
+    int reason = -1;
+    if (!sim.tree_valid || sim.tree.nnodes() == 0 || typical_h <= 0.0)
+        reason = sim.pending_rebuild_reason;
+    else if ((double)(sim.forces_since_build + (long long)active.size())
+             > sim.tree_update_freq * (double)sim.size())
+        reason = Sim::REBUILD_CUMULATIVE;
+    else if (max_drift > sim.tree_rebuild_pad_frac * typical_h)
+        reason = Sim::REBUILD_DRIFT;
+    if (reason >= 0) {
+        ++sim.rebuilds_by[reason];
+        sim.pending_rebuild_reason = Sim::REBUILD_INVALID;
+        rebuild_tree(sim);
+    }
+    sim.forces_since_build += (long long)active.size();
     // Make the ACTIVE set current before anything reads a position -- GIZMO's core/run.cc:588,
     // "drift the active timebins at each sync". Parallel over a list with no duplicates, so no
     // lock. Everyone else is caught up on touch, by the hook below.
@@ -3559,7 +3645,13 @@ double mfm_step(Sim& sim, double dt_max) {
     // point a gas particle's velocity changes. (Hermite-corrected sinks get the same feed after
     // the corrector, below.) The climb stops at the first ancestor that already covers the speed,
     // so in steady state this is one relaxed load per active particle.
+    // A step moving more than TreeDomainUpdateFrequency of the particles rebuilds the tree anyway
+    // (run.cc:176), so climbing the ancestors of every one of them would be wasted.
+    if (sim.tree_valid && (double)active.size() > sim.tree_update_freq * (double)n_part) {
+        sim.tree_valid = false; sim.pending_rebuild_reason = Sim::REBUILD_BIGSTEP;
+    }
     if (sim.tree_valid && !sim.tree.leaf_of.empty()) {
+        const double tau = sim.tree.t_since_build;
         #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < active.size(); ++k) {
             const uint32_t i = active[k];
@@ -3567,11 +3659,10 @@ double mfm_step(Sim& sim, double dt_max) {
             if (leaf < 0) continue;
             const Vec3d v_now{sim.vx[i], sim.vy[i], sim.vz[i]};
             sim.tree.raise_vmax(leaf, (float)v_now.norm());
-            // ... and the node MOMENTUM, the other half of force_kick_node: node_vel() reads
-            // vcom + dp/mass, so the jerk sees where a node's mass is actually going rather
-            // than where it was going at build time.
+            // ... and the node MOMENTUM, the other half of force_kick_node, which is what keeps
+            // the incremental node COM and velocity exact between rebuilds.
             if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == n_part)
-                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i]);
+                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i], tau);
             if (sim.vel_at_last_kick.size() == n_part) sim.vel_at_last_kick[i] = v_now;
         }
     }
@@ -3637,6 +3728,7 @@ double mfm_step(Sim& sim, double dt_max) {
     // point is exactly that: if a spurious second sink still forms with the first one immovable,
     // then the fragmentation is something the GAS does.
     static const bool pin_sinks = getenv("SHMEM_SINK_PINNED") != nullptr;
+    if (pin_sinks && sim.n_gas < n_part) sim.tree_valid = false;   // teleports sinks; not tracked
     if (pin_sinks && sim.n_gas < n_part) {
         if (sim.sink_pin_x.size() != n_part) {
             sim.sink_pin_x.resize(n_part, 0.0); sim.sink_pin_y.resize(n_part, 0.0);
@@ -3694,7 +3786,8 @@ double mfm_step(Sim& sim, double dt_max) {
             const Vec3d v_now{sim.vx[i], sim.vy[i], sim.vz[i]};
             sim.tree.raise_vmax(leaf, (float)v_now.norm());
             if (!sim.tree.dp_x.empty() && sim.vel_at_last_kick.size() == sim.size())
-                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i]);
+                sim.tree.kick_node(leaf, (v_now - sim.vel_at_last_kick[i]) * sim.P.m[i],
+                                   sim.tree.t_since_build);
             if (sim.vel_at_last_kick.size() == sim.size()) sim.vel_at_last_kick[i] = v_now;
         }
     }
@@ -3744,6 +3837,10 @@ double mfm_step(Sim& sim, double dt_max) {
                             " time)\n",
                     c_steps, sim.tree_builds, c_tree*1e-3, c_dens*1e-3, c_grad*1e-3, c_grav*1e-3,
                     c_bins*1e-3, c_flux*1e-3, c_drift*1e-3, 100.0*c_drift/tot);
+            fprintf(stderr, "[prof-rebuild] invalid=%lld bigstep=%lld cumulative=%lld drift=%lld "
+                    "compactions=%lld\n", sim.rebuilds_by[Sim::REBUILD_INVALID],
+                    sim.rebuilds_by[Sim::REBUILD_BIGSTEP], sim.rebuilds_by[Sim::REBUILD_CUMULATIVE],
+                    sim.rebuilds_by[Sim::REBUILD_DRIFT], sim.rebuilds_by[Sim::REBUILD_TOMBSTONES]);
             for (int b = 0; b < NBUCK; ++b) {
                 if (!b_n[b]) continue;
                 fprintf(stderr, "[prof-bucket] active %-7s %6lld steps  grav %7.1f s (%4.1f%% of "

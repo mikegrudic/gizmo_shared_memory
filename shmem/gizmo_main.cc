@@ -672,6 +672,8 @@ int main(int argc, char** argv) {
     // reads node centres-of-mass as they were AT BUILD TIME, so this directly controls a force
     // error that the neighbour-search padding does not cover. 0 rebuilds every sync, for A/B.
     if (const char* tp = getenv("SHMEM_TREE_PAD_FRAC")) sim.tree_rebuild_pad_frac = atof(tp);
+    if (params.count("TreeDomainUpdateFrequency"))
+        sim.tree_update_freq = atof(params["TreeDomainUpdateFrequency"].c_str());
     // Anchor the integer timeline on the WHOLE RUN, exactly as the reference does
     // (core/init.cc:114, Timebase_interval = (TimeMax - TimeBegin)/TIMEBASE). Anchoring it on
     // the SNAPSHOT interval instead -- which this used to do -- makes the reachable timesteps
@@ -793,6 +795,9 @@ int main(int argc, char** argv) {
         }
         const double dt_taken = mfm_step(sim, dt_allowed);
         time = sim.individual_timesteps ? sim.time_now() : time + dt_taken;
+        // Swallowed cells are tombstoned in place; drop them once there are enough to matter.
+        // Between steps is the one point no particle index is held.
+        if ((double)sim.n_dead > sim.tree_update_freq * (double)sim.size()) compact_dead_cells(sim);
         ++n_steps;
         const double wall_elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
@@ -819,6 +824,7 @@ int main(int argc, char** argv) {
         // extra, which is what OutputListOn will need.
         while (sim.individual_timesteps && sim.clock_ticks >= next_snapshot_ticks
                && next_snapshot_ticks < end_ticks) {
+            compact_dead_cells(sim);   // snapshots carry no tombstones
             if (sim.output_potential) compute_potential(sim);
             sync_all_positions(sim);
             write_snapshot_at(sim, particle_ids, outdir, snapshot_num++,
@@ -828,12 +834,14 @@ int main(int argc, char** argv) {
         }
         if (!sim.individual_timesteps &&
             time >= std::min(next_snapshot_time, time_max) - 1e-12 && next_snapshot_time < time_max) {
+            compact_dead_cells(sim);
             if (sim.output_potential) compute_potential(sim);
             sync_all_positions(sim);
             write_snapshot(sim, particle_ids, outdir, snapshot_num++, time, box);
             next_snapshot_time += dt_snapshot;
         }
     }
+    compact_dead_cells(sim);
     if (sim.output_potential) compute_potential(sim);
     sync_all_positions(sim);
     write_snapshot(sim, particle_ids, outdir, snapshot_num, time, box);

@@ -345,6 +345,16 @@ struct Sim {
     bool   tree_valid = false;
     double tree_rebuild_pad_frac = 0.25;  // rebuild once pad exceeds this fraction of a typical h
     long long tree_builds = 0;         // diagnostic; also seeds the randomised root offset
+    // Tree reuse cadence (GIZMO's TreeDomainUpdateFrequency, run.cc:162-177): rebuild when one
+    // step, or the forces computed since the last build, exceed this fraction of the particles.
+    double tree_update_freq = 0.005;
+    long long forces_since_build = 0;
+    enum RebuildReason { REBUILD_INVALID, REBUILD_BIGSTEP, REBUILD_CUMULATIVE, REBUILD_DRIFT,
+                         REBUILD_TOMBSTONES /* counts compactions */, REBUILD_NREASONS };
+    long long rebuilds_by[REBUILD_NREASONS] = {0, 0, 0, 0, 0};
+    int pending_rebuild_reason = REBUILD_INVALID;   // why tree_valid was last cleared
+    // Swallowed cells awaiting compaction: massless, parked outside the box, never active.
+    size_t n_dead = 0;
     // RANDOMIZE_GRAVTREE: redraw the tree's root offset on every build so the walk's force errors
     // are decorrelated between steps rather than repeating. A fixed grid's errors are the same
     // every step and integrate into a secular drift; redrawn ones average out.
@@ -437,6 +447,9 @@ void hermite_report();
 // IO_HERMITE_SYNC: the (x, v) of particle i at time_now() + dt_offset from its Hermite predictor,
 // a mutually consistent pair. False for particles not integrated by Hermite (use plain values).
 bool hermite_sync_state(const Sim& sim, size_t i, double dt_offset, Vec3d& x, Vec3d& v);
+// Remove tombstoned (swallowed) cells from the particle arrays. Invalidates every held index and
+// the tree; call only between steps (e.g. before writing a snapshot).
+void compact_dead_cells(Sim& sim);
 void print_timebins(const Sim& sim, double systemstep, double time);
 
 // Diagnostics used by the tests.

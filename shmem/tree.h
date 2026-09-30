@@ -283,15 +283,19 @@ struct Tree {
     // Without it vcom is only right at build time and every subsequent kick makes it staler; the
     // node velocity a walk should use is vcom + dp/mass.
     std::vector<double> dp_x, dp_y, dp_z;
+    // Incremental moments, so the tree can be reused across steps (GIZMO's force_update_tree +
+    // force_drift_node) instead of rebuilt. With tau = time since the build, each node's
+    //     mass M(tau)     = mass + dmass
+    //     momentum P(tau) = mass*vcom + dp
+    //     COM(tau)        = (mass*C + P*tau - dq) / M(tau),    C = build-time centre of mass
+    // which is EXACT for particles moving ballistically between kicks: a kick of dp at tau_k adds
+    // dp*(tau - tau_k) to the first moment, so dq accumulates dp*tau_k. Mass changes and
+    // non-ballistic position changes (accretion merges, the Hermite corrector) enter through
+    // mass_event / shift_node.
+    std::vector<double> dq_x, dq_y, dq_z, dmass;
     double t_since_build = 0.0;         // engine time elapsed since this tree was built
 
     size_t nnodes() const { return mass.size(); }   // valid after build() trims to nalloc
-
-    // Opening radius of a node, inflated for motion since the build. Cheap enough for the
-    // neighbour-search inner loop: one float load from a compact array plus an FMA.
-    double open_radius(int node_id) const {
-        return wn[node_id].s + (double)vmax[node_id] * t_since_build;
-    }
 
     // Record that particle `i` (in leaf `leaf_node`) now moves at |v| = speed, propagating the
     // bound to every ancestor. GIZMO's force_kick_node: climb the parent chain taking a max. The
@@ -305,17 +309,29 @@ struct Tree {
     // Node max softening is a build-time reduction; raise it when a particle's softening grows
     // so the softening force-open test never trusts a stale, too-small value.
     void raise_soft(int leaf_node, double soft);
-    // Accumulate a particle's momentum change into every ancestor node (GIZMO's force_kick_node).
-    // No-op unless the build produced vcom, so runs that never ask for a jerk pay nothing.
-    void kick_node(int leaf_node, const Vec3d& dp);
-    // Node centre-of-mass velocity, corrected for kicks since the build.
+    // Accumulate a particle's momentum change dp, made at time tau since the build, into every
+    // ancestor node (GIZMO's force_kick_node). No-op unless the build produced vcom.
+    void kick_node(int leaf_node, const Vec3d& dp, double tau);
+    // A particle of mass dm (negative to remove one) at position x moving at v, appearing at tau.
+    // x is unwrapped against each ancestor's current COM, so periodic folding is harmless.
+    void mass_event(int leaf_node, double dm, const Vec3d& x, const Vec3d& v, double tau, double box);
+    // A particle of mass m displaced by dx without a velocity change (e.g. a Hermite correction).
+    void shift_node(int leaf_node, double m, const Vec3d& dx);
+    // Node mass and centre of mass at tau, from the incremental moments.
+    double node_mass(int no) const { return mass[no] + (dmass.empty() ? 0.0 : dmass[no]); }
+    Vec3d node_com(int no, double tau) const;
+    // Rewrite the packed walk nodes (COM, mass, and the opening radius and side widened by
+    // 2*vmax*tau) from the incremental moments. O(nodes); call before any gravity walk.
+    void refresh_walk_nodes(double tau);
+    // Node centre-of-mass velocity, corrected for kicks and mass events since the build.
     Vec3d node_vel(int node_id) const {
-        if (dp_x.empty() || mass[node_id] <= 0)
+        const double M = node_mass(node_id);
+        if (dp_x.empty() || M <= 0)
             return Vec3d{vcom_x[node_id], vcom_y[node_id], vcom_z[node_id]};
-        const double inv_m = 1.0 / mass[node_id];
-        return Vec3d{vcom_x[node_id] + dp_x[node_id] * inv_m,
-                     vcom_y[node_id] + dp_y[node_id] * inv_m,
-                     vcom_z[node_id] + dp_z[node_id] * inv_m};
+        const double m0 = mass[node_id];
+        return Vec3d{(m0 * vcom_x[node_id] + dp_x[node_id]) / M,
+                     (m0 * vcom_y[node_id] + dp_y[node_id]) / M,
+                     (m0 * vcom_z[node_id] + dp_z[node_id]) / M};
     }
 };
 
@@ -324,12 +340,13 @@ struct Tree {
 // a node's children are exactly the next-chain from first[X] up to next[X]. Against that it checks
 // parent[] and leaf_of[] (a moments re-derivation alone climbs the same parent chain it would be
 // checking, so it cannot see a corrupted one), every particle reached exactly once, node mass, and
-// that every ancestor of each particle still covers it: hmax >= h, soft >= soft, vmax >= |v|, and
-// the position inside the node box plus the vmax*t_since_build pad the searches prune on.
+// the incremental mass and COM against the particles (dt_behind: time each particle's position lags
+// the tree's clock), and that every ancestor of each particle still covers it: hmax >= h, soft >=
+// soft, vmax >= |v|, and the position inside the node box plus the vmax*t_since_build pad.
 // Returns the number of violations; the first is described in `msg`.
 long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t n_gas,
                      const double* vx, const double* vy, const double* vz, double box,
-                     char* msg, size_t msglen);
+                     const double* dt_behind, char* msg, size_t msglen);
 
 static const int LEAF_MAX = 16;        // particles per leaf; below this, direct summation is cheaper
 static const int MAX_LEVEL = 20;       // Morton keys carry 21 bits per axis

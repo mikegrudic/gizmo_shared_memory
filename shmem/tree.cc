@@ -208,7 +208,7 @@ static inline void atomic_max_nonneg(float* slot, float value) {
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { /* seen reloaded */ }
 }
 
-void Tree::kick_node(int leaf_node, const Vec3d& dp) {
+void Tree::kick_node(int leaf_node, const Vec3d& dp, double tau) {
     if (dp_x.empty()) return;                    // no vcom built, nothing to keep current
     for (int no = leaf_node; no >= 0; no = parent[no]) {
         #pragma omp atomic
@@ -217,6 +217,59 @@ void Tree::kick_node(int leaf_node, const Vec3d& dp) {
         dp_y[no] += dp[1];
         #pragma omp atomic
         dp_z[no] += dp[2];
+        #pragma omp atomic
+        dq_x[no] += dp[0] * tau;
+        #pragma omp atomic
+        dq_y[no] += dp[1] * tau;
+        #pragma omp atomic
+        dq_z[no] += dp[2] * tau;
+    }
+}
+
+Vec3d Tree::node_com(int no, double tau) const {
+    const double M = node_mass(no);
+    if (dp_x.empty() || M <= 0) return Vec3d{cx[no], cy[no], cz[no]};
+    const double m0 = mass[no];
+    return Vec3d{(m0 * cx[no] + (m0 * vcom_x[no] + dp_x[no]) * tau - dq_x[no]) / M,
+                 (m0 * cy[no] + (m0 * vcom_y[no] + dp_y[no]) * tau - dq_y[no]) / M,
+                 (m0 * cz[no] + (m0 * vcom_z[no] + dp_z[no]) * tau - dq_z[no]) / M};
+}
+
+// Serial: called from the accretion and Hermite hand-back loops, one particle at a time.
+void Tree::mass_event(int leaf_node, double dm, const Vec3d& x, const Vec3d& v, double tau,
+                      double box) {
+    if (dp_x.empty() || leaf_node < 0 || dm == 0.0) return;
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        const Vec3d c = node_com(no, tau);
+        const Vec3d xr = c + min_image(x - c, box);
+        dmass[no] += dm;
+        dp_x[no] += dm * v[0]; dp_y[no] += dm * v[1]; dp_z[no] += dm * v[2];
+        dq_x[no] -= dm * (xr[0] - v[0] * tau);
+        dq_y[no] -= dm * (xr[1] - v[1] * tau);
+        dq_z[no] -= dm * (xr[2] - v[2] * tau);
+    }
+}
+
+void Tree::shift_node(int leaf_node, double m, const Vec3d& dx) {
+    if (dp_x.empty() || leaf_node < 0) return;
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        dq_x[no] -= m * dx[0]; dq_y[no] -= m * dx[1]; dq_z[no] -= m * dx[2];
+    }
+}
+
+void Tree::refresh_walk_nodes(double tau) {
+    const bool nodelta = nodelta_opening();
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < nnodes(); ++i) {
+        WNode& w = wn[i];
+        const Vec3d c = node_com((int)i, tau);
+        w.cx = c[0]; w.cy = c[1]; w.cz = c[2];
+        w.mass = node_mass((int)i);
+        // every particle can have moved vmax*tau and the COM with them, so a bound on the
+        // COM-to-particle distance grows by 2*vmax*tau (forcetree_update.cc: len += 2*vmax*dt)
+        const double grow = 2.0 * (double)vmax[i] * tau;
+        w.s   = size[i] + (nodelta ? 0.0 : delta[i]) + grow;
+        w.len = (float)(size[i] + grow);
     }
 }
 
@@ -289,9 +342,16 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     if (!vel) want_vcom = false;                  // no velocities, no centre-of-mass velocity
     double t_a = now_ms(), t_start = t_a;
     const size_t n = P.size();
+    // Massless particles are tombstones (swallowed cells awaiting compaction): left out of the tree
+    // entirely, with leaf_of = -1, so no walk or search can reach them.
+    std::vector<uint32_t> order;
+    order.reserve(n);
+    for (size_t i = 0; i < n; ++i) if (P.m[i] > 0) order.push_back((uint32_t)i);
+    const size_t n_live = order.size();
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
     #pragma omp parallel for reduction(min:lo[:3]) reduction(max:hi[:3]) schedule(static)
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t r = 0; r < n_live; ++r) {
+        const size_t i = order[r];
         lo[0] = std::min(lo[0], P.x[i]); hi[0] = std::max(hi[0], P.x[i]);
         lo[1] = std::min(lo[1], P.y[i]); hi[1] = std::max(hi[1], P.y[i]);
         lo[2] = std::min(lo[2], P.z[i]); hi[2] = std::max(hi[2], P.z[i]);
@@ -337,23 +397,22 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     }
 
     const double scale = ((1u << MAX_LEVEL) - 1) / side;
-    std::vector<uint64_t> key(n);
-    std::vector<uint32_t> order(n);
+    std::vector<uint64_t> key(n, 0);
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t r = 0; r < n_live; ++r) {
+        const size_t i = order[r];
         uint32_t a = (uint32_t)((P.x[i] - (cx - 0.5*side)) * scale);
         uint32_t b = (uint32_t)((P.y[i] - (cy - 0.5*side)) * scale);
         uint32_t c = (uint32_t)((P.z[i] - (cz - 0.5*side)) * scale);
         key[i] = morton(a, b, c);
-        order[i] = (uint32_t)i;
     }
     if(bt) { bt->keys = now_ms()-t_a; } t_a = now_ms();
     __gnu_parallel::sort(order.begin(), order.end(),
               [&](uint32_t a, uint32_t b) { return key[a] < key[b]; });
     if(bt) { bt->sort = now_ms()-t_a; } t_a = now_ms();
-    std::vector<uint64_t> skey(n);
+    std::vector<uint64_t> skey(n_live);
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n; ++i) skey[i] = key[order[i]];
+    for (size_t i = 0; i < n_live; ++i) skey[i] = key[order[i]];
 
     Tree T;
     // Pre-size: <= one node per LEAF_MAX particles at the bottom + interior ~ 8/7 of that; 2x
@@ -366,7 +425,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     // the end and we simply build again with a bigger arena. nalloc is only a LOWER bound on what
     // was needed (refused nodes never recursed), hence doubling rather than sizing exactly; two
     // attempts is the most this has ever taken.
-    size_t cap = (2 * n) / LEAF_MAX * 3 + 1024;
+    size_t cap = (2 * n_live) / LEAF_MAX * 3 + 1024;
     for (;;) {
         T.cx.assign(cap, 0.0); T.cy.assign(cap, 0.0); T.cz.assign(cap, 0.0);
         T.mass.assign(cap, 0.0); T.size.assign(cap, 0.0); T.delta.assign(cap, 0.0);
@@ -380,12 +439,14 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         if (want_vcom) {
             T.vcom_x.assign(cap, 0.0); T.vcom_y.assign(cap, 0.0); T.vcom_z.assign(cap, 0.0);
             T.dp_x.assign(cap, 0.0);   T.dp_y.assign(cap, 0.0);   T.dp_z.assign(cap, 0.0);
+            T.dq_x.assign(cap, 0.0);   T.dq_y.assign(cap, 0.0);   T.dq_z.assign(cap, 0.0);
+            T.dmass.assign(cap, 0.0);
         }
         T.leaf_of.assign(n, -1);
         T.nalloc = 0;
         #pragma omp parallel
         #pragma omp single
-        T.root = build_node(T, P, order, skey, 0, (int)n, 0, cx, cy, cz, side, vel);
+        T.root = build_node(T, P, order, skey, 0, (int)n_live, 0, cx, cy, cz, side, vel);
         if ((size_t)T.nalloc <= cap) break;
         cap = (size_t)T.nalloc * 2 + 1024;
     }
@@ -399,6 +460,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         if (!T.vcom_x.empty()) {
             T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn);
             T.dp_x.resize(nn);   T.dp_y.resize(nn);   T.dp_z.resize(nn);
+            T.dq_x.resize(nn);   T.dq_y.resize(nn);   T.dq_z.resize(nn);   T.dmass.resize(nn);
         }
     }
     if(bt) { bt->recurse = now_ms()-t_a; } t_a = now_ms();
@@ -408,9 +470,9 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
     T.orderbuf.swap(order);
     // Inverse permutation, so a small active set can be put in tree order by sorting rather than
     // by scanning all N. One O(N) pass on a build that is already O(N log N).
-    T.rank.resize(n);
+    T.rank.assign(n, UINT32_MAX);
     #pragma omp parallel for schedule(static)
-    for (size_t r = 0; r < n; ++r) T.rank[T.orderbuf[r]] = (uint32_t)r;
+    for (size_t r = 0; r < n_live; ++r) T.rank[T.orderbuf[r]] = (uint32_t)r;
 
     if(bt) { bt->links = now_ms()-t_a; } t_a = now_ms();
     // Pack the traversal copies. WNode (64 B) serves the gravity walk; SNode (32 B) serves the
@@ -900,7 +962,7 @@ void accel_brute(const Particles& P, const std::vector<uint32_t>& targets, doubl
 
 long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t n_gas,
                      const double* vx, const double* vy, const double* vz, double box,
-                     char* msg, size_t msglen) {
+                     const double* dt_behind, char* msg, size_t msglen) {
     long long bad = 0;
     auto fail = [&](const char* fmt, auto... args) {
         if (bad++ == 0 && msg) snprintf(msg, msglen, fmt, args...);
@@ -938,25 +1000,49 @@ long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t 
             stack.push_back(c);
         }
     }
+    // only tombstones (massless) may be absent from the tree
     for (size_t p = 0; p < N; ++p)
-        if (!seen_part[p]) { fail("particle %zu unreachable from the root", p); break; }
+        if (!seen_part[p] && P.m[p] > 0) { fail("particle %zu unreachable from the root", p); break; }
     if (bad) return bad;   // coverage checks below climb parent[], which is only now trusted
 
-    // 2. node mass, re-derived bottom-up (children are allocated after their parent)
+    // 2. node mass and centre of mass, re-derived bottom-up from the particles (children are
+    // allocated after their parent) against the incremental moments. Positions are taken at the
+    // tree's current time (dt_behind undoes lazy drift) and unwrapped against the tracked COM.
+    const double tau = T.t_since_build;
     std::vector<double> msum(nn, 0.0);
-    for (size_t p = 0; p < N; ++p) msum[T.leaf_of[p]] += P.m[p];
-    for (size_t no = nn; no-- > 0;) if (T.parent[no] >= 0) msum[T.parent[no]] += msum[no];
+    std::vector<Vec3d> mdx(nn, Vec3d{0, 0, 0});
+    std::vector<Vec3d> com(nn);
+    for (size_t no = 0; no < nn; ++no) com[no] = T.node_com((int)no, tau);
+    for (size_t p = 0; p < N; ++p) {
+        if (T.leaf_of[p] < 0 || P.m[p] <= 0) continue;
+        Vec3d x = P.pos(p);
+        if (dt_behind && vx) x += Vec3d{vx[p], vy[p], vz[p]} * dt_behind[p];
+        for (int no = T.leaf_of[p]; no >= 0; no = T.parent[no]) {
+            msum[no] += P.m[p];
+            mdx[no] += min_image(x - com[no], box) * P.m[p];
+        }
+    }
     for (size_t no = 0; no < nn; ++no) {
-        const double tol = 1e-10 * std::max(msum[no], T.mass[no]) + 1e-300;
-        if (std::abs(msum[no] - T.mass[no]) > tol || std::abs(T.wn[no].mass - T.mass[no]) > tol) {
-            fail("node %zu mass %.17g, particles sum to %.17g", no, T.mass[no], msum[no]);
+        const double M = T.node_mass((int)no);
+        const double tol = 1e-10 * std::max(msum[no], std::abs(M)) + 1e-300;
+        if (std::abs(msum[no] - M) > tol) {
+            fail("node %zu mass %.17g, particles sum to %.17g", no, M, msum[no]);
             break;
+        }
+        if (msum[no] > 0 && !T.dp_x.empty()) {
+            const double off = (mdx[no] / msum[no]).norm();
+            const double reach = T.size[no] + 2.0 * (double)T.vmax[no] * tau;
+            if (off > 1e-6 * reach) {
+                fail("node %zu tracked COM is %.9g off the particles' (node reach %.9g)", no, off, reach);
+                break;
+            }
         }
     }
 
     // 3. every ancestor covers every particle
     const float* hm = T.hmax.empty() ? nullptr : T.hmax.data();
     for (size_t p = 0; p < N && bad < 1000; ++p) {
+        if (T.leaf_of[p] < 0 || P.m[p] <= 0) continue;   // tombstones are parked, not covered
         const double sp = P.soft.empty() ? 0.0 : P.soft[p];
         const bool gas = p < n_gas && h;
         const double v = vx ? std::sqrt(vx[p]*vx[p] + vy[p]*vy[p] + vz[p]*vz[p]) : 0.0;
