@@ -291,6 +291,13 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
     write_attr(header, "Flag_Metals", 0);   write_attr(header, "Flag_DoublePrecision", 1);
     write_attr(header, "HubbleParam", 1.0);
     write_attr(header, "Omega0", 0.0);      write_attr(header, "OmegaLambda", 0.0);
+    // the reference's unit and threshold attributes (io.cc), which analysis tools read
+    write_attr(header, "ComovingIntegrationOn", 0);
+    write_attr(header, "UnitLength_In_CGS", sim.unit_length_cgs);
+    write_attr(header, "UnitMass_In_CGS", sim.unit_mass_cgs);
+    write_attr(header, "UnitVelocity_In_CGS", sim.unit_vel_cgs);
+    write_attr(header, "Gravitational_Constant_In_Code_Inits", sim.G);
+    if (sim.sink_formation) write_attr(header, "Density_Threshold_For_SF_CodeUnits", sim.crit_phys_density);
     H5Gclose(header);
 
     for (int t = 0; t < 6; ++t) {
@@ -563,6 +570,7 @@ int main(int argc, char** argv) {
         sim.eos_law = Sim::EosLaw::ENFORCE_ADIABAT;
         sim.eos_adiabat = eos_adiabat;
     }
+    sim.unit_length_cgs = unit_length_cgs; sim.unit_mass_cgs = unit_mass_cgs; sim.unit_vel_cgs = unit_vel_cgs;
     sim.mass_to_solar = unit_mass_cgs / 1.989e33;
     sim.vel_to_kms = unit_vel_cgs / 1.0e5;
     sim.length_to_au = unit_length_cgs / 1.495978707e13;

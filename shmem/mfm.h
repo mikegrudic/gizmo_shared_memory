@@ -138,6 +138,7 @@ struct Sim {
     // passes every criterion converts on the spot. The criteria are all veto-style, exactly as in
     // galaxy_sf/sfr_eff.cc -- see project-shmem-sink-plan for the bit-by-bit mapping.
     bool   sink_formation = false;     // SINGLE_STAR_SINK_FORMATION present in the config
+    double unit_length_cgs = 3.085678e21, unit_mass_cgs = 1.989e43, unit_vel_cgs = 1e5;  // for the snapshot header
     double mass_to_solar = 1.0;        // code mass -> Msun (UnitMass_in_g / 1.989e33)
     double vel_to_kms = 1.0;           // code velocity -> km/s (UnitVelocity_in_cm_per_s / 1e5)
     // code length -> AU, for the 0.1 AU Larson-core floor on sink formation (sfr_eff.cc:348)

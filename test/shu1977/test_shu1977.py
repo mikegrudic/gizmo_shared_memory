@@ -83,6 +83,20 @@ def test_shu1977(num_mpi_ranks, num_omp_threads, extra_config_flags, request):
 
     assert num_sinks == 1, f"[{variant_id}] Expected exactly 1 PartType5 particle, got {num_sinks}"
 
+    # analysis tools (SinkVis etc.) take the unit system from the header
+    params = {}
+    with open(f"{test_dir}/{test_name}.params") as f:
+        for line in f:
+            tok = line.split("%")[0].split()
+            if len(tok) >= 2:
+                params[tok[0]] = tok[1]
+    with h5py.File(final_snap, "r") as F:
+        hdr = F["Header"].attrs
+        for attr, key in (("UnitLength_In_CGS", "UnitLength_in_cm"), ("UnitMass_In_CGS", "UnitMass_in_g"),
+                          ("UnitVelocity_In_CGS", "UnitVelocity_in_cm_per_s")):
+            assert attr in hdr and np.isclose(hdr[attr], float(params[key]), rtol=1e-12), (
+                f"[{variant_id}] header {attr}={hdr.get(attr)} does not match {key}={params[key]}")
+
     # EOS_ENFORCE_ADIABAT resets u from rho on every pressure evaluation (eos.cc), so every
     # snapshot's u must lie on the adiabat; 1e-6 allows single-precision output.
     adiabat, gamma = enforced_adiabat(f"{test_dir}/Config.sh")
