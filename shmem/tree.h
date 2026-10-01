@@ -270,6 +270,10 @@ struct Tree {
     // whose OWN kernel reaches the target (GIZMO's SEARCHBOTHWAYS, Extnodes[].hmax). Only ever
     // raised between rebuilds, so it stays conservative when h shrinks.
     std::vector<float> hmax;
+    // Displacement not explained by motion at <= vmax since the build (accretion merges, the
+    // Hermite corrector), accumulated in the leaf and taken as a max up the ancestors. Every
+    // particle stays within the build-time box widened by vmax*tau + xpad.
+    std::vector<float> xpad;
     // Sinks contained in the node, for the direct-summation criterion (see open_node). A separate
     // array rather than a WNode field: WNode is exactly one cache line, and this is only read when
     // the target itself is a sink, which is a vanishing fraction of walks.
@@ -309,6 +313,8 @@ struct Tree {
     // Node max softening is a build-time reduction; raise it when a particle's softening grows
     // so the softening force-open test never trusts a stale, too-small value.
     void raise_soft(int leaf_node, double soft);
+    // Record a non-ballistic displacement of `d` for a particle in `leaf_node`.
+    void raise_pad(int leaf_node, double d);
     // Accumulate a particle's momentum change dp, made at time tau since the build, into every
     // ancestor node (GIZMO's force_kick_node). No-op unless the build produced vcom.
     void kick_node(int leaf_node, const Vec3d& dp, double tau);

@@ -267,7 +267,7 @@ void Tree::refresh_walk_nodes(double tau) {
         w.mass = node_mass((int)i);
         // every particle can have moved vmax*tau and the COM with them, so a bound on the
         // COM-to-particle distance grows by 2*vmax*tau (forcetree_update.cc: len += 2*vmax*dt)
-        const double grow = 2.0 * (double)vmax[i] * tau;
+        const double grow = 2.0 * ((double)vmax[i] * tau + (double)xpad[i]);
         w.s   = size[i] + (nodelta ? 0.0 : delta[i]) + grow;
         w.len = (float)(size[i] + grow);
     }
@@ -316,6 +316,16 @@ void Tree::raise_soft(int leaf_node, double soft) {
         if (cur >= sf) return;
         atomic_max_nonneg(&wn[no].soft, sf);
         atomic_max_double(&this->soft[no], soft);
+    }
+}
+
+// Serial callers (accretion, the Hermite hand-back), so plain stores suffice.
+void Tree::raise_pad(int leaf_node, double d) {
+    if (leaf_node < 0 || xpad.empty() || !(d > 0)) return;
+    const float leaf_pad = h_as_bound((double)xpad[leaf_node] + d);
+    for (int no = leaf_node; no >= 0; no = parent[no]) {
+        if (xpad[no] >= leaf_pad) return;
+        xpad[no] = leaf_pad;
     }
 }
 
@@ -433,7 +443,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.soft.assign(cap, 0.0);
         T.first.assign(cap, -1); T.next.assign(cap, -1);
         T.plo.assign(cap, 0); T.phi.assign(cap, 0);
-        T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f);
+        T.parent.assign(cap, -1); T.vmax.assign(cap, 0.0f); T.xpad.assign(cap, 0.0f);
         // Only when there are sinks to find; gas-only runs never allocate or touch this.
         if (!P.type.empty()) T.nsink.assign(cap, 0u);
         if (want_vcom) {
@@ -455,7 +465,7 @@ Tree build(const Particles& P, BuildTimes* bt, const double* const* vel, bool wa
         T.cx.resize(nn); T.cy.resize(nn); T.cz.resize(nn); T.mass.resize(nn); T.size.resize(nn);
         T.delta.resize(nn); T.soft.resize(nn); T.first.resize(nn); T.next.resize(nn);
         T.gcx.resize(nn); T.gcy.resize(nn); T.gcz.resize(nn);
-        T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn);
+        T.plo.resize(nn); T.phi.resize(nn); T.parent.resize(nn); T.vmax.resize(nn); T.xpad.resize(nn);
         if (!T.nsink.empty()) T.nsink.resize(nn);
         if (!T.vcom_x.empty()) {
             T.vcom_x.resize(nn); T.vcom_y.resize(nn); T.vcom_z.resize(nn);
@@ -1031,7 +1041,7 @@ long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t 
         }
         if (msum[no] > 0 && !T.dp_x.empty()) {
             const double off = (mdx[no] / msum[no]).norm();
-            const double reach = T.size[no] + 2.0 * (double)T.vmax[no] * tau;
+            const double reach = T.size[no] + 2.0 * ((double)T.vmax[no] * tau + (double)T.xpad[no]);
             if (off > 1e-6 * reach) {
                 fail("node %zu tracked COM is %.9g off the particles' (node reach %.9g)", no, off, reach);
                 break;
@@ -1055,7 +1065,7 @@ long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t 
                 fail("vmax[%d]=%.9g below |v|=%.9g of particle %zu", no, (double)T.vmax[no], v, p);
             const SNode& sn = T.sn[no];
             const double reach = (double)sn.half + (double)T.vmax[no] * T.t_since_build
-                               + 1e-6 * (double)sn.half;
+                               + (double)T.xpad[no] + 1e-6 * (double)sn.half;
             const double d[3] = {min_image(P.x[p] - (double)sn.cx, box),
                                  min_image(P.y[p] - (double)sn.cy, box),
                                  min_image(P.z[p] - (double)sn.cz, box)};

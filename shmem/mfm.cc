@@ -1580,8 +1580,8 @@ static double sink_mdot(const Sim& sim, size_t i, double dt) {
 }
 
 // Tell the reused tree that particle i jumped from state 0 to state 1 outside a drift or kick
-// (an accretion merge). Moments get the exact change; the leaf's vmax absorbs the displacement,
-// so the node box plus vmax*tau still bounds the particle at every later tau.
+// (an accretion merge). Moments get the exact change; the displacement goes into the node pad and
+// the new speed into vmax, so the node bounds still cover the particle.
 static void track_state_change(Sim& sim, size_t i, double m0, const Vec3d& x0, const Vec3d& v0,
                                double m1, const Vec3d& x1, const Vec3d& v1) {
     if (!sim.tree_valid || i >= sim.tree.leaf_of.size() || sim.tree.leaf_of[i] < 0) return;
@@ -1590,10 +1590,8 @@ static void track_state_change(Sim& sim, size_t i, double m0, const Vec3d& x0, c
     sim.tree.mass_event(leaf, -m0, x0, v0, tau, sim.box);
     sim.tree.mass_event(leaf,  m1, x1, v1, tau, sim.box);
     if (sim.vel_at_last_kick.size() == sim.size()) sim.vel_at_last_kick[i] = v1;
-    const double jump = min_image(x1 - x0, sim.box).norm();
-    if (jump > 0 && tau <= 0) { sim.tree_valid = false; return; }   // a pad cannot encode it at tau=0
-    const double v_bound = std::max((double)sim.tree.vmax[leaf], v1.norm()) + (jump > 0 ? jump / tau : 0.0);
-    sim.tree.raise_vmax(leaf, (float)(v_bound * (1.0 + 1e-6)));
+    sim.tree.raise_pad(leaf, min_image(x1 - x0, sim.box).norm());
+    sim.tree.raise_vmax(leaf, (float)(v1.norm() * (1.0 + 1e-6)));
 }
 
 static void sink_accretion_scan(Sim& sim) {
@@ -2262,12 +2260,7 @@ static void hermite_pass(Sim& sim, const std::vector<uint32_t>& active,
                 const int leaf = sim.tree.leaf_of[i];
                 const Vec3d dx = min_image(pos_c - pos_kdk[k], sim.box);
                 sim.tree.shift_node(leaf, sim.P.m[i], dx);
-                const double tau = sim.tree.t_since_build;
-                if (tau > 0)
-                    sim.tree.raise_vmax(leaf, (float)(((double)sim.tree.vmax[leaf] + dx.norm() / tau)
-                                                      * (1.0 + 1e-6)));
-                else
-                    sim.tree_valid = false;
+                sim.tree.raise_pad(leaf, dx.norm());
             }
             sim.vx[i] = vel_true[k][0]; sim.vy[i] = vel_true[k][1]; sim.vz[i] = vel_true[k][2];
         }

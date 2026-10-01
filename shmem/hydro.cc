@@ -45,6 +45,7 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
     // bytes per visit are worth this.
     const SNode* __restrict nodes = tree.sn.data();
     const float* __restrict node_vmax = tree.vmax.data();
+    const float* __restrict node_xpad = tree.xpad.data();
     const double elapsed = tree.t_since_build;
     const double radius_sq = radius * radius;
     const bool counting = ngb_counting();
@@ -58,7 +59,7 @@ void ngb_search(const Tree& tree, const Particles& particles, const Vec3d& centr
         // Half the side, plus this node's own vmax bound on how far its particles can have moved
         // since the build. Per node rather than a global pad -- one fast particle must not inflate
         // the prune for the whole box (see Tree::vmax). Skipped entirely on a fresh tree.
-        double dist = radius + (double)node.half;
+        double dist = radius + (double)node.half + (double)node_xpad[node_id];
         if (elapsed > 0) dist += (double)node_vmax[node_id] * elapsed;
         const double dx = min_image((double)node.cx - centre[0], box);
         if (dx > dist || -dx > dist) { node_id = node.next; continue; }
@@ -112,6 +113,7 @@ void ngb_search_reverse(const Tree& tree, const Particles& particles, const doub
     const SNode* __restrict nodes = tree.sn.data();
     const float* __restrict node_vmax = tree.vmax.data();
     const float* __restrict node_hmax = tree.hmax.data();
+    const float* __restrict node_xpad = tree.xpad.data();
     const double elapsed = tree.t_since_build;
     const double h_i_sq = h_i * h_i;
     int node_id = tree.root;
@@ -120,7 +122,7 @@ void ngb_search_reverse(const Tree& tree, const Particles& particles, const doub
         // no particle here has h_j > h_i, so none can satisfy h_i <= r < h_j
         const double hm = (double)node_hmax[node_id];
         if (hm <= h_i) { node_id = node.next; continue; }
-        double dist = hm + (double)node.half;
+        double dist = hm + (double)node.half + (double)node_xpad[node_id];
         if (elapsed > 0) dist += (double)node_vmax[node_id] * elapsed;
         const double dx = min_image((double)node.cx - centre[0], box);
         if (dx > dist || -dx > dist) { node_id = node.next; continue; }
