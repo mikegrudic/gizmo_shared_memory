@@ -32,6 +32,17 @@ from momentum_drift_common import (  # noqa: E402
 MOMENTUM_PARTTYPES = ("PartType0", "PartType5")
 
 
+def enforced_adiabat(config_path):
+    """(EOS_ENFORCE_ADIABAT, EOS_GAMMA) from a Config.sh."""
+    flags = {}
+    with open(config_path) as f:
+        for line in f:
+            key, _, value = line.split("#")[0].strip().partition("=")
+            if value:
+                flags[key.strip()] = float(value)
+    return flags["EOS_ENFORCE_ADIABAT"], flags["EOS_GAMMA"]
+
+
 def plot_shu1977_density_slice(coords, rho, boxsize, output_dir="."):
     """Plot a density slice through the Shu 1977 collapse center."""
     center = np.average(coords, axis=0)
@@ -71,6 +82,19 @@ def test_shu1977(num_mpi_ranks, num_omp_threads, extra_config_flags, request):
         num_sinks = f["Header"].attrs["NumPart_ThisFile"][5]
 
     assert num_sinks == 1, f"[{variant_id}] Expected exactly 1 PartType5 particle, got {num_sinks}"
+
+    # EOS_ENFORCE_ADIABAT resets u from rho on every pressure evaluation (eos.cc), so every
+    # snapshot's u must lie on the adiabat; 1e-6 allows single-precision output.
+    adiabat, gamma = enforced_adiabat(f"{test_dir}/Config.sh")
+    for snap in sorted(glob.glob(variant_output_dir(test_name, extra_config_flags) + "/snapshot_*.hdf5")):
+        with h5py.File(snap, "r") as F:
+            rho = F["PartType0/Density"][:]
+            u = F["PartType0/InternalEnergy"][:]
+        dev = np.abs(u / (adiabat * rho**(gamma - 1) / (gamma - 1)) - 1).max()
+        assert dev < 1e-6, (
+            f"[{variant_id}] {path.basename(snap)}: InternalEnergy is off the enforced adiabat by "
+            f"up to {dev:.3e}"
+        )
 
     # --- spurious COM drift from correlated tree-force errors (RANDOMIZE_GRAVTREE) ---
     traj = measure_and_record(test_dir, variant_id,

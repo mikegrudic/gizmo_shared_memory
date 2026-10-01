@@ -336,7 +336,9 @@ static void write_snapshot(const Sim& sim, const std::vector<long long>& particl
             // InternalEnergyPred): the stored u is half-kicked like the velocity, and completing
             // the owed half with the particle's own rate synchronises it. Exact at a particle's
             // own sync point; mid-step it is the same first-order prediction the reference makes.
-            if (sim.du_dt.size() == n_part && sim.pending_half_kick.size() == n_part) {
+            // A density-driven EOS resets InternalEnergyPred along with u (eos.cc), so there the
+            // stored u is already the answer.
+            if (sim.eos_is_ideal() && sim.du_dt.size() == n_part && sim.pending_half_kick.size() == n_part) {
                 std::vector<double> u_pred(sim.u);
                 for (size_t q = 0; q < n_part && q < sim.n_gas; ++q)
                     u_pred[q] = std::max(u_pred[q] + sim.du_dt[q] * sim.pending_half_kick[q],
