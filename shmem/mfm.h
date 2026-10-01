@@ -384,6 +384,10 @@ struct Sim {
     // scratch reused across steps, so a sync does not allocate and zero several N-sized arrays
     std::vector<double> dt_of, dmom_x, dmom_y, dmom_z, denergy;
     std::vector<std::pair<uint32_t,int>> wake_requests;   // (particle, bin it must drop to)
+    // Per-particle pending wakeup: the bin a woken cell must drop to, 0 for none. Per particle, not
+    // a list, so it survives the array reordering between the flux loop and the next step.
+    std::vector<int> wake_floor;
+    std::vector<uint32_t> woken;                          // inactive cells found woken this sync
     // particles that received flux this sync (actives + their neighbours), duplicates allowed
     std::vector<uint32_t> touched;
     std::vector<std::vector<uint32_t>> active_chunks;     // per-thread, merged into `active`

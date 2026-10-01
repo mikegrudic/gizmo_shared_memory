@@ -26,6 +26,12 @@ static constexpr double SINK_TIMESTEP_SAFETY_FACTOR = 0.3;
 
 static void audit_tree_if_asked(const Sim& sim, const char* where);
 
+static inline void atomic_max_double(double* slot, double value) {
+    double seen; __atomic_load(slot, &seen, __ATOMIC_RELAXED);
+    while (seen < value &&
+           !__atomic_compare_exchange(slot, &seen, &value, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
 // Neighbour-list access for the three hydro phases. With SHMEM_CACHE_NEIGHBORS the list is built
 // once per step (in solve_h_and_volumes) and the later phases read it back; without it, each
 // phase searches the tree as before. Both paths hand the caller the same `neighbours` vector, so
@@ -92,7 +98,9 @@ static inline void eos_apply(Sim& sim, size_t i) {
             // odd variants use gamma = 7/5, even 5/3.
             const double nH_crit = 6.0e10, p_iso = 6.60677e-16 * nH;
             const double g = (sim.baro_variant == 1 || sim.baro_variant == 3) ? 1.4 : (5.0 / 3.0);
-            gamma_index = g;
+            // variant 1 is the reference's EOS_GMC_BAROTROPIC=1, whose u write-back and sound speed
+            // use 7/5 switching to 5/3 once dissociated (eos.cc:120-121) -- the pressure keeps 7/5
+            gamma_index = (sim.baro_variant == 1 && nH > 2.30181e16) ? 5.0 / 3.0 : g;
             if (sim.baro_variant <= 2) {
                 if (nH < nH_crit) { p_cgs = p_iso; gamma_eff = 1.0; }
                 else { p_cgs = 6.60677e-16 * nH_crit * std::pow(nH / nH_crit, g); gamma_eff = g; }
@@ -115,9 +123,12 @@ static inline void eos_apply(Sim& sim, size_t i) {
     sim.press[i] = press;
     if (sim.eos_law != Sim::EosLaw::IDEAL)
         sim.u[i] = press / (rho * (gamma_index - 1.0));
+    // Sound speed from the EOS's own index, as the reference's EOS_GENERAL default
+    // (SoundSpeed = sqrt(gamma_eos_index P/rho), eos.cc:212) -- 7/5 for the barotrope, not the
+    // config-level 5/3.
     if (sim.eos_law != Sim::EosLaw::IDEAL && !sim.csnd.empty()) {
         const double g_cs = (sim.eos_law == Sim::EosLaw::BAROTROPIC && sim.baro_soundspeed)
-                          ? gamma_eff : sim.gamma;
+                          ? gamma_eff : gamma_index;
         sim.csnd[i] = std::sqrt(g_cs * press / rho);
     }
 }
@@ -176,8 +187,8 @@ static inline void limit_slope(Vec3d& gradient, double largest_rise, double larg
     double factor = allowed / (a_limiter * h_lim * slope);
     if (pos_preserve && d_max > 0) {
         const double val_min_ngb = val_cen + largest_drop;      // actual minimum neighbour value
-        const double fmin = std::min(val_cen, std::max(0.0,
-                              std::min(0.5 * (val_cen + val_min_ngb), val_cen - allowed)));
+        const double fmin = std::min(val_cen, std::max(0.0, std::max(1e-56 * val_cen,
+                              std::min(0.5 * (val_cen + val_min_ngb), val_cen - allowed))));
         factor = std::min(((val_cen - fmin) / d_max) / slope, factor);
     }
     if (factor < 1.0) gradient *= factor;
@@ -214,37 +225,43 @@ static inline void limit_face_pair(double Q_i, double Q_j, double& face_i, doubl
 // MFM flux needs, since the mass flux vanishes by construction.
 struct ContactState { double speed, pressure; };
 
-// HLLC for an ideal gas, states already rotated so the given velocities are normal to the face.
-// Wave-speed estimates: Davis.
-// gamma_left/gamma_right are the LOCAL effective adiabatic indices, so a barotrope reaches the
-// wavespeeds at its own dP/drho rather than at the thermodynamic gamma -- GIZMO's EOS_GENERAL
-// pathway. For an ideal gas both are simply gamma and this reduces to the usual estimate.
-[[nodiscard]] static ContactState solve_hllc_contact(
-        double density_left,  double vnorm_left,  double pressure_left,
-        double density_right, double vnorm_right, double pressure_right,
-        double gamma_left, double gamma_right) {
-    const double csound_left  = std::sqrt(gamma_left  * pressure_left  / density_left);
-    const double csound_right = std::sqrt(gamma_right * pressure_right / density_right);
-    const double wave_left  = std::min(vnorm_left - csound_left, vnorm_right - csound_right);
-    const double wave_right = std::max(vnorm_left + csound_left, vnorm_right + csound_right);
-    const double numerator = pressure_right - pressure_left
-                           + density_left  * vnorm_left  * (wave_left  - vnorm_left)
-                           - density_right * vnorm_right * (wave_right - vnorm_right);
-    const double denominator = density_left  * (wave_left  - vnorm_left)
-                             - density_right * (wave_right - vnorm_right);
-    double contact_speed = (std::abs(denominator) > 1e-300)
-                         ? numerator / denominator : 0.5*(vnorm_left + vnorm_right);
-    // CLAMP into the wave fan, as the reference does (reimann.h:572). The denominator
-    // rho_L(S_L-v_L) - rho_R(S_R-v_R) is bounded away from zero for well-separated states, but not
-    // for near-degenerate ones, and an unclamped ratio then returns a contact speed orders of
-    // magnitude outside the fan -- which is unphysical for the face flux and catastrophic if the
-    // signal velocity is derived from it (measured 1.2e5 against a sound speed of 0.2).
-    contact_speed = std::min(std::max(contact_speed, wave_left), wave_right);
-    double contact_pressure = pressure_left
-                            + density_left * (wave_left - vnorm_left) * (contact_speed - vnorm_left);
-    // vacuum-adjacent guard; the tier-1 tests never reach it
-    if (contact_pressure < 0) contact_pressure = 0.5*(pressure_left + pressure_right);
-    return {contact_speed, contact_pressure};
+// Contact state from the Riemann fan: a port of the reference's get_wavespeeds_and_pressure_star
+// (reimann.h:512-578), states already projected on the face normal (pointing left -> right).
+// Vacuum when the states separate faster than sound; otherwise the Gaburov HLLC estimate, falling
+// back to Roe-averaged wave speeds and then to a primitive-variable estimate whenever the pressure
+// is non-positive or exceeds `limiter`. The Roe tier averages the sound speeds, the reference's
+// EOS_GENERAL form, for every EOS.
+[[nodiscard]] static ContactState riemann_star(
+        double rho_L, double v_L, double P_L, double c_L,
+        double rho_R, double v_R, double P_R, double c_R, double limiter) {
+    constexpr double MIN_REAL = 1e-56;                      // MIN_REAL_NUMBER, constants.h:74
+    if (v_R - v_L > std::max(c_L, c_R)) return {0.0, MIN_REAL};
+    double S_L = std::min(v_L, v_R) - std::max(c_L, c_R);
+    double S_R = std::max(v_L, v_R) + std::max(c_L, c_R);
+    double w_L = rho_L * (S_L - v_L), w_R = rho_R * (S_R - v_R);
+    double S_M = ((P_R - P_L) + w_L * v_L - w_R * v_R) / (w_L - w_R);
+    double P_M = (P_L * w_R - P_R * w_L + w_L * w_R * (v_R - v_L)) / (w_R - w_L);
+    if (P_M <= MIN_REAL) return {0.0, MIN_REAL};
+    if (!(P_M > 0) || std::isnan(P_M) || P_M > limiter) {
+        const double sL = std::sqrt(rho_L), sR = std::sqrt(rho_R), inv = 1.0 / (sL + sR);
+        const double v_roe = (sL * v_L + sR * v_R) * inv, c_roe = (sL * c_L + sR * c_R) * inv;
+        S_R = std::max(v_R + c_R, v_roe + c_roe);
+        S_L = std::min(v_L - c_L, v_roe - c_roe);
+        w_R =  rho_R * (S_R - v_R);
+        w_L = -rho_L * (S_L - v_L);
+        S_M = ((w_R * v_R + w_L * v_L) + (P_L - P_R)) / (w_R + w_L);
+        P_M = rho_L * (v_L - S_L) * (v_L - S_M) + P_L;
+        if (P_M <= MIN_REAL) return {0.0, MIN_REAL};
+        if (!(P_M > 0) || std::isnan(P_M) || P_M > limiter) {
+            P_M = 0.5 * ((P_L + P_R) + (v_L - v_R) * 0.25 * (rho_L + rho_R) * (c_L + c_R));
+            S_M = 0.5 * (v_R + v_L) + 2.0 * (P_L - P_R) / ((rho_L + rho_R) * (c_L + c_R));
+            const double S_plus = std::max(std::max(std::abs(v_L - c_L), std::abs(v_R - c_R)),
+                                           std::max(std::abs(v_L + c_L), std::abs(v_R + c_R)));
+            S_M = std::min(std::max(S_M, -S_plus), S_plus);
+            if (P_M <= MIN_REAL) return {0.0, MIN_REAL};
+        }
+    }
+    return {S_M, P_M};
 }
 
 // Refresh h, volume, density and pressure for the ACTIVE particles only. Inactive ones keep the
@@ -269,7 +286,8 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
 #endif
     const DensityResult solved =
         density(tree, sim.P, active, sim.des_ngb, sim.ngb_tol, h_guess, sim.box, sim.dim, ngb_cache,
-                sim.lazy());
+                sim.lazy(), sim.work.condition_number.size() == sim.size()
+                            ? sim.work.condition_number.data() : nullptr);
     const bool track_hmax = sim.tree_valid && !sim.tree.hmax.empty();
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < active.size(); ++k) {
@@ -344,12 +362,23 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
             const uint32_t i = active[k];
             const Vec3d pos_i = sim.P.pos(i);
             get_neighbours(sim, tree, k, pos_i, sim.h[i], neighbours);
-            double weight_sum = 0, dn_dh = 0, dphi_dh_sum = 0;
+            double weight_sum = 0, dn_dh = 0, dphi_dh_sum = 0, divv_sum = 0;
+            const bool have_vpred = sim.work.predicted[FIELD_VX].size() == n_part;
+            const Vec3d v_i{sim.vx[i], sim.vy[i], sim.vz[i]};
             for (uint32_t j : neighbours) {
                 if (j >= sim.n_gas) continue;   // hydro sums are over GAS neighbours only
                 const Vec3d offset = min_image(sim.P.pos(j) - pos_i, sim.box);
                 const double r = offset.norm();
                 weight_sum += kernel_w(r, sim.h[i], sim.dim);
+                // Particle_DivVel (density.cc:346): -sum dW/dr (dp . dv)/r, dp = x_i - x_j,
+                // dv = Vel_i - VelPred_j -- unlimited, unlike the slope-limited gradient
+                if (r > 0) {
+                    const Vec3d v_j = have_vpred ? Vec3d{sim.work.predicted[FIELD_VX][j],
+                                                         sim.work.predicted[FIELD_VY][j],
+                                                         sim.work.predicted[FIELD_VZ][j]}
+                                                 : Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
+                    divv_sum -= kernel_dwdr(r, sim.h[i], sim.dim) * dot(offset * -1.0, v_i - v_j) / r;
+                }
                 // both sums INCLUDE the self term (r = 0), as GIZMO's do
                 dn_dh += kernel_dwdh(r, sim.h[i], sim.dim);
                 // FORGAS zeta (gradients.cc:1759-1766): no self term, and under max-softening a
@@ -366,6 +395,9 @@ static void solve_h_and_volumes(Sim& sim, const Tree& tree,
                 const double omega_pre = sim.h[i] / (sim.dim * weight_sum) * dn_dh;
                 sim.omega[i] = (omega_pre > -0.9) ? 1.0 / (1.0 + omega_pre) : 1.0;
             }
+            // drives the drift-time density prediction and the div-v timestep, as in the reference
+            if (sim.work.div_vel.size() == n_part && weight_sum > 0)
+                sim.work.div_vel[i] = divv_sum / weight_sum * sim.omega[i];
 
             if (want_zeta) {
                 // zeta_i = m_i h_i Omega_i^-1 (sum' m_j dphi/dh) / (NDIMS n_i), the FORGAS form
@@ -490,11 +522,35 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                     largest_drop[f] = std::min(largest_drop[f], diff);
                 }
             }
-            // GIZMO's per-field limiter settings (hydro/gradients.cc): reach h_lim is the larger
-            // of the kernel radius and the farthest neighbour; overshoot tolerance 0.1 for pure
-            // hydro, 0 with gravity on; density and pressure positivity-preserved.
-            const double h_lim = std::max(sim.h[i], max_ngb_distance);
-            const double stol = sim.gravity_on ? 0.0 : 0.1;
+            // Extrema and the farthest distance are over ALL interacting pairs, r < max(h_i, h_j)
+            // (gradients.cc:1640), not just the gather set the gradient sums use.
+            if (!tree.hmax.empty()) {
+                std::vector<uint32_t> reverse;
+                ngb_search_reverse(tree, sim.P, sim.h.data(), sim.n_gas, pos_i, sim.h[i], reverse,
+                                   sim.box, sim.lazy());
+                for (uint32_t j : reverse) {
+                    max_ngb_distance = std::max(max_ngb_distance,
+                                                min_image(sim.P.pos(j) - pos_i, sim.box).norm());
+                    const PrimitiveState field_j{work.predicted[FIELD_DENSITY][j],
+                                                 work.predicted[FIELD_VX][j],
+                                                 work.predicted[FIELD_VY][j],
+                                                 work.predicted[FIELD_VZ][j],
+                                                 work.predicted[FIELD_PRESSURE][j]};
+                    for (int f = 0; f < NUM_FIELDS; ++f) {
+                        const double diff = field_j[f] - field_i[f];
+                        largest_rise[f] = std::max(largest_rise[f], diff);
+                        largest_drop[f] = std::min(largest_drop[f], diff);
+                    }
+                }
+            }
+            // GIZMO's per-field limiter settings (gradients.cc:1191-1197): reach and positivity
+            // range d_max = max(h_i, farthest pair); for pure hydro (no self-gravity, no GALSF) the
+            // reach is h_i with overshoot tolerance 0.1, otherwise 0. Density and pressure are
+            // positivity-preserved.
+            const bool pure_hydro = !sim.gravity_on && !sim.sink_formation;
+            const double d_max = std::max(sim.h[i], max_ngb_distance);
+            const double h_lim = pure_hydro ? sim.h[i] : d_max;
+            const double stol = pure_hydro ? 0.1 : 0.0;
             // sqrt(||E|| ||E^-1||)/NUMDIMS, GIZMO's matrix_invert_ndims (system/system.cc:195).
             // ~1 for a well-conditioned neighbour geometry.
             double frob_e = 0.0, frob_inv = 0.0;
@@ -511,13 +567,9 @@ static void gradients(Sim& sim, const Tree& tree, const std::vector<uint32_t>& a
                 const bool pos_preserve = (f == FIELD_DENSITY || f == FIELD_PRESSURE);
                 limit_slope(gradient, largest_rise[f], largest_drop[f], h_lim,
                             (f == FIELD_DENSITY) ? 0.0 : stol, pos_preserve,
-                            max_ngb_distance, field_i[f], a_lim);
+                            d_max, field_i[f], a_lim);
                 work.gradient[f][i] = gradient;
             }
-            // kept for the drift-time prediction of INACTIVE particles
-            work.div_vel[i] = work.gradient[FIELD_VX][i][0]
-                            + work.gradient[FIELD_VY][i][1]
-                            + work.gradient[FIELD_VZ][i][2];
         }
     }
 }
@@ -972,43 +1024,76 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                 auto extrapolate = [&](int field, size_t side, double sign)->double {
                     return sign * dot(work.gradient[field][side], to_midpoint);
                 };
-                // Pairwise face limiter, ported from GIZMO's reconstruct_face_states: overshoot
-                // beyond the pair range allowed up to half the jump, deviation from the midpoint
-                // capped at 0.375 of it, signs preserved. See limit_face_pair for why this beats
-                // a hard clamp into [min,max] at shocks.
-                PrimitiveState left{}, right{};
-                for (int f = 0; f < NUM_FIELDS; ++f) {
-                    const auto& predicted = work.predicted[f];
-                    left[f]  = predicted[i] + extrapolate(f, i, +1.0);
-                    right[f] = predicted[j] + extrapolate(f, j, -1.0);
-                    limit_face_pair(predicted[i], predicted[j], left[f], right[f]);
-                }
-                if (left[FIELD_DENSITY]  <= 0 || right[FIELD_DENSITY]  <= 0 ||
-                    left[FIELD_PRESSURE] <= 0 || right[FIELD_PRESSURE] <= 0) {  // limiter emergency
-                    left[FIELD_DENSITY]   = work.predicted[FIELD_DENSITY][i];
-                    left[FIELD_PRESSURE]  = work.predicted[FIELD_PRESSURE][i];
-                    right[FIELD_DENSITY]  = work.predicted[FIELD_DENSITY][j];
-                    right[FIELD_PRESSURE] = work.predicted[FIELD_PRESSURE][j];
-                }
-
-                // face frame: mean velocity; rotate the states onto the normal
+                // face frame: mean velocity
                 const Vec3d face_vel{
                     0.5*(work.predicted[FIELD_VX][i] + work.predicted[FIELD_VX][j]),
                     0.5*(work.predicted[FIELD_VY][i] + work.predicted[FIELD_VY][j]),
                     0.5*(work.predicted[FIELD_VZ][i] + work.predicted[FIELD_VZ][j])};
-                const double vnorm_left = dot(
-                    Vec3d{left[FIELD_VX], left[FIELD_VY], left[FIELD_VZ]} - face_vel, normal);
-                const double vnorm_right = dot(
-                    Vec3d{right[FIELD_VX], right[FIELD_VY], right[FIELD_VZ]} - face_vel, normal);
                 // Effective index per side, cs^2 rho / P, so the reconstructed face state keeps
                 // the local barotropic stiffness instead of being forced back onto gamma.
                 const double geff_i = sim.eos_is_ideal() ? sim.gamma
                     : sound_speed(sim, i)*sound_speed(sim, i) * sim.rho[i] / sim.press[i];
                 const double geff_j = sim.eos_is_ideal() ? sim.gamma
                     : sound_speed(sim, j)*sound_speed(sim, j) * sim.rho[j] / sim.press[j];
-                const auto [contact_speed, contact_pressure] = solve_hllc_contact(
-                    left[FIELD_DENSITY],  vnorm_left,  left[FIELD_PRESSURE],
-                    right[FIELD_DENSITY], vnorm_right, right[FIELD_PRESSURE], geff_i, geff_j);
+                // Pairwise face limiter, ported from GIZMO's reconstruct_face_states: overshoot
+                // beyond the pair range allowed up to half the jump, deviation from the midpoint
+                // capped at 0.375 of it, signs preserved. `second_order` false gives the cell
+                // values, the reference's recon_mode 0.
+                PrimitiveState left{}, right{};
+                auto build_states = [&](bool second_order) {
+                    for (int f = 0; f < NUM_FIELDS; ++f) {
+                        const auto& predicted = work.predicted[f];
+                        left[f] = predicted[i]; right[f] = predicted[j];
+                        if (!second_order) continue;
+                        left[f]  += extrapolate(f, i, +1.0);
+                        right[f] += extrapolate(f, j, -1.0);
+                        limit_face_pair(predicted[i], predicted[j], left[f], right[f]);
+                    }
+                    if (left[FIELD_DENSITY]  <= 0 || right[FIELD_DENSITY]  <= 0 ||
+                        left[FIELD_PRESSURE] <= 0 || right[FIELD_PRESSURE] <= 0) {  // limiter emergency
+                        left[FIELD_DENSITY]   = work.predicted[FIELD_DENSITY][i];
+                        left[FIELD_PRESSURE]  = work.predicted[FIELD_PRESSURE][i];
+                        right[FIELD_DENSITY]  = work.predicted[FIELD_DENSITY][j];
+                        right[FIELD_PRESSURE] = work.predicted[FIELD_PRESSURE][j];
+                    }
+                };
+                auto solve = [&](double limiter, bool zero_velocity) {
+                    const double vl = zero_velocity ? 0.0 : dot(
+                        Vec3d{left[FIELD_VX], left[FIELD_VY], left[FIELD_VZ]} - face_vel, normal);
+                    const double vr = zero_velocity ? 0.0 : dot(
+                        Vec3d{right[FIELD_VX], right[FIELD_VY], right[FIELD_VZ]} - face_vel, normal);
+                    const double cl = std::sqrt(geff_i * left[FIELD_PRESSURE] / left[FIELD_DENSITY]);
+                    const double cr = std::sqrt(geff_j * right[FIELD_PRESSURE] / right[FIELD_DENSITY]);
+                    return riemann_star(left[FIELD_DENSITY], vl, left[FIELD_PRESSURE], cl,
+                                        right[FIELD_DENSITY], vr, right[FIELD_PRESSURE], cr, limiter);
+                };
+                // Upwind pressure bound from the approach speed (hydro_core_meshless.h:81-172),
+                // doubled under EOS_GENERAL (the barotrope). First-order reconstruction where the
+                // faces around either cell leak (leak_vs_tol > 1).
+                const double P_i = work.predicted[FIELD_PRESSURE][i], P_j = work.predicted[FIELD_PRESSURE][j];
+                const double rho_i = work.predicted[FIELD_DENSITY][i], rho_j = work.predicted[FIELD_DENSITY][j];
+                const Vec3d dv_ij{work.predicted[FIELD_VX][i] - work.predicted[FIELD_VX][j],
+                                  work.predicted[FIELD_VY][i] - work.predicted[FIELD_VY][j],
+                                  work.predicted[FIELD_VZ][i] - work.predicted[FIELD_VZ][j]};
+                double v2_approach = 0.0;
+                const double v_radial = -dot(offset, dv_ij) / separation;   // < 0 when closing
+                if (v_radial < 0) v2_approach = v_radial * v_radial;
+                const double v_face = -dot(dv_ij, normal);                  // face_vel_i - face_vel_j
+                if (v_face < 0) v2_approach = std::max(v2_approach, v_face * v_face);
+                double limiter = 1.1 * std::max(P_i + rho_i * v2_approach, P_j + rho_j * v2_approach);
+                if (sim.eos_law == Sim::EosLaw::BAROTROPIC) limiter *= 2.0;
+                const bool leaky = work.face_closure.size() == sim.size() &&
+                                   0.5 * (work.face_closure[i] + work.face_closure[j]) > 1.0;
+                if (leaky) limiter = std::max(limiter, std::max(std::max(P_i, P_j),
+                                              2.0 * std::max(rho_i, rho_j) * v2_approach));
+                build_states(!leaky);
+                ContactState cs_ij = solve(limiter, false);
+                if (!(cs_ij.pressure >= 0) || cs_ij.pressure > 1.4 * limiter) {
+                    build_states(false);                                   // first-order retry
+                    cs_ij = solve(1.4 * limiter, false);
+                    if (!(cs_ij.pressure >= 0)) cs_ij = solve(1.4 * limiter, true);
+                }
+                const double contact_speed = cs_ij.speed, contact_pressure = cs_ij.pressure;
 
                 // THE pair signal speed for this step: the contact-wave form when enabled, the
                 // Monaghan estimate otherwise. Computed ONCE and used for both the per-particle
@@ -1025,8 +1110,15 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                     const double fv_j = dot(Vec3d{work.predicted[FIELD_VX][j],
                                                   work.predicted[FIELD_VY][j],
                                                   work.predicted[FIELD_VZ][j]}, normal);
-                    vsig_pair = 2.0*contact_speed + std::max(0.0, fv_j - fv_i);
+                    // hydro_core_meshless.h:253, vsig = 2 S_M + max(0, face_vel_j - face_vel_i),
+                    // written there with the normal pointing j -> i. Here it points i -> j, so for
+                    // i the contact term flips sign and the velocity term is the APPROACH speed.
+                    const double approach = std::max(0.0, fv_i - fv_j);
+                    vsig_pair = -2.0*contact_speed + approach;
                     vsig_i = std::max(vsig_i, vsig_pair);
+                    // The reference evaluates every pair from both ends; a pair owned by i with j
+                    // also active must give j its own orientation too.
+                    if (sim.is_active(j)) atomic_max_double(&vsig_new[j], 2.0*contact_speed + approach);
                 } else {
                     const Vec3d rel = Vec3d{sim.vx[i], sim.vy[i], sim.vz[i]}
                                     - Vec3d{sim.vx[j], sim.vy[j], sim.vz[j]};
@@ -1159,7 +1251,7 @@ static void fluxes(Sim& sim, const Tree& tree, const std::vector<uint32_t>& acti
                         local_wakes.emplace_back(j, sim.bin[i] + wake_offset);
                 }
             }
-            if (contact_vsig) vsig_new[i] = vsig_i;
+            if (contact_vsig) atomic_max_double(&vsig_new[i], vsig_i);
         }
         if (!local_wakes.empty()) {
             #pragma omp critical
@@ -1206,10 +1298,13 @@ static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
     // evolves as its neighbourhood converges or expands, rho_dot = -rho div v. Without this a
     // long-binned particle in a steadily converging flow carries a systematically LOW density until
     // it next activates -- in noh the cold supersonic inflow sat 25% under the analytic pre-shock
-    // profile with the velocities EXACT, because only the density estimate was stale. The kernel
-    // radius follows with the opposite sign (h ~ n^{-1/dim}) and pressure tracks rho at fixed u.
-    // Clamped at +-0.3 as GIZMO clamps it; cheap 2nd-order exp for the tiny arguments this sees.
-    if (sim.individual_timesteps && !sim.is_active(i)) {
+    // profile with the velocities EXACT, because only the density estimate was stale. Pressure
+    // tracks rho through the EOS; the kernel radius is NOT predicted (the reference does so only
+    // under HYDRO_FIX_MESH_MOTION, predict.cc:225). Clamped at +-0.3 as GIZMO clamps it.
+    // On EVERY drift, as predict.cc does: gating on activity at the old clock skipped the first
+    // sub-step of every particle whose bin is coarser than the system step. A particle due at the
+    // new time is re-evaluated anyway.
+    if (sim.individual_timesteps) {
         // PREDICTED VELOCITY -- GIZMO's VelPred (predict.cc:189), which it advances on every drift
         // for every particle. The STORED velocity is a KDK quantity and correctly stays put between
         // an inactive particle's own kicks, but the hydro reads the PREDICTED one, on both sides of
@@ -1232,11 +1327,6 @@ static inline void drift_particle_to(Sim& sim, size_t i, long long target) {
             sim.rho[i]  *= f;
             sim.ninv[i] /= f;
             eos_apply(sim, i);              // P(rho) directly, not a scaling of the old pressure
-            sim.h[i] *= (std::abs(divv_fac) < 0.15)
-                        ? 1.0 + divv_fac/sim.dim + 0.5*(divv_fac/sim.dim)*(divv_fac/sim.dim)
-                        : std::exp(divv_fac / sim.dim);
-            if (divv_fac > 0 && i < sim.tree.leaf_of.size())
-                sim.tree.raise_hmax(sim.tree.leaf_of[i], sim.h[i]);
             sim.work.predicted[FIELD_DENSITY][i]  = sim.rho[i];
             sim.work.predicted[FIELD_PRESSURE][i] = sim.press[i];
         }
@@ -1383,12 +1473,13 @@ static void swap_particles(Sim& sim, size_t a, size_t b) {
     sw(sim.phi); sw(sim.a_grav); sw(sim.a_hydro); sw(sim.du_dt); sw(sim.tidal);
     sw(sim.pending_half_kick);
     sw(sim.sink_pin_x); sw(sim.sink_pin_y); sw(sim.sink_pin_z); sw(sim.sink_pinned);
-    sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift);
+    sw(sim.bin); sw(sim.dt_of); sw(sim.alpha_vir_smoothed); sw(sim.last_drift); sw(sim.wake_floor);
     sw(sim.sink_radius); sw(sim.sink_tform); sw(sim.sink_m0); sw(sim.sink_reservoir); sw(sim.id);
     sw(sim.min_sink_tapp); sw(sim.min_sink_tff); sw(sim.sink_dt_gas_cap); sw(sim.vel_at_last_kick);
     sw(sim.herm_valid); sw(sim.herm_tick); sw(sim.herm_pos); sw(sim.herm_vel);
     sw(sim.herm_acc); sw(sim.herm_jerk);
     sw(sim.dmom_x); sw(sim.dmom_y); sw(sim.dmom_z); sw(sim.denergy);
+    sw(sim.time_since_treeforce); sw(sim.tdyn_for_treeforce); sw(sim.a_grav_jerk);
     sw(sim.work.moments_inv); sw(sim.work.signal_speed); sw(sim.work.div_vel);
     sw(sim.work.condition_number); sw(sim.work.face_closure);
     for (auto& g : sim.work.gradient)  sw(g);
@@ -1405,12 +1496,13 @@ static void pop_particle(Sim& sim) {
     pop(sim.phi); pop(sim.a_grav); pop(sim.a_hydro); pop(sim.du_dt); pop(sim.tidal);
     pop(sim.pending_half_kick);
     pop(sim.sink_pin_x); pop(sim.sink_pin_y); pop(sim.sink_pin_z); pop(sim.sink_pinned);
-    pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift);
+    pop(sim.bin); pop(sim.dt_of); pop(sim.alpha_vir_smoothed); pop(sim.last_drift); pop(sim.wake_floor);
     pop(sim.sink_radius); pop(sim.sink_tform); pop(sim.sink_m0); pop(sim.sink_reservoir); pop(sim.id);
     pop(sim.min_sink_tapp); pop(sim.min_sink_tff); pop(sim.sink_dt_gas_cap); pop(sim.vel_at_last_kick);
     pop(sim.herm_valid); pop(sim.herm_tick); pop(sim.herm_pos); pop(sim.herm_vel);
     pop(sim.herm_acc); pop(sim.herm_jerk);
     pop(sim.dmom_x); pop(sim.dmom_y); pop(sim.dmom_z); pop(sim.denergy);
+    pop(sim.time_since_treeforce); pop(sim.tdyn_for_treeforce); pop(sim.a_grav_jerk);
     pop(sim.work.moments_inv); pop(sim.work.signal_speed); pop(sim.work.div_vel);
     pop(sim.work.condition_number); pop(sim.work.face_closure);
     for (auto& g : sim.work.gradient)  pop(g);
@@ -2358,7 +2450,9 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         // the average near its initial 0 and left alpha_vir = 1/avg - 1 permanently enormous, and
         // no sink could ever form no matter how long the run went.
         const double particle_size = std::pow(sim.ninv[i], 1.0 / sim.dim);
-        double v_fast = sound_speed(sim, i);
+        // thermal_soundspeed() (sfr_eff.cc:228): sqrt(g (g-1) u) with g = GAMMA_DEFAULT, on the u the
+        // EOS wrote with its own index -- 2.78 P/rho for the 7/5 barotrope, not its sound speed^2
+        double v_fast = std::sqrt(std::max(0.0, sim.gamma * (sim.gamma - 1.0) * sim.u[i]));
         if (sim.eos_law != Sim::EosLaw::IDEAL && sim.nh_per_code_density > 0) {
             // Opacity-limit relief (sfr_eff.cc:241): once an optically-thick first core forms, its
             // real sound speed rises and the virial criterion never lets a sink form, so the
@@ -2402,19 +2496,25 @@ static void sink_formation_pass(Sim& sim, const std::vector<uint32_t>& active_ga
         // negative definite once its own self-term is restored (the walk omits self-self).
         if (sim.tidal_criterion && sim.tidal.size() == n_part) {
             SymTensor3d T = sim.tidal[i];
-            const double h_i = std::max(sim.P.soft[i], 1e-300);
-            const double fac_self = -sim.P.m[i] * (2.8 / (h_i * h_i)) / h_i;
-            T[0][0] += fac_self; T[1][1] += fac_self; T[2][2] += fac_self;
+            // the trace is tested on the walk's tensor alone, before the self term (sfr_eff.cc:327)
             const double trace = T[0][0] + T[1][1] + T[2][2];
             if (trace >= 0) { ++veto[V_TIDAL]; continue; }                 // a positive trace forces a positive eigenvalue
+            // self term: -m kernel_gravity(0,1,1,1)/h^3, the mode-1 force factor at u=0
+            const double h_i = std::max(sim.P.soft[i], 1e-300);
+            const double fac_self = -sim.P.m[i] * 10.666666666667 / (h_i * h_i * h_i);
+            T[0][0] += fac_self; T[1][1] += fac_self; T[2][2] += fac_self;
             if (!sym3_negative_definite(T)) { ++veto[V_TIDAL]; continue; }
         }
 
-        // (4) local density maximum: no denser gas neighbour inside the kernel
+        // (4) local density maximum: no denser gas neighbour among the pairs r < max(h_i, h_j),
+        // the set the reference's Maxima.Density is taken over (gradients.cc:1207)
         {
             bool denser_neighbour = false;
             std::vector<uint32_t> ngb;
             get_neighbours(sim, sim.tree, k, sim.P.pos(i), sim.h[i], ngb);
+            if (!sim.tree.hmax.empty())
+                ngb_search_reverse(sim.tree, sim.P, sim.h.data(), sim.n_gas, sim.P.pos(i), sim.h[i],
+                                   ngb, sim.box, sim.lazy());
             for (uint32_t j : ngb) {
                 if (j == i || j >= sim.n_gas) continue;
                 if (sim.rho[j] > rho) { denser_neighbour = true; break; }
@@ -2860,6 +2960,10 @@ static double desired_dt(const Sim& sim, size_t i, DtParts* parts) {
                       / (sim.work.signal_speed[i] + 1e-300)
                     : 1e300;
     if (parts) parts->cfl = dt;
+    // the velocity divergence must not imply too large a change of density in one step
+    // (timestep.cc:837-841, unconditional for gas)
+    if (gas && sim.work.div_vel.size() == sim.size() && sim.work.div_vel[i] != 0.0)
+        dt = std::min(dt, 1.5 / std::abs(sim.work.div_vel[i]));
     if (sim.gravity_on) {
         // WHICH acceleration this criterion sees (core/timestep.cc:348-379). It starts as the
         // GRAVITATIONAL acceleration and picks up the hydro one for gas -- except under
@@ -3027,7 +3131,11 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
     #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < active.size(); ++k) {
         const uint32_t i = active[k];
-        const int want = bin_for_dt(sim, desired_dt(sim, i));
+        int want = bin_for_dt(sim, desired_dt(sim, i));
+        if (i < sim.wake_floor.size() && sim.wake_floor[i] > 0) {
+            want = std::max(want, sim.wake_floor[i]);            // a woken cell keeps its new bin
+            sim.wake_floor[i] = 0;
+        }
         const int current = sim.bin[i];
         int b;
         if (want >= current) {
@@ -3082,11 +3190,40 @@ static void assign_bins(Sim& sim, const std::vector<uint32_t>& active) {
 // Staging the writes outside the flux loop itself is still required: sim.bin is read by every
 // thread while that loop runs. Deepening away from a particle's own sync point is always legal
 // (see assign_bins).
+// Record the flux loop's wake requests on the particles; they take effect at the next sync
+// (wake_cells), which is where the reference's process_wake_ups runs (end of find_timesteps).
 static void apply_wake_requests(Sim& sim) {
     if (!sim.individual_timesteps) return;   // global scheme: fluxes() clears the list itself
+    if (sim.wake_floor.size() != sim.size()) sim.wake_floor.resize(sim.size(), 0);
     for (const auto& [j, floor_bin] : sim.wake_requests)
-        if (sim.bin[j] < floor_bin) sim.bin[j] = std::min(floor_bin, Sim::MAX_BINS);
+        sim.wake_floor[j] = std::max(sim.wake_floor[j], std::min(floor_bin, Sim::MAX_BINS));
     sim.wake_requests.clear();
+}
+
+// process_wake_ups (timestep.cc:1278-1428) for the cells gather_active found woken and inactive.
+// Each one's current step is truncated to END NOW: its owed half-kick becomes (elapsed - dt_old/2),
+// so the kick below integrates exactly the elapsed interval -- the reference's reversal of the part
+// of its last kick beyond now. It then starts a new step now, on the woken bin, which is aligned
+// because it is deeper than the waker's. assign_bins takes that bin as a floor.
+static void wake_cells(Sim& sim) {
+    if (sim.woken.empty()) return;
+    for (uint32_t j : sim.woken) {
+        const int old_bin = sim.bin[j];
+        const long long ticks_old = sim.ticks_in_bin(old_bin);
+        const long long elapsed = sim.clock_ticks & (ticks_old - 1);
+        if (sim.pending_half_kick.size() == sim.size())
+            sim.pending_half_kick[j] += sim.time_of_ticks(elapsed) - sim.time_of_ticks(ticks_old);
+        sim.bin[j] = sim.wake_floor[j];
+    }
+    // join this sync's active set, keeping it sorted (the flux ownership tiebreak relies on it)
+    std::vector<uint32_t> merged(sim.active.size() + sim.woken.size());
+    std::sort(sim.woken.begin(), sim.woken.end());
+    std::merge(sim.active.begin(), sim.active.end(), sim.woken.begin(), sim.woken.end(), merged.begin());
+    sim.active.swap(merged);
+    if (sim.n_gas < sim.size())
+        sim.active_gas.assign(sim.active.begin(),
+                              std::lower_bound(sim.active.begin(), sim.active.end(), (uint32_t)sim.n_gas));
+    sim.woken.clear();
 }
 
 // Fill sim.active (and sim.active_gas when the layout is mixed) with the particles due at the
@@ -3108,15 +3245,26 @@ static void gather_active(Sim& sim) {
         const int nthreads = omp_get_max_threads();
         std::vector<std::vector<uint32_t>>& chunks = sim.active_chunks;
         chunks.resize(nthreads);
+        const bool have_wake = sim.wake_floor.size() == n_part;
+        std::vector<std::vector<uint32_t>> woken_chunks(have_wake ? nthreads : 0);
+        sim.woken.clear();
         #pragma omp parallel
         {
             const int tid = omp_get_thread_num();
             std::vector<uint32_t>& mine = chunks[tid];
+            static thread_local std::vector<uint32_t> no_wake;
+            std::vector<uint32_t>& woken_mine = have_wake ? woken_chunks[tid] : no_wake;
             mine.clear();
             #pragma omp for schedule(static) nowait
-            for (size_t i = 0; i < n_part; ++i)
-                if ((sim.clock_ticks & (sim.ticks_in_bin(sim.bin[i]) - 1)) == 0 && sim.P.m[i] > 0)
-                    mine.push_back((uint32_t)i);
+            for (size_t i = 0; i < n_part; ++i) {
+                if (sim.P.m[i] <= 0) continue;
+                const bool due = (sim.clock_ticks & (sim.ticks_in_bin(sim.bin[i]) - 1)) == 0;
+                if (due) mine.push_back((uint32_t)i);
+                if (have_wake && sim.wake_floor[i] > 0) {
+                    if (due || sim.wake_floor[i] <= sim.bin[i]) sim.wake_floor[i] = 0;
+                    else woken_mine.push_back((uint32_t)i);
+                }
+            }
         }
         size_t total = 0;
         for (const auto& c : chunks) total += c.size();
@@ -3124,6 +3272,7 @@ static void gather_active(Sim& sim) {
         // static schedule hands out ascending ranges, so concatenating in thread order keeps the
         // active list sorted -- which the index tiebreak in the flux ownership rule relies on
         for (const auto& c : chunks) sim.active.insert(sim.active.end(), c.begin(), c.end());
+        for (const auto& c : woken_chunks) sim.woken.insert(sim.woken.end(), c.begin(), c.end());
     } else {
         sim.active.resize(n_part);
         for (size_t i = 0; i < n_part; ++i) sim.active[i] = (uint32_t)i;
@@ -3277,6 +3426,7 @@ double mfm_step(Sim& sim, double dt_max) {
 
     // ---- BEGIN-OF-STEP: the particles whose steps end AND begin at this sync point ----
     gather_active(sim);
+    wake_cells(sim);
     const std::vector<uint32_t>& active = sim.active;
     const std::vector<uint32_t>& active_gas =
         (sim.n_gas < n_part) ? sim.active_gas : sim.active;
@@ -3746,7 +3896,11 @@ double mfm_step(Sim& sim, double dt_max) {
     // because it reorders the particle arrays.
     probe("hydro-flux");
     probeL("hydro-flux");
+    const size_t n_gas_before_formation = sim.n_gas;
     sink_formation_pass(sim, active2_gas, dt_of);
+    // Formation converts and reorders particles, so every index in the active set is stale; the
+    // Hermite pass below walks it. Same clock, so re-gathering gives the same set, re-indexed.
+    if (sim.n_gas != n_gas_before_formation) gather_active(sim);
     probe("sink-form");
     probeL("sink-form");
     sinkv_probe(sim, "sink-form");

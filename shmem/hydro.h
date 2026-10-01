@@ -111,6 +111,7 @@ struct NeighborCache {
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box = 0.0, int n_dims = 3,
-                      NeighborCache* cache = nullptr, const LazyDrift* lazy = nullptr);
+                      NeighborCache* cache = nullptr, const LazyDrift* lazy = nullptr,
+                      const double* cond_prev = nullptr);
 
 }  // namespace shmem

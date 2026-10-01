@@ -150,7 +150,7 @@ void ngb_search_reverse(const Tree& tree, const Particles& particles, const doub
 DensityResult density(const Tree& tree, const Particles& particles,
                       const std::vector<uint32_t>& targets, double des_ngb, double ngb_tol,
                       const std::vector<double>& h_start, double box, int n_dims,
-                      NeighborCache* cache, const LazyDrift* lazy) {
+                      NeighborCache* cache, const LazyDrift* lazy, const double* cond_prev) {
     static const bool no_face_corr = getenv("SHMEM_NO_FACECORR") != nullptr;  // A/B switch
     const size_t n_targets = targets.size();
     DensityResult result;
@@ -231,7 +231,15 @@ DensityResult density(const Tree& tree, const Particles& particles,
                 // the density peak and the free surface -- but those are exactly the cells that set
                 // rho_max, and (since gas gravitational softening is h) the short-range gravity
                 // there. Without it a collapsing core is resolved with a kernel ~1.3x too narrow.
-                double des_eff = des_ngb, tol_eff = ngb_tol;
+                // Poorly conditioned neighbourhoods (sheets, filaments) get more neighbours too, from
+                // the previous evaluation's condition number (density.cc:577-594): sqrt(1 + (cn -
+                // 100)/1000) above cn = 0.1 CONDITION_NUMBER_DANGER, capped at 2.
+                double ncorr = 1.0;
+                if (cond_prev) {
+                    const double cn = cond_prev[targets[t]];
+                    if (cn > 100.0) ncorr = std::min(std::sqrt(1.0 + (cn - 100.0) / 1000.0), 2.0);
+                }
+                double des_eff = des_ngb * ncorr, tol_eff = ngb_tol * ncorr;
                 if (!no_face_corr && weight_sum > 0) {
                     Mat3d B;
                     if (invert_moments(moments, B, n_dims)) {
@@ -243,11 +251,16 @@ DensityResult density(const Tree& tree, const Particles& particles,
                         const double denom = 2.0 * n_dims * std::pow(dx_i, n_dims - 1);
                         if (denom > 0) {
                             const double fce = sum_abs / denom;
-                            const double ncorr = std::min(std::max(fce / 0.35, 1.0), 2.0);
+                            if (fce > 0.35) ncorr = std::max(ncorr, std::min(fce / 0.35, 2.0));
                             des_eff = des_ngb * ncorr; tol_eff = ngb_tol * ncorr;
                         }
                     }
                 }
+                // the tolerance grows as the solve iterates, so a narrow one cannot trap it
+                // (density.cc:603)
+                if (iter > 1)
+                    tol_eff = std::min(0.25 * des_eff,
+                                       tol_eff * std::exp(0.1 * std::log(des_eff / (16.0 * tol_eff)) * iter));
                 const double residual = n_eff - des_eff;
                 if (std::abs(residual) < tol_eff) { converged = true; break; }
                 if (residual > 0) h_hi = h; else h_lo = h;
