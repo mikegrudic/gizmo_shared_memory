@@ -23,11 +23,8 @@ import glob
 import warnings
 from os import path
 
-import os
-
 import h5py
 import numpy as np
-import pytest
 
 # Sanity ceiling, NOT a tuned tolerance: a spurious COM velocity comparable to the
 # internal velocity dispersion means the system is being pushed across the box by force
@@ -322,15 +319,3 @@ def _baseline_counterpart(randomize_id, summaries):
     if randomize_id == "randomize_ewald":
         return "ewald" if "ewald" in summaries else None
     return None
-
-
-# Shared-memory engine only (GIZMO_PREBUILT): its RANDOMIZE_GRAVTREE works -- plummer and hernquist
-# randomize pass -- but in gas problems the COM drift is dominated by the hydro, not by correlated
-# tree-force errors, so randomising the tree cannot bring it under a ceiling calibrated on the MPI
-# code (measured 2026-09-29: evrard 5.7e-5 vs 1.7e-5, shu1977 2.5e-3 vs 1.1e-3; randomize/baseline
-# 0.97x on shu1977). Non-strict, so the variant still runs and reports, and XPASSes once the hydro
-# drift is fixed. The MPI build is held to the ceiling as before.
-SHMEM_GAS_DRIFT_XFAIL = pytest.mark.xfail(
-    condition=bool(os.environ.get("GIZMO_PREBUILT")), strict=False,
-    reason="shmem engine: gas COM drift is hydro-dominated and exceeds the randomized-tree ceiling")
-

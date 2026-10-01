@@ -20,8 +20,8 @@ from gizmo.test import build_and_run_test, default_mpi_ranks, flush_colorbar, as
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from momentum_drift_common import (  # noqa: E402
-    DRIFT_SANITY_CEILING, SHMEM_GAS_DRIFT_XFAIL, assert_randomized_drift, measure_and_record,
-    plot_momentum_drift, report_momentum_drift,
+    DRIFT_SANITY_CEILING, assert_randomized_drift, measure_and_record, plot_momentum_drift,
+    report_momentum_drift,
 )
 
 
@@ -61,7 +61,7 @@ def plot_evrard_density_slice(coords, rho, output_dir="."):
         ("TIDAL_TIMESTEP_CRITERION", "ADAPTIVE_TREEFORCE_UPDATE=0.06"),
         # RANDOMIZE_GRAVTREE (non-periodic path). Evrard is initially at rest with zero net
         # momentum by symmetry, so correlated force errors show up as spurious COM drift.
-        pytest.param(("RANDOMIZE_GRAVTREE",), marks=SHMEM_GAS_DRIFT_XFAIL),
+        ("RANDOMIZE_GRAVTREE",),
     ],
     ids=["baseline", "tidal_adaptive", "randomize"],
 )
