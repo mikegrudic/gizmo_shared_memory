@@ -703,11 +703,17 @@ int main(int argc, char** argv) {
     // it, as does the bate M50 production run's. Opening it unconditionally aborts the read on
     // those files. Absent means zero, which is the same instruction.
     double ic_mass_table[6] = {0,0,0,0,0,0};
+    double ic_time = 0.0;
     {
         hid_t header = H5Gopen2(ic_file, "Header", H5P_DEFAULT);
         if (H5Aexists(header, "MassTable") > 0) {
             hid_t attr = H5Aopen(header, "MassTable", H5P_DEFAULT);
             H5Aread(attr, H5T_NATIVE_DOUBLE, ic_mass_table);
+            H5Aclose(attr);
+        }
+        if (H5Aexists(header, "Time") > 0) {
+            hid_t attr = H5Aopen(header, "Time", H5P_DEFAULT);
+            H5Aread(attr, H5T_NATIVE_DOUBLE, &ic_time);
             H5Aclose(attr);
         }
         H5Gclose(header);
@@ -756,6 +762,23 @@ int main(int argc, char** argv) {
                         sim.h[base + q] = std::cbrt(3.0 * 32.0 * m_q / (4.0 * M_PI * rho0[q]));
                 }
             }
+        }
+        // Sinks carried in from a GIZMO snapshot. Without these a loaded sink has accretion radius
+        // 0 and never accretes. Formation time is rebased to this run's clock, which starts at 0.
+        if (t == 5 && H5Lexists(group, "Sink_Radius", H5P_DEFAULT) > 0) {
+            const size_t base = sim.P.m.size() - n_type;
+            auto take = [&](std::vector<double>& dst, const char* name, double offset) {
+                if (H5Lexists(group, name, H5P_DEFAULT) <= 0) return;
+                const std::vector<double> src = h5_read(group, name, -1);
+                if (dst.size() < base + n_type) dst.resize(base + n_type, 0.0);
+                for (size_t q = 0; q < n_type; ++q) dst[base + q] = src[q] - offset;
+            };
+            take(sim.sink_radius, "Sink_Radius", 0.0);
+            take(sim.sink_m0, "Sink_InitialMass", 0.0);
+            take(sim.sink_reservoir, "Sink_Mass_Reservoir", 0.0);
+            take(sim.sink_tform, "StellarFormationTime", ic_time);
+            printf("shmem-GIZMO: %zu sinks from the IC carry their radius/initial mass/reservoir/age\n",
+                   n_type);
         }
         const std::vector<double> ids_as_double = h5_read(group, "ParticleIDs", -1);
         for (double id : ids_as_double) particle_ids.push_back((long long)id);
