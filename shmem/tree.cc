@@ -1017,19 +1017,34 @@ long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t 
 
     // 2. node mass and centre of mass, re-derived bottom-up from the particles (children are
     // allocated after their parent) against the incremental moments. Positions are taken at the
-    // tree's current time (dt_behind undoes lazy drift) and unwrapped against the tracked COM.
+    // tree's current time (dt_behind undoes lazy drift). The build sums RAW positions (gravity is
+    // not periodic), so each member is taken in the image nearest the node's geometric centre --
+    // the build's image, undoing any fold since -- when that is unambiguous (node half-width plus
+    // motion pad under half a box), and raw otherwise. Unwrapping against the COM would move a
+    // member a full box whenever it sits more than half a box from its node's COM.
     const double tau = T.t_since_build;
     std::vector<double> msum(nn, 0.0);
     std::vector<Vec3d> mdx(nn, Vec3d{0, 0, 0});
     std::vector<Vec3d> com(nn);
-    for (size_t no = 0; no < nn; ++no) com[no] = T.node_com((int)no, tau);
+    std::vector<uint8_t> unwrap(nn, 0);
+    for (size_t no = 0; no < nn; ++no) {
+        com[no] = T.node_com((int)no, tau);
+        const double pad = (double)T.vmax[no] * tau + (double)T.xpad[no];
+        unwrap[no] = box > 0 && (double)T.sn[no].half + pad < 0.5 * box;
+    }
     for (size_t p = 0; p < N; ++p) {
         if (T.leaf_of[p] < 0 || P.m[p] <= 0) continue;
         Vec3d x = P.pos(p);
         if (dt_behind && vx) x += Vec3d{vx[p], vy[p], vz[p]} * dt_behind[p];
         for (int no = T.leaf_of[p]; no >= 0; no = T.parent[no]) {
             msum[no] += P.m[p];
-            mdx[no] += min_image(x - com[no], box) * P.m[p];
+            Vec3d xr = x;
+            if (unwrap[no]) {
+                const SNode& sn = T.sn[no];
+                const Vec3d c{(double)sn.cx, (double)sn.cy, (double)sn.cz};
+                xr = c + min_image(x - c, box);
+            }
+            mdx[no] += (xr - com[no]) * P.m[p];
         }
     }
     for (size_t no = 0; no < nn; ++no) {
@@ -1044,6 +1059,30 @@ long long audit_tree(const Tree& T, const Particles& P, const double* h, size_t 
             const double reach = T.size[no] + 2.0 * ((double)T.vmax[no] * tau + (double)T.xpad[no]);
             if (off > 1e-6 * reach) {
                 fail("node %zu tracked COM is %.9g off the particles' (node reach %.9g)", no, off, reach);
+                // Members outside the node box in raw coordinates but inside it by min-image have
+                // been folded across the periodic boundary since the build; each moves the true COM
+                // by m*box/M, which the incremental moments never see.
+                const SNode& sn = T.sn[no];
+                const double c[3] = {(double)sn.cx, (double)sn.cy, (double)sn.cz};
+                const double lim = (double)sn.half + (double)T.vmax[no] * tau + (double)T.xpad[no];
+                long long n_wrapped = 0, n_members = 0; double m_wrapped = 0;
+                for (size_t p = 0; p < N; ++p) {
+                    if (T.leaf_of[p] < 0 || P.m[p] <= 0) continue;
+                    bool member = false;
+                    for (int a = T.leaf_of[p]; a >= 0 && !member; a = T.parent[a]) member = (a == (int)no);
+                    if (!member) continue;
+                    ++n_members;
+                    Vec3d x = P.pos(p);
+                    if (dt_behind && vx) x += Vec3d{vx[p], vy[p], vz[p]} * dt_behind[p];
+                    bool outside = false;
+                    for (int k = 0; k < 3; ++k) outside |= std::abs(x[k] - c[k]) > lim;
+                    if (outside) { ++n_wrapped; m_wrapped += P.m[p]; }
+                }
+                fprintf(stderr, "[tree-audit]   node %zu: centre (%.6g, %.6g, %.6g) half %.6g mass %.6g, "
+                        "%lld members; %lld (mass %.6g) outside the node box unless folded -- "
+                        "expected COM shift if each wrapped once: %.6g (box %.6g)\n",
+                        no, c[0], c[1], c[2], (double)sn.half, msum[no], n_members, n_wrapped,
+                        m_wrapped, msum[no] > 0 ? m_wrapped * box / msum[no] : 0.0, box);
                 break;
             }
         }
